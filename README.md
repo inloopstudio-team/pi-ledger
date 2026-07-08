@@ -17,13 +17,13 @@ pi-ledger is the billing engine for the **serverless agency** — a dev shop tha
 runs on on-demand agents and bills the way serverless compute is billed:
 **per-invocation, duration-based, scale-to-zero idle**.
 
-| Serverless compute     | pi-ledger                                             |
-| ---------------------- | ----------------------------------------------------- |
-| On-demand function     | The agent — each turn is an invocation                |
-| Execution duration     | Per-turn agent time (generation − stalls + tool time) |
-| Scale-to-zero idle     | Human idle costs nothing by default                   |
-| Provisioned capacity   | Opt-in pomodoro extensions (billed human oversight)   |
-| Usage report / invoice | `/ledger-receipt` — an invoice-grade HTML receipt     |
+| Serverless compute     | pi-ledger                                                          |
+| ---------------------- | ------------------------------------------------------------------ |
+| On-demand function     | The agent — each turn is an invocation                             |
+| Execution duration     | Per-turn agent time (generation normalized to ref TPS + tool time) |
+| Scale-to-zero idle     | Human idle costs nothing by default                                |
+| Provisioned capacity   | Opt-in pomodoro extensions (billed human oversight)                |
+| Usage report / invoice | `/ledger-receipt` — an invoice-grade HTML receipt                  |
 
 The agent is the on-demand function; each turn is an invocation billed by
 duration, with stalls excluded (a slow or queued provider is a retry, not
@@ -81,11 +81,12 @@ capped at the grace budget) but enough to demo the output.
 | **Agent** | `agent_start` → `agent_end` (sum of turns)     | Agent time |
 | **Human** | `agent_end` → next `agent_start` (idle window) | Human time |
 
-**Agent time per turn** = `(generationMs − stallMs) + toolExecutionMs`.
+**Agent time per turn** = `normalizedGenerationMs + toolExecutionMs`, where
+`normalizedGenerationMs = outputTokens / referenceTps × 1000`.
 
-- **Generation** (incl. TTFT) is the model producing tokens — billable.
-- **Tool execution** is the agent doing the work (running bash, reading files, …) — billable, measured as the union wall-clock of tool calls within the turn (parallel tools don't double-count).
-- **Stalls** (mid-stream inference pauses) are **excluded**. A slow or queued provider must not inflate billable time — that's the abuse vector this rule closes.
+- **Generation** is billed by **output tokens at a reference TPS** (frontier-model average, default 75), so model speed can't change the bill — a fast model and a slow one producing the same output tokens bill the same, and the faster model no longer punishes the contractor. `referenceTps` is configurable in `/ledger-settings`.
+- **Tool execution** is the agent doing the work (running bash, reading files, …) — billable, measured as the union wall-clock of tool calls within the turn (parallel tools don't double-count). It isn't token-bound, so it's billed as real time.
+- **Stalls** (mid-stream inference pauses) **drop out automatically** — a stall produces no tokens, so token-normalized billing never counts it (the abuse vector a slow/queued provider could inflate). The real wall-clock `generationMs`/`stallMs` are still recorded on the event for audit.
 - **Source** is either `tps` (high-fidelity, from pi-tps's event) or `fallback`
   (self-measured). Exactly one segment is written per turn regardless of
   extension load order — a `fallback` may be corrected by a later `tps` entry
@@ -132,16 +133,17 @@ text fields open an inline input on `Enter`; currency and the auto-wizard
 toggle cycle through presets. Settings persist to the per-session sidecar (see [Data model](#data-model))
 and rehydrate on resume and `/tree` navigation.
 
-| Setting          | Default  | Notes                                                    |
-| ---------------- | -------- | -------------------------------------------------------- |
-| Agent rate       | `60`     | $/hour billed for agent work                             |
-| Human rate       | `60`     | $/hour billed for human work                             |
-| Grace minutes    | `1`      | Idle minutes billed by default if the wizard is ignored  |
-| Pomodoro minutes | `20`     | Minutes added per extension                              |
-| Project          | _(cwd)_  | Shown on the receipt; falls back to the cwd name         |
-| Author           | _(user)_ | Shown on the receipt; falls back to your OS user         |
-| Currency         | `USD`    | Symbol for amounts                                       |
-| Auto-wizard      | `on`     | Auto-popup at `agent_end` when no rolling credit remains |
+| Setting          | Default  | Notes                                                       |
+| ---------------- | -------- | ----------------------------------------------------------- |
+| Agent rate       | `60`     | $/hour billed for agent work                                |
+| Human rate       | `60`     | $/hour billed for human work                                |
+| Grace minutes    | `1`      | Idle minutes billed by default if the wizard is ignored     |
+| Pomodoro minutes | `20`     | Minutes added per extension                                 |
+| Reference TPS    | `75`     | Output tokens/sec to normalize generation to (frontier avg) |
+| Project          | _(cwd)_  | Shown on the receipt; falls back to the cwd name            |
+| Author           | _(user)_ | Shown on the receipt; falls back to your OS user            |
+| Currency         | `USD`    | Symbol for amounts                                          |
+| Auto-wizard      | `on`     | Auto-popup at `agent_end` when no rolling credit remains    |
 
 ## Receipt
 
@@ -166,7 +168,7 @@ the session JSONL so it survives **compaction** (which discards old custom
 entries) and accumulates across **all branches** of the session. Events:
 
 - `settings` — a settings snapshot (last one wins on replay).
-- `agent` — one per turn: `{ id, turnIndex, agentMs, generationMs, stallMs, toolMs, tokens, model, source, supersedes?, timestamp }`. A `'tps'` turn may `supersede` an earlier `'fallback'` for the same turn (load-order race) so it isn't double-counted.
+- `agent` — one per turn: `{ id, turnIndex, agentMs, generationMs, stallMs, toolMs, tokens, model, source, supersedes?, timestamp }`. `agentMs` is the billable time (generation normalized to the reference TPS + tool time); `generationMs`/`stallMs` are the real wall-clock (audit). A `'tps'` turn may `supersede` an earlier `'fallback'` for the same turn (load-order race) so it isn't double-counted.
 - `human-open` — on `agent_end` (and re-recorded on each wizard extend): `{ openedAt, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. `grantedBudgetMs` is the window's cap = `grace + extensionBudgetMs`; `extensionBudgetMs` is the rolling credit carried into the window.
 - `human-close` — on the next `agent_start` **or on `session_shutdown`** (exit): `{ openedAt, closedAt, billedMs, idleMs, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. Its `extensionBudgetMs` is the rolling credit remaining after this window's consumption (carried forward). Legacy events lacking `extensionBudgetMs` are backfilled on replay.
 
@@ -184,7 +186,7 @@ turn_start            → reset per-turn tool + fallback accumulators
 tool_execution_start  → tool depth counter (union timing)
 tool_execution_end    →   (parallel tools don't double-count)
 message_start/update/end → fallback generation + stall gate (self-sufficient)
-tps:telemetry (pi-tps)→ record 'tps' agent segment = (gen − stall) + tool
+tps:telemetry (pi-tps)→ record 'tps' agent segment = (output tokens / ref TPS) + tool
                         └ corrects a 'fallback' already written this turn
 
 turn_end (no pi-tps)  → record 'fallback' agent segment from own measurement
@@ -198,10 +200,12 @@ agent_start           → close window: billed = min(idle, grace + credit);
 session_shutdown      → close any open window (record the exit: idle is retained)
 ```
 
-Agent timing prefers pi-tps's `tps:telemetry` (`generationMs`, `stallMs`);
-when pi-tps is absent, pi-ledger measures generation + a basic stall gap gate
-itself at `turn_end`. Tool-execution time is always measured locally and paired
-with the turn. The wizard is driven entirely by the extension (the agent is
+Agent timing prefers pi-tps's `tps:telemetry` (`generationMs`, `stallMs`,
+`tokens.output`); when pi-tps is absent, pi-ledger measures generation + a basic
+stall gap gate itself at `turn_end`. Either way generation is billed by output
+tokens at the reference TPS (speed-invariant); the real generation/stall ms are
+recorded for audit. Tool-execution time is always measured locally, billed as
+real time, and paired with the turn. The wizard is driven entirely by the extension (the agent is
 unaware), auto-fires at `agent_end` only when no rolling pomodoro credit
 remains (otherwise it's armed to fire when that credit is exhausted), and is
 disarmed on the next `agent_start` or `session_shutdown`. The first grace
@@ -220,7 +224,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (50 tests)
+pnpm test            # vitest run (67 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```

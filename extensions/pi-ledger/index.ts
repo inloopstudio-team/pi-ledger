@@ -6,10 +6,13 @@
  * per-turn agent timing and tracks tool-execution time itself; meters
  * human idle windows with a grace minute plus pomodoro extensions.
  *
- * Agent billable time per turn = (generationMs − stallMs) + toolExecutionMs.
- * Stalls are excluded to avoid abuse — a slow or queued provider must not
- * inflate billable time. TTFT stays in (it's the model producing the first
- * token); tool-execution time stays in (the agent doing the work).
+ * Agent billable time per turn = normalizedGenerationMs + toolExecutionMs,
+ * where normalizedGenerationMs = outputTokens / referenceTps × 1000. Generation
+ * is billed by output tokens at a reference TPS (frontier-model average,
+ * default 75), so model speed can't change the bill — a fast model and a slow
+ * one producing the same tokens bill the same. Stalls drop out automatically
+ * (a stall produces no tokens) and the real wall-clock generation/stall ms
+ * stay on the event for audit; tool-execution time is billed as-is.
  *
  * Human time = the idle window between agent_end and the next agent_start,
  * capped by a granted budget: the first grace minute is always billable,
@@ -82,6 +85,7 @@ const DEFAULT_SETTINGS: LedgerSettings = {
   humanRatePerHour: 60,
   graceMinutes: 1,
   pomodoroMinutes: 20,
+  referenceTps: 75,
   project: '',
   author: '',
   currency: 'USD',
@@ -95,6 +99,9 @@ export interface LedgerSettings {
   humanRatePerHour: number;
   graceMinutes: number;
   pomodoroMinutes: number;
+  /** Output tokens/sec generation is normalized to (frontier-model average ≈ 75).
+   *  Higher → less normalized time → a lower bill for fast models. */
+  referenceTps: number;
   project: string;
   author: string;
   currency: string;
@@ -109,9 +116,14 @@ export interface AgentEvent {
   kind: 'agent';
   id: string;
   turnIndex: number;
+  /** Billable agent time: generation normalized to the reference TPS + tool
+   *  time (what's summed into totals and billed). */
   agentMs: number;
+  /** Real wall-clock generation (TTFT + streaming), kept for audit. */
   generationMs: number;
+  /** Real mid-stream stall time, kept for audit (excluded from billing). */
   stallMs: number;
+  /** Real tool-execution time (billed as-is). */
   toolMs: number;
   tokens: { input: number; output: number; total: number };
   model: { provider: string; modelId: string };
@@ -208,10 +220,18 @@ export interface ReceiptData {
 
 // ─── Pure helpers (exported for testing) ────────────────────────────────────
 
-/** Agent billable time: active generation (TTFT + streaming, minus stalls) + tool time. */
-export function computeAgentMs(generationMs: number, stallMs: number, toolMs: number): number {
-  const activeGen = Math.max(0, generationMs - Math.max(0, stallMs));
-  return activeGen + Math.max(0, toolMs);
+/** Billable agent time: generation normalized to a reference TPS, plus real
+ *  tool-execution time.
+ *
+ *  Generation is billed as `outputTokens / referenceTps` seconds — a fast model
+ *  and a slow one producing the same output tokens bill the same, so model
+ *  speed can't change the bill. Stalls drop out automatically (a stall produces
+ *  no tokens); the real wall-clock generation/stall ms stay on the event for
+ *  audit. Tool time is billed as-is (it isn't token-bound). */
+export function computeAgentMs(outputTokens: number, toolMs: number, referenceTps: number): number {
+  const refTps = referenceTps > 0 ? referenceTps : 0;
+  const standardGenMs = refTps > 0 ? Math.round((Math.max(0, outputTokens) / refTps) * 1000) : 0;
+  return standardGenMs + Math.max(0, toolMs);
 }
 
 /** Close an idle window: billed = min(actual idle, granted budget). */
@@ -278,6 +298,10 @@ function fmtRate(rate: number): string {
   return rate === Math.round(rate) ? `${rate}` : `${rate.toFixed(2)}`;
 }
 
+function fmtTps(n: number): string {
+  return n === Math.round(n) ? `${n}` : `${n.toFixed(1)}`;
+}
+
 function parseNumber(raw: string): number | null {
   const n = Number(raw);
   if (!Number.isFinite(n)) return null;
@@ -321,6 +345,11 @@ export function applySettingValue(
     case 'pomodoroMinutes': {
       const n = parseNumber(value);
       if (n !== null) next.pomodoroMinutes = Math.max(1, Math.round(n));
+      break;
+    }
+    case 'referenceTps': {
+      const n = parseNumber(value);
+      if (n !== null && n > 0) next.referenceTps = Math.round(n * 10) / 10;
       break;
     }
     case 'project':
@@ -442,16 +471,17 @@ export function extractTpsEntries(
 
 /** Convert pi-tps markers into billable agent + (estimated) human time. Pure.
  *
- * Agent time per marker = (generationMs − stallMs); tool time is unavailable
- * from pi-tps markers. Human time is estimated from inter-turn gaps — each
- * gap is capped at the grace budget (no wizard ran, so no extensions) —
- * which mirrors the scale-to-zero billing rule. When `nowMs` is given, the
- * trailing idle after the last marker (up to now) is added as a final human
- * window, capped at grace — the in-progress "last idle" minute, for display
- * only (never persisted). @internal */
+ * Agent time per marker = outputTokens / referenceTps (generation normalized
+ * to the reference TPS; tool time is unavailable from pi-tps markers). Human
+ * time is estimated from inter-turn gaps — each gap is capped at the grace
+ * budget (no wizard ran, so no extensions) — which mirrors the scale-to-zero
+ * billing rule. When `nowMs` is given, the trailing idle after the last marker
+ * (up to now) is added as a final human window, capped at grace — the
+ * in-progress "last idle" minute, for display only (never persisted). @internal */
 export function convertTpsEntries(
   tps: TpsMarker[],
   graceMs: number,
+  referenceTps: number,
   nowMs?: number
 ): {
   agentMs: number;
@@ -467,7 +497,7 @@ export function convertTpsEntries(
   let humanWindows = 0;
   for (let i = 0; i < tps.length; i++) {
     const e = tps[i]!;
-    agentMs += computeAgentMs(e.timing.generationMs || 0, e.timing.stallMs || 0, 0);
+    agentMs += computeAgentMs(e.tokens.output || 0, 0, referenceTps);
     agentTokens.input += e.tokens.input || 0;
     agentTokens.output += e.tokens.output || 0;
     agentTokens.total += e.tokens.total || 0;
@@ -828,7 +858,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         tps = [];
       }
       if (tps.length > 0) {
-        const c = convertTpsEntries(tps, settings.graceMinutes * MS_PER_MINUTE, now);
+        const c = convertTpsEntries(
+          tps,
+          settings.graceMinutes * MS_PER_MINUTE,
+          settings.referenceTps,
+          now
+        );
         return {
           agentMs: c.agentMs,
           humanMs: c.humanMs,
@@ -1164,7 +1199,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const generationMs = Number.isFinite(t.timing.generationMs) ? t.timing.generationMs : 0;
     const stallMs = Number.isFinite(t.timing.stallMs) ? t.timing.stallMs : 0;
     const toolMs = toolMsThisTurn;
-    const agentMs = computeAgentMs(generationMs, stallMs, toolMs);
+    // Bill generation by output tokens at the reference TPS (speed-invariant);
+    // the real generationMs/stallMs above are still recorded for audit.
+    const agentMs = computeAgentMs(t.tokens.output || 0, toolMs, settings.referenceTps);
     if (agentMs <= 0) return;
     const supersedes =
       lastFallback && lastFallback.turnIndex === currentTurnIndex ? lastFallback.id : undefined;
@@ -1208,7 +1245,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (tpsEverSeen) return; // pi-tps present; it handles turns (or intentionally skips)
     if (fb.messageCount === 0 || !fb.model) return;
     const toolMs = toolMsThisTurn;
-    const agentMs = computeAgentMs(fb.totalGenerationMs, fb.stallMs, toolMs);
+    // Bill generation by output tokens at the reference TPS (speed-invariant);
+    // the real totalGenerationMs/stallMs are still recorded for audit.
+    const agentMs = computeAgentMs(fb.tokens.output || 0, toolMs, settings.referenceTps);
     if (agentMs <= 0) return;
     const id = randomUUID();
     appendSidecar({
@@ -1476,6 +1515,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         currentValue: String(settings.pomodoroMinutes),
         description: 'Minutes added per extension (wizard · /ledger-extend)',
         submenu: numberSubmenu(theme, 'Pomodoro minutes'),
+      },
+      {
+        id: 'referenceTps',
+        label: 'Reference TPS',
+        currentValue: fmtTps(settings.referenceTps),
+        description: 'Output tokens/sec to normalize generation to (frontier avg ≈ 75)',
+        submenu: numberSubmenu(theme, 'Reference TPS'),
       },
       {
         id: 'project',

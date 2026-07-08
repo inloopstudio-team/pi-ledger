@@ -36,6 +36,7 @@ const DEFAULTS: LedgerSettings = {
   humanRatePerHour: 60,
   graceMinutes: 1,
   pomodoroMinutes: 20,
+  referenceTps: 75,
   project: '',
   author: '',
   currency: 'USD',
@@ -61,15 +62,21 @@ function entryCount(fixture: TestFixture, customType: string): number {
 // ─── Pure helpers ───────────────────────────────────────────────────────────
 
 describe('computeAgentMs', () => {
-  it('excludes stalls, includes tools, keeps generation', () => {
-    // generation includes TTFT + streaming; stalls are the abuse vector we drop.
-    expect(computeAgentMs(2000, 500, 300)).toBe(1800); // (2000-500)+300
+  it('bills output tokens at the reference TPS plus tool time', () => {
+    // 750 output tokens ÷ 75 TPS = 10s = 10_000ms; + 300ms tools
+    expect(computeAgentMs(750, 300, 75)).toBe(10_300);
   });
-  it('clamps negative stall overshoot to zero active gen', () => {
-    expect(computeAgentMs(100, 500, 300)).toBe(300); // max(0,100-500)=0 +300
+  it('bills only tool time when there are no output tokens', () => {
+    // generation is billed by tokens; no tokens → no generation bill (stalls moot)
+    expect(computeAgentMs(0, 300, 75)).toBe(300);
   });
   it('ignores negative tool time', () => {
-    expect(computeAgentMs(1000, 0, -50)).toBe(1000);
+    expect(computeAgentMs(750, -50, 75)).toBe(10_000);
+  });
+  it('scales the generation bill by the reference TPS (higher TPS → lower bill)', () => {
+    // same 750 tokens: at 150 TPS the normalized time halves vs 75 TPS
+    expect(computeAgentMs(750, 0, 150)).toBe(5_000);
+    expect(computeAgentMs(750, 0, 75)).toBe(10_000);
   });
 });
 
@@ -196,6 +203,16 @@ describe('applySettingValue', () => {
     expect(applySettingValue(DEFAULTS, 'graceMinutes', '0').graceMinutes).toBe(0);
     expect(applySettingValue(DEFAULTS, 'pomodoroMinutes', '0').pomodoroMinutes).toBe(1); // min 1
     expect(applySettingValue(DEFAULTS, 'pomodoroMinutes', '15.7').pomodoroMinutes).toBe(16);
+  });
+  it('accepts a positive reference TPS and rejects non-positive', () => {
+    expect(applySettingValue(DEFAULTS, 'referenceTps', '100').referenceTps).toBe(100);
+    expect(applySettingValue(DEFAULTS, 'referenceTps', '12.5').referenceTps).toBe(12.5);
+    expect(
+      applySettingValue({ ...DEFAULTS, referenceTps: 75 }, 'referenceTps', '0').referenceTps
+    ).toBe(75); // reject 0 → keeps old
+    expect(
+      applySettingValue({ ...DEFAULTS, referenceTps: 75 }, 'referenceTps', '-5').referenceTps
+    ).toBe(75); // reject negative → keeps old
   });
   it('sets text fields and currency/toggle', () => {
     expect(applySettingValue(DEFAULTS, 'project', 'app.inloop.studio').project).toBe(
@@ -437,10 +454,11 @@ describe('extractTpsEntries + convertTpsEntries', () => {
           timestamp: 90000,
         },
       ],
-      60_000
+      60_000,
+      75
     );
-    // agent = (2000-0) + (3000-500) + (1000-0) = 5500
-    expect(c.agentMs).toBe(5500);
+    // agent = (50 + 100 + 25) output tokens ÷ 75 TPS = 667 + 1333 + 333 = 2333
+    expect(c.agentMs).toBe(2333);
     expect(c.agentTurns).toBe(3);
     expect(c.agentTokens.total).toBe(525);
     // gap0 = (70000-4000) - 0 = 66000 -> capped at 60000; gap1 = (90000-1500) - 70000 = 18500
@@ -450,7 +468,7 @@ describe('extractTpsEntries + convertTpsEntries', () => {
   });
 
   it('returns zeros for no markers', () => {
-    const c = convertTpsEntries([], 60_000);
+    const c = convertTpsEntries([], 60_000, 75);
     expect(c.agentMs).toBe(0);
     expect(c.humanMs).toBe(0);
     expect(c.startedAt).toBe(0);
@@ -556,12 +574,37 @@ describe('extension integration', () => {
 
     const seg = lastEntry(fixture, 'ledger-agent');
     expect(seg).toBeDefined();
-    expect(seg.agentMs).toBe(2300); // (2000 - 500) + 800
+    // 400 output tokens ÷ 75 TPS = 5333ms + 800ms tools = 6133 (speed-invariant;
+    // the 500ms stall is recorded below but not billed)
+    expect(seg.agentMs).toBe(6133);
     expect(seg.toolMs).toBe(800);
     expect(seg.generationMs).toBe(2000);
     expect(seg.stallMs).toBe(500);
     expect(seg.turnIndex).toBe(1);
     expect(seg.tokens.total).toBe(1400);
+  });
+
+  it('bills the same agent time for a fast and a slow model with equal output (speed-invariant)', async () => {
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
+    // slow model: 30s real generation for 1500 output tokens (50 TPS)
+    fixture.emitEvent(
+      'tps:telemetry',
+      makeTpsTelemetry({ generationMs: 30_000, stallMs: 0, output: 1500, total: 1500 })
+    );
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 1, timestamp: Date.now() });
+    // fast model: 5s real generation for the same 1500 output tokens (300 TPS)
+    fixture.emitEvent(
+      'tps:telemetry',
+      makeTpsTelemetry({ generationMs: 5_000, stallMs: 0, output: 1500, total: 1500 })
+    );
+
+    const events = fixture.readSidecarEvents().filter((e) => e.kind === 'agent');
+    // both normalize to 1500 ÷ 75 × 1000 = 20_000ms regardless of real speed
+    expect(events[0]!.agentMs).toBe(20_000);
+    expect(events[1]!.agentMs).toBe(20_000);
+    // the real wall-clock generation is preserved for audit
+    expect(events[0]!.generationMs).toBe(30_000);
+    expect(events[1]!.generationMs).toBe(5_000);
   });
 
   it('measures parallel tool execution as a union span (no double-count)', async () => {
@@ -618,7 +661,8 @@ describe('extension integration', () => {
     const seg = lastEntry(fixture, 'ledger-agent');
     expect(seg).toBeDefined();
     expect(seg.source).toBe('fallback');
-    expect(seg.agentMs).toBe(1200); // 1200ms generation, no stalls, no tools
+    // 50 output tokens ÷ 75 TPS = 667ms (speed-invariant; real 1200ms below is audit)
+    expect(seg.agentMs).toBe(667);
     expect(seg.generationMs).toBe(1200);
     expect(seg.stallMs).toBe(0);
     expect(seg.model.modelId).toBe('gpt-4');
@@ -638,11 +682,12 @@ describe('extension integration', () => {
     fixture.run('turn_end', { type: 'turn_end', turnIndex: 0, message: msg, toolResults: [] });
 
     const seg = lastEntry(fixture, 'ledger-agent');
-    // generation 2300 (message span) − stall 1500 = 800
+    // 50 output tokens ÷ 75 TPS = 667ms — stalls are recorded (1500ms below) but
+    // excluded from billing automatically (a stall produces no tokens)
     expect(seg.source).toBe('fallback');
     expect(seg.generationMs).toBe(2300);
     expect(seg.stallMs).toBe(1500);
-    expect(seg.agentMs).toBe(800);
+    expect(seg.agentMs).toBe(667);
   });
 
   it('corrects a fallback with the later tps segment for the same turn (no double-count)', async () => {
@@ -657,18 +702,18 @@ describe('extension integration', () => {
     // ledger-before-tps load order: fallback first...
     fixture.run('turn_end', { type: 'turn_end', turnIndex: 0, message: msg, toolResults: [] });
     expect(lastEntry(fixture, 'ledger-agent').source).toBe('fallback');
-    expect(lastEntry(fixture, 'ledger-agent').agentMs).toBe(800);
+    expect(lastEntry(fixture, 'ledger-agent').agentMs).toBe(667); // 50 tokens ÷ 75 TPS
     // ...then tps arrives and corrects it
     fixture.emitEvent('tps:telemetry', makeTpsTelemetry({ generationMs: 2000, stallMs: 500 }));
 
     const seg = lastEntry(fixture, 'ledger-agent');
     expect(seg.source).toBe('tps');
-    expect(seg.agentMs).toBe(1500); // (2000 - 500) + 0
+    expect(seg.agentMs).toBe(6667); // 500 tokens ÷ 75 TPS = 6667ms
     expect(entryCount(fixture, 'ledger-agent')).toBe(2); // fallback + tps entries kept
     // rehydrate dedups → keeps tps
     // rehydrate from the sidecar: the fallback is superseded → only tps counts
     const r = rehydrateFromSidecar(fixture.readSidecarEvents());
-    expect(r.totals.agentMs).toBe(1500);
+    expect(r.totals.agentMs).toBe(6667);
     expect(r.totals.agentTurns).toBe(1);
   });
 
@@ -898,7 +943,7 @@ describe('extension integration', () => {
       customType: 'tps',
       data: {
         timing: { generationMs: 3_600_000, stallMs: 0, totalMs: 3_700_000 },
-        tokens: { input: 0, output: 0, total: 1500 },
+        tokens: { input: 0, output: 270000, total: 270000 },
         model: { provider: 'openai', modelId: 'gpt-4' },
         timestamp: 1000,
       },
@@ -1051,7 +1096,7 @@ describe('extension integration', () => {
         customType: 'tps',
         data: {
           timing: { generationMs: 3_600_000, stallMs: 0, totalMs: 3_700_000 },
-          tokens: { input: 0, output: 0, total: 1500 },
+          tokens: { input: 0, output: 270000, total: 270000 },
           model: { provider: 'openai', modelId: 'gpt-4' },
           timestamp: 1000,
         },
@@ -1119,7 +1164,10 @@ describe('extension integration', () => {
 
   it('session_tree (/tree go-back) keeps the live totals — does not reset to $0', async () => {
     fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
-    fixture.emitEvent('tps:telemetry', makeTpsTelemetry({ generationMs: 3_600_000, stallMs: 0 }));
+    fixture.emitEvent(
+      'tps:telemetry',
+      makeTpsTelemetry({ generationMs: 3_600_000, stallMs: 0, output: 270000, total: 270000 })
+    );
     // branching (/tree → "go back to an earlier message") fires session_tree
     fixture.run('session_tree', { type: 'session_tree' });
     // the live in-memory total is kept — not reset to $0
@@ -1136,7 +1184,10 @@ describe('extension integration', () => {
 
   it('session_start keeps live totals if the sidecar read is empty (no reset to $0)', async () => {
     fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
-    fixture.emitEvent('tps:telemetry', makeTpsTelemetry({ generationMs: 3_600_000, stallMs: 0 }));
+    fixture.emitEvent(
+      'tps:telemetry',
+      makeTpsTelemetry({ generationMs: 3_600_000, stallMs: 0, output: 270000, total: 270000 })
+    );
     fixture.clearSidecar(); // simulate a missing/failed sidecar read
     fixture.run('session_start', { type: 'session_start', reason: 'reload' });
     expect(fixture.setStatusSpy.mock.calls.at(-1)![1]).toContain('agent 1.00h');
