@@ -264,6 +264,34 @@ interface Totals {
   agentTurns: number;
   humanWindows: number;
   agentTokens: { input: number; output: number; total: number };
+  // Agent breakdown for the itemized receipt: billed generation
+  // (token-normalized) and billed tool time split out so the invoice shows
+  // compute vs. I/O (both @ agentRate); stallMs is the UNbilled wall-clock.
+  agentGenMs: number;
+  agentToolMs: number;
+  stallMs: number;
+  toolTurns: number;
+  stalledTurns: number;
+  // Human breakdown (all billable @ humanRate): committed idle (review/think)
+  // vs. steering vs. queuing (followUp), each with its own count + keystroke
+  // total; abandonedWindows/abandonedMs is the UNbilled walk-away span.
+  humanIdleMs: number;
+  humanSteerMs: number;
+  humanQueueMs: number;
+  idleWindows: number;
+  steerCount: number;
+  queueCount: number;
+  idleKeystrokes: number;
+  steerKeystrokes: number;
+  queueKeystrokes: number;
+  abandonedWindows: number;
+  abandonedMs: number;
+  // Extension (provisioned capacity) breakdown: blocks granted, total credit
+  // granted (ms), and credit consumed (billed beyond grace). Remaining =
+  // granted − consumed (the live rolling budget).
+  extensionsGranted: number;
+  extensionCreditMs: number;
+  extensionConsumedMs: number;
 }
 
 export interface Billing {
@@ -496,12 +524,45 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
   const agentTokens = { input: 0, output: 0, total: 0 };
   let humanMs = 0;
   let humanWindows = 0;
+  // Sub-totals for the itemized receipt (billable at their group rate except
+  // stallMs/abandonedMs, the UNbilled audit spans).
+  let agentGenMs = 0;
+  let agentToolMs = 0;
+  let stallMs = 0;
+  let toolTurns = 0;
+  let stalledTurns = 0;
+  let humanIdleMs = 0;
+  let humanSteerMs = 0;
+  let humanQueueMs = 0;
+  let idleWindows = 0;
+  let steerCount = 0;
+  let queueCount = 0;
+  let idleKeystrokes = 0;
+  let steerKeystrokes = 0;
+  let queueKeystrokes = 0;
+  let abandonedWindows = 0;
+  let abandonedMs = 0;
+  let extensionsGranted = 0;
+  let extensionCreditMs = 0;
+  let extensionConsumedMs = 0;
   // Rolling billable-human-time budget (provisioned pomodoro credit) carried
   // across agent turns. The last human-open/close event in the log holds the
   // current value: an open window records what was carried in (and extended);
   // a close records what remains after that window's consumption.
   let extensionBudgetMs = 0;
   const closedOpenedAts = new Set<number>();
+  // Apply a recorded rolling-budget value: a rise = a credit grant (one
+  // block), a fall = a consumption (billed beyond grace). Mirrors the live
+  // grant/consume calls exactly, so rehydrate reconstructs the same totals.
+  function applyBudgetDelta(next: number) {
+    if (next > extensionBudgetMs) {
+      extensionCreditMs += next - extensionBudgetMs;
+      extensionsGranted += 1;
+    } else if (next < extensionBudgetMs) {
+      extensionConsumedMs += extensionBudgetMs - next;
+    }
+    extensionBudgetMs = next;
+  }
   for (const e of events) {
     if (e.kind === 'settings') {
       settings = { ...DEFAULT_SETTINGS, ...e.settings };
@@ -512,18 +573,32 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
       agentTokens.input += e.tokens.input;
       agentTokens.output += e.tokens.output;
       agentTokens.total += e.tokens.total;
+      // Billed agent time = generation (token-normalized) + tool; the event
+      // records the bundled `agentMs`, so generation = agentMs − toolMs.
+      agentGenMs += e.agentMs - e.toolMs;
+      agentToolMs += e.toolMs;
+      stallMs += e.stallMs;
+      if (e.toolMs > 0) toolTurns += 1;
+      if (e.stallMs > 0) stalledTurns += 1;
     } else if (e.kind === 'human-close') {
       closedOpenedAts.add(e.openedAt);
       humanMs += e.billedMs;
       if (e.billedMs > 0) humanWindows += 1; // match live: only billed windows count
-      extensionBudgetMs = resolveExtensionBudget(
-        e,
-        (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE
+      const committed = e.committed ?? true;
+      if (committed && e.billedMs > 0) {
+        humanIdleMs += e.billedMs;
+        idleWindows += 1;
+        idleKeystrokes += e.keystrokes ?? 0;
+      } else if (!committed) {
+        abandonedWindows += 1;
+        abandonedMs += e.idleMs;
+      }
+      applyBudgetDelta(
+        resolveExtensionBudget(e, (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE)
       );
     } else if (e.kind === 'human-open') {
-      extensionBudgetMs = resolveExtensionBudget(
-        e,
-        (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE
+      applyBudgetDelta(
+        resolveExtensionBudget(e, (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE)
       );
     } else if (e.kind === 'steer') {
       // A steer/followUp composed during a run is human time, billed under the
@@ -532,7 +607,18 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
       // after the steer (carried forward, last wins on replay).
       humanMs += e.billedMs;
       humanWindows += 1;
-      extensionBudgetMs = e.extensionBudgetMs;
+      if (e.billedMs > 0) {
+        if (e.behavior === 'steer') {
+          humanSteerMs += e.billedMs;
+          steerCount += 1;
+          steerKeystrokes += e.keystrokes;
+        } else {
+          humanQueueMs += e.billedMs;
+          queueCount += 1;
+          queueKeystrokes += e.keystrokes;
+        }
+      }
+      applyBudgetDelta(e.extensionBudgetMs);
     }
   }
   // Last unclosed human-open (by append order) is the in-progress window.
@@ -554,7 +640,32 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
   }
   return {
     settings: settings ?? { ...DEFAULT_SETTINGS },
-    totals: { agentMs, humanMs, agentTurns, humanWindows, agentTokens },
+    totals: {
+      agentMs,
+      humanMs,
+      agentTurns,
+      humanWindows,
+      agentTokens,
+      agentGenMs,
+      agentToolMs,
+      stallMs,
+      toolTurns,
+      stalledTurns,
+      humanIdleMs,
+      humanSteerMs,
+      humanQueueMs,
+      idleWindows,
+      steerCount,
+      queueCount,
+      idleKeystrokes,
+      steerKeystrokes,
+      queueKeystrokes,
+      abandonedWindows,
+      abandonedMs,
+      extensionsGranted,
+      extensionCreditMs,
+      extensionConsumedMs,
+    },
     humanWindow,
     extensionBudgetMs,
   };
@@ -608,17 +719,44 @@ export function convertTpsEntries(
   humanMs: number;
   humanWindows: number;
   startedAt: number;
+  // Itemized sub-totals. pi-tps markers carry no tool time and can't
+  // reconstruct steering/abandonment, so only generation and idle/review are
+  // populated; the rest are zero (the receipt still itemizes them as $0).
+  agentGenMs: number;
+  agentToolMs: number;
+  stallMs: number;
+  toolTurns: number;
+  stalledTurns: number;
+  humanIdleMs: number;
+  humanSteerMs: number;
+  humanQueueMs: number;
+  idleWindows: number;
+  steerCount: number;
+  queueCount: number;
+  idleKeystrokes: number;
+  steerKeystrokes: number;
+  queueKeystrokes: number;
+  abandonedWindows: number;
+  abandonedMs: number;
+  extensionsGranted: number;
+  extensionCreditMs: number;
+  extensionConsumedMs: number;
 } {
   let agentMs = 0;
   const agentTokens = { input: 0, output: 0, total: 0 };
   let humanMs = 0;
   let humanWindows = 0;
+  let stallMs = 0;
+  let stalledTurns = 0;
   for (let i = 0; i < tps.length; i++) {
     const e = tps[i]!;
     agentMs += computeAgentMs(e.tokens.output || 0, 0, referenceTps);
     agentTokens.input += e.tokens.input || 0;
     agentTokens.output += e.tokens.output || 0;
     agentTokens.total += e.tokens.total || 0;
+    const sm = e.timing.stallMs || 0;
+    stallMs += sm;
+    if (sm > 0) stalledTurns += 1;
     if (i + 1 < tps.length) {
       const next = tps[i + 1]!;
       // next turn started ~ next.timestamp − next.totalMs; idle = that − this turn's end
@@ -647,6 +785,25 @@ export function convertTpsEntries(
     humanMs,
     humanWindows,
     startedAt: tps.length > 0 ? tps[0]!.timestamp : 0,
+    agentGenMs: agentMs, // markers have no tool time → all generation
+    agentToolMs: 0,
+    stallMs,
+    toolTurns: 0,
+    stalledTurns,
+    humanIdleMs: humanMs, // estimated inter-turn idle (no steering from markers)
+    humanSteerMs: 0,
+    humanQueueMs: 0,
+    idleWindows: humanWindows,
+    steerCount: 0,
+    queueCount: 0,
+    idleKeystrokes: 0,
+    steerKeystrokes: 0,
+    queueKeystrokes: 0,
+    abandonedWindows: 0,
+    abandonedMs: 0,
+    extensionsGranted: 0,
+    extensionCreditMs: 0,
+    extensionConsumedMs: 0,
   };
 }
 
@@ -840,6 +997,25 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     agentTurns: 0,
     humanWindows: 0,
     agentTokens: { input: 0, output: 0, total: 0 },
+    agentGenMs: 0,
+    agentToolMs: 0,
+    stallMs: 0,
+    toolTurns: 0,
+    stalledTurns: 0,
+    humanIdleMs: 0,
+    humanSteerMs: 0,
+    humanQueueMs: 0,
+    idleWindows: 0,
+    steerCount: 0,
+    queueCount: 0,
+    idleKeystrokes: 0,
+    steerKeystrokes: 0,
+    queueKeystrokes: 0,
+    abandonedWindows: 0,
+    abandonedMs: 0,
+    extensionsGranted: 0,
+    extensionCreditMs: 0,
+    extensionConsumedMs: 0,
   };
 
   // Per-turn tool-execution accumulator (depth counter → union wall-clock).
@@ -908,6 +1084,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     id: string;
     turnIndex: number;
     agentMs: number;
+    toolMs: number;
+    stallMs: number;
     tokens: { input: number; output: number; total: number };
   } | null = null;
   let fallbackNotified = false;
@@ -995,12 +1173,19 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *  Unlike pi-tps (per-turn), this is the full session up to the moment. */
   function computeDisplayTotals(ctx: ExtensionContext): Totals {
     const now = Date.now();
-    let openHumanMs = 0;
-    let openWindows = 0;
+    let openIdleMs = 0;
+    let openIdleWindows = 0;
+    let openIdleKeystrokes = 0;
+    let openSteerMs = 0;
+    let openSteerCount = 0;
+    let openSteerKeystrokes = 0;
     if (humanWindow) {
+      // In-progress idle window: bill wall-clock from onset (capped), and fold
+      // in the live composition-density count as a provisional idle window.
       const elapsed = Math.max(0, now - humanWindow.openedAt);
-      openHumanMs = Math.min(elapsed, humanWindow.grantedBudgetMs);
-      openWindows = 1;
+      openIdleMs = Math.min(elapsed, humanWindow.grantedBudgetMs);
+      openIdleWindows = 1;
+      openIdleKeystrokes = idleKeystrokes;
     } else if (agentRunning && steerStaging.length > 0) {
       // In-progress steer/followUp composition during the run — no idle window
       // is open while the agent works, so show the typing-burst sum so far
@@ -1008,9 +1193,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       // until it's submitted (then it's recorded as a `steer` event). Shows
       // active typing only, so idle gaps during composition don't accrue.
       const cap = settings.graceMinutes * MS_PER_MINUTE + extensionBudgetMs;
-      openHumanMs = Math.min(computeBurstMs(steerStaging, STEER_GAP_MS), cap);
-      openWindows = 1;
+      openSteerMs = Math.min(computeBurstMs(steerStaging, STEER_GAP_MS), cap);
+      openSteerCount = 1;
+      openSteerKeystrokes = steerStaging.length;
     }
+    const openHumanMs = openIdleMs + openSteerMs;
+    const openWindows = openIdleWindows + openSteerCount;
     if (totals.agentTurns === 0 && totals.humanWindows === 0) {
       let tps: TpsMarker[] = [];
       try {
@@ -1025,21 +1213,19 @@ export default function ledgerExtension(pi: ExtensionAPI) {
           settings.referenceTps,
           now
         );
-        return {
-          agentMs: c.agentMs,
-          humanMs: c.humanMs,
-          agentTurns: c.agentTurns,
-          humanWindows: c.humanWindows,
-          agentTokens: c.agentTokens,
-        };
+        return { ...c };
       }
     }
     return {
-      agentMs: totals.agentMs,
+      ...totals,
       humanMs: totals.humanMs + openHumanMs,
-      agentTurns: totals.agentTurns,
       humanWindows: totals.humanWindows + openWindows,
-      agentTokens: totals.agentTokens,
+      humanIdleMs: totals.humanIdleMs + openIdleMs,
+      idleWindows: totals.idleWindows + openIdleWindows,
+      idleKeystrokes: totals.idleKeystrokes + openIdleKeystrokes,
+      humanSteerMs: totals.humanSteerMs + openSteerMs,
+      steerCount: totals.steerCount + openSteerCount,
+      steerKeystrokes: totals.steerKeystrokes + openSteerKeystrokes,
     };
   }
 
@@ -1072,10 +1258,17 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       billedMs = r.billedMs;
       // Only billed time beyond the per-window grace consumes the rolling
       // extension budget; the leftover rolls forward to the next idle window.
-      extensionBudgetMs -= consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
+      const consumed = consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
+      extensionBudgetMs -= consumed;
+      totals.humanIdleMs += billedMs;
+      totals.idleWindows += 1;
+      totals.idleKeystrokes += idleKeystrokes;
+      totals.extensionConsumedMs += consumed;
     } else {
       idleMs = Math.max(0, closedAt - w.openedAt); // span, kept for audit only
       billedMs = 0; // abandoned → unbilled
+      totals.abandonedWindows += 1;
+      totals.abandonedMs += idleMs;
     }
     // Always record the close (even abandoned/0-billed) so the open window is
     // marked closed on replay — never restored as a stale in-progress window.
@@ -1117,7 +1310,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (humanWindow) return; // safety: never open a second window
     idleKeystrokes = 0; // reset the composition-density count for the new window
     const graceMs = settings.graceMinutes * MS_PER_MINUTE;
-    if (extendMs > 0) extensionBudgetMs += extendMs;
+    if (extendMs > 0) {
+      extensionBudgetMs += extendMs;
+      totals.extensionCreditMs += extendMs; // provisioned capacity (one block)
+      totals.extensionsGranted += 1;
+    }
     const cap = graceMs + extensionBudgetMs;
     const openedAt = Date.now();
     humanWindow = {
@@ -1188,7 +1385,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     lastKeyTime = 0;
     // Only billed time beyond the per-window grace consumes rolling credit;
     // the leftover rolls forward (same rule as an idle window).
-    extensionBudgetMs -= consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
+    const consumed = consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
+    extensionBudgetMs -= consumed;
+    totals.extensionConsumedMs += consumed;
     appendSidecar({
       kind: 'steer',
       startedAt,
@@ -1204,6 +1403,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (billedMs > 0) {
       totals.humanMs += billedMs;
       totals.humanWindows += 1;
+      if (behavior === 'steer') {
+        totals.humanSteerMs += billedMs;
+        totals.steerCount += 1;
+        totals.steerKeystrokes += keystrokes;
+      } else {
+        totals.humanQueueMs += billedMs;
+        totals.queueCount += 1;
+        totals.queueKeystrokes += keystrokes;
+      }
     }
     updateStatus(ctx);
   }
@@ -1333,6 +1541,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         humanWindow.grantedBudgetMs += addMs;
         humanWindow.extensions += 1;
         extensionBudgetMs += addMs;
+        totals.extensionCreditMs += addMs; // provisioned capacity (one block)
+        totals.extensionsGranted += 1;
         appendSidecar({
           kind: 'human-open',
           openedAt: humanWindow.openedAt,
@@ -1552,6 +1762,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       totals.agentTokens.input -= lastFallback!.tokens.input;
       totals.agentTokens.output -= lastFallback!.tokens.output;
       totals.agentTokens.total -= lastFallback!.tokens.total;
+      totals.agentGenMs -= lastFallback!.agentMs - lastFallback!.toolMs;
+      totals.agentToolMs -= lastFallback!.toolMs;
+      totals.stallMs -= lastFallback!.stallMs;
+      if (lastFallback!.toolMs > 0) totals.toolTurns -= 1;
+      if (lastFallback!.stallMs > 0) totals.stalledTurns -= 1;
       lastFallback = null;
     }
     appendSidecar({
@@ -1577,6 +1792,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     totals.agentTokens.input += t.tokens.input || 0;
     totals.agentTokens.output += t.tokens.output || 0;
     totals.agentTokens.total += t.tokens.total || 0;
+    totals.agentGenMs += agentMs - toolMs;
+    totals.agentToolMs += toolMs;
+    totals.stallMs += stallMs;
+    if (toolMs > 0) totals.toolTurns += 1;
+    if (stallMs > 0) totals.stalledTurns += 1;
     updateStatus(lastCtx);
   });
 
@@ -1609,10 +1829,17 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     totals.agentTokens.input += fb.tokens.input;
     totals.agentTokens.output += fb.tokens.output;
     totals.agentTokens.total += fb.tokens.total;
+    totals.agentGenMs += agentMs - toolMs;
+    totals.agentToolMs += toolMs;
+    totals.stallMs += fb.stallMs;
+    if (toolMs > 0) totals.toolTurns += 1;
+    if (fb.stallMs > 0) totals.stalledTurns += 1;
     lastFallback = {
       id,
       turnIndex: event.turnIndex,
       agentMs,
+      toolMs,
+      stallMs: fb.stallMs,
       tokens: { input: fb.tokens.input, output: fb.tokens.output, total: fb.tokens.total },
     };
     updateStatus(ctx);

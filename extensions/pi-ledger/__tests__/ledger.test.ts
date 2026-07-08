@@ -302,6 +302,137 @@ describe('rehydrateFromSidecar', () => {
     expect(r.totals.agentTokens.total).toBe(150);
     expect(r.humanWindow).toBeNull();
   });
+  it('replays itemized sub-totals (agent gen/tool/stall, human idle/steer/queue/abandoned, extensions)', () => {
+    const events: SidecarEvent[] = [
+      { kind: 'settings', settings: { ...DEFAULTS, agentRatePerHour: 100 }, timestamp: 0 },
+      {
+        kind: 'agent',
+        id: 'a1',
+        turnIndex: 0,
+        agentMs: 3_600_000,
+        generationMs: 3_000_000,
+        stallMs: 500,
+        toolMs: 600_000,
+        tokens: { input: 100, output: 50, total: 150 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'tps',
+        timestamp: 1000,
+      },
+      {
+        kind: 'agent',
+        id: 'a2',
+        turnIndex: 1,
+        agentMs: 2_000_000,
+        generationMs: 2_000_000,
+        stallMs: 0,
+        toolMs: 0,
+        tokens: { input: 200, output: 100, total: 300 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'tps',
+        timestamp: 2000,
+      },
+      // idle window engaged via extension: grants one 20m block (1_200_000ms)
+      {
+        kind: 'human-open',
+        openedAt: 10_000,
+        grantedBudgetMs: 1_260_000,
+        extensions: 1,
+        engagedVia: 'extension',
+        extensionBudgetMs: 1_200_000,
+        timestamp: 10_000,
+      },
+      // committed idle: bills 120s = 60s grace + 60s credit (consumes 60s)
+      {
+        kind: 'human-close',
+        openedAt: 10_000,
+        closedAt: 130_000,
+        billedMs: 120_000,
+        idleMs: 120_000,
+        keystrokes: 50,
+        committed: true,
+        grantedBudgetMs: 1_260_000,
+        extensions: 1,
+        extensionBudgetMs: 1_140_000,
+        timestamp: 130_000,
+      },
+      // a steer (30s, under grace → no credit consumed) and a followUp (10s)
+      {
+        kind: 'steer',
+        startedAt: 200_000,
+        submittedAt: 230_000,
+        durationMs: 30_000,
+        billedMs: 30_000,
+        keystrokes: 20,
+        behavior: 'steer',
+        grantedBudgetMs: 1_200_000,
+        extensionBudgetMs: 1_140_000,
+        timestamp: 230_000,
+      },
+      {
+        kind: 'steer',
+        startedAt: 300_000,
+        submittedAt: 310_000,
+        durationMs: 10_000,
+        billedMs: 10_000,
+        keystrokes: 5,
+        behavior: 'followUp',
+        grantedBudgetMs: 1_200_000,
+        extensionBudgetMs: 1_140_000,
+        timestamp: 310_000,
+      },
+      // an abandoned window (walked away; no submit → 0 billed)
+      {
+        kind: 'human-open',
+        openedAt: 400_000,
+        grantedBudgetMs: 1_200_000,
+        extensions: 0,
+        engagedVia: 'keystroke',
+        extensionBudgetMs: 1_140_000,
+        timestamp: 400_000,
+      },
+      {
+        kind: 'human-close',
+        openedAt: 400_000,
+        closedAt: 600_000,
+        billedMs: 0,
+        idleMs: 200_000,
+        committed: false,
+        grantedBudgetMs: 1_200_000,
+        extensions: 0,
+        extensionBudgetMs: 1_140_000,
+        timestamp: 600_000,
+      },
+    ];
+    const r = rehydrateFromSidecar(events);
+    // agent split: generation (token-normalized) vs tool, plus unbilled stall
+    expect(r.totals.agentMs).toBe(5_600_000);
+    expect(r.totals.agentGenMs).toBe(5_000_000); // (3.6m−600k) + 2m
+    expect(r.totals.agentToolMs).toBe(600_000);
+    expect(r.totals.stallMs).toBe(500);
+    expect(r.totals.toolTurns).toBe(1);
+    expect(r.totals.stalledTurns).toBe(1);
+    expect(r.totals.agentTurns).toBe(2);
+    // human split: committed idle vs steering vs queuing, plus abandoned
+    expect(r.totals.humanMs).toBe(160_000); // 120k + 30k + 10k (abandoned bills 0)
+    expect(r.totals.humanWindows).toBe(3);
+    expect(r.totals.humanIdleMs).toBe(120_000);
+    expect(r.totals.idleWindows).toBe(1);
+    expect(r.totals.idleKeystrokes).toBe(50);
+    expect(r.totals.humanSteerMs).toBe(30_000);
+    expect(r.totals.steerCount).toBe(1);
+    expect(r.totals.steerKeystrokes).toBe(20);
+    expect(r.totals.humanQueueMs).toBe(10_000);
+    expect(r.totals.queueCount).toBe(1);
+    expect(r.totals.queueKeystrokes).toBe(5);
+    expect(r.totals.abandonedWindows).toBe(1);
+    expect(r.totals.abandonedMs).toBe(200_000);
+    // extensions: 1 block granted (1_200_000), 60s consumed, 1_140_000 remaining
+    expect(r.totals.extensionsGranted).toBe(1);
+    expect(r.totals.extensionCreditMs).toBe(1_200_000);
+    expect(r.totals.extensionConsumedMs).toBe(60_000);
+    expect(r.extensionBudgetMs).toBe(1_140_000);
+    expect(r.totals.extensionCreditMs - r.totals.extensionConsumedMs).toBe(r.extensionBudgetMs);
+  });
   it('defaults settings when none persisted', () => {
     const r = rehydrateFromSidecar([]);
     expect(r.settings).toEqual(DEFAULTS);
@@ -920,6 +1051,18 @@ describe('extension integration', () => {
     expect(seg.billedMs).toBe(51 * 60_000); // the whole thinking span (21 + 20 + 10) min, under the 61m cap
     expect(seg.committed).toBe(true); // committed by the submit (agent action), not abandoned
     expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('extension'); // engaged via the first extend
+
+    // live accumulation round-trips through rehydrate: 3 blocks granted (60m),
+    // 51m billed (50m beyond grace consumed), 10m credit remaining.
+    const r = rehydrateFromSidecar(fixture.readSidecarEvents());
+    expect(r.totals.extensionsGranted).toBe(3);
+    expect(r.totals.extensionCreditMs).toBe(3 * 20 * 60_000);
+    expect(r.totals.extensionConsumedMs).toBe(50 * 60_000);
+    expect(r.extensionBudgetMs).toBe(10 * 60_000);
+    expect(r.totals.humanIdleMs).toBe(51 * 60_000);
+    expect(r.totals.idleWindows).toBe(1);
+    expect(r.totals.humanSteerMs).toBe(0);
+    expect(r.totals.abandonedWindows).toBe(0);
   });
 
   it('suppresses the wizard at the next agent_end while rolling extension credit remains', async () => {
@@ -1716,6 +1859,14 @@ describe('steering composition (human types while the agent runs)', () => {
     expect(steers).toHaveLength(2);
     expect(steers[0]!.billedMs).toBe(10_000);
     expect(steers[1]!.billedMs).toBe(20_000);
+
+    // steering bills as human time, distinct from idle (no idle window here).
+    const r = rehydrateFromSidecar(fixture.readSidecarEvents());
+    expect(r.totals.humanSteerMs).toBe(30_000); // 10s + 20s
+    expect(r.totals.steerCount).toBe(2);
+    expect(r.totals.humanWindows).toBe(2);
+    expect(r.totals.humanIdleMs).toBe(0);
+    expect(r.totals.idleWindows).toBe(0);
   });
 
   it('discards an unsubmitted in-run composition (no backdate — it never reached the agent)', async () => {
