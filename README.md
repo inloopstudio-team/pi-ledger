@@ -31,7 +31,7 @@ grace minute of human time is billable, and a wizard pops immediately at
 ## Quick start
 
 ```bash
-pi install npm:@monotykamary/pi-ledger
+pi install github:inloopstudio-team/pi-ledger
 # optional — better stall detection & per-turn fidelity:
 pi install npm:@monotykamary/pi-tps
 ```

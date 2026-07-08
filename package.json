@@ -6,6 +6,9 @@
     "pi-package"
   ],
   "license": "MIT",
+  "repository": "github:inloopstudio-team/pi-ledger",
+  "homepage": "https://github.com/inloopstudio-team/pi-ledger#readme",
+  "bugs": "https://github.com/inloopstudio-team/pi-ledger/issues",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
