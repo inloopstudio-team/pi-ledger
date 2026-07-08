@@ -27,6 +27,7 @@ import {
   type LedgerSettings,
   type ReceiptData,
   type SidecarEvent,
+  type SteerEvent,
 } from '../index';
 
 // Stub the browser opener so /ledger-receipt never launches anything during tests.
@@ -1405,5 +1406,236 @@ describe('extension integration', () => {
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // post-turn window → wizard pops
     // the wizard pops at agent_end (where it belongs), not at session_start
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Steering composition (human types while the agent runs) ────────────────
+
+function lastSteer(fixture: TestFixture): SteerEvent | undefined {
+  return fixture.lastSidecarEvent('steer') as SteerEvent | undefined;
+}
+
+function steerInput(behavior: 'steer' | 'followUp', source = 'interactive', text = 'h') {
+  return { type: 'input' as const, text, source, streamingBehavior: behavior };
+}
+
+describe('steering composition (human types while the agent runs)', () => {
+  let fixture: TestFixture;
+  let cacheDir: string;
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
+    process.env.XDG_CACHE_HOME = cacheDir;
+    fixture = createTestFixture();
+    await activateExtension(fixture);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.XDG_CACHE_HOME;
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  it('installs an editor wrapper at session_start (TUI) to observe keystrokes', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    expect(fixture.setEditorComponentSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not install the editor in non-TUI modes (no composition to capture)', () => {
+    (fixture.mockCtx as unknown as { mode: string }).mode = 'print';
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    expect(fixture.setEditorComponentSpy).not.toHaveBeenCalled();
+  });
+
+  it('bills a steer composed during the run under the grace minute', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' }); // run begins; closes the initial window
+    fixture.sendEditorKey('h'); // composition onset (first keystroke during the run)
+    await vi.advanceTimersByTimeAsync(30_000); // 30s composing mid-stream
+    fixture.run('input', steerInput('steer'));
+
+    const steer = lastSteer(fixture);
+    expect(steer).toBeDefined();
+    expect(steer!.billedMs).toBe(30_000); // under 1m grace → billed in full
+    expect(steer!.durationMs).toBe(30_000);
+    expect(steer!.behavior).toBe('steer');
+    expect(steer!.grantedBudgetMs).toBe(60_000); // grace 1m, no credit
+    expect(steer!.extensionBudgetMs).toBe(0);
+  });
+
+  it('consumes rolling credit for a steer composed beyond the grace minute', async () => {
+    // Rehydrate 19m of rolling pomodoro credit from a prior idle window.
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      {
+        kind: 'human-open',
+        openedAt: 0,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 20 * 60_000,
+        timestamp: 1000,
+      },
+      {
+        kind: 'human-close',
+        openedAt: 0,
+        closedAt: 2 * 60_000,
+        billedMs: 2 * 60_000,
+        idleMs: 2 * 60_000,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 19 * 60_000,
+        timestamp: 2000,
+      },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    fixture.run('agent_start', { type: 'agent_start' }); // close the initial window; start the run
+    fixture.sendEditorKey('h');
+    await vi.advanceTimersByTimeAsync(3 * 60_000); // 3m composing
+    fixture.run('input', steerInput('steer'));
+
+    const steer = lastSteer(fixture);
+    expect(steer!.billedMs).toBe(3 * 60_000); // under the 20m cap (grace 1m + 19m credit)
+    expect(steer!.grantedBudgetMs).toBe(20 * 60_000);
+    expect(steer!.extensionBudgetMs).toBe(17 * 60_000); // 19m − 2m consumed beyond grace
+  });
+
+  it('bills a queued followUp the same as a mid-stream steer', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('h');
+    await vi.advanceTimersByTimeAsync(45_000); // 45s composing
+    fixture.run('input', steerInput('followUp'));
+
+    const steer = lastSteer(fixture);
+    expect(steer!.behavior).toBe('followUp');
+    expect(steer!.billedMs).toBe(45_000);
+  });
+
+  it('ignores steers from non-interactive sources (extension/rpc injected)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('h');
+    await vi.advanceTimersByTimeAsync(30_000);
+    fixture.run('input', steerInput('steer', 'extension'));
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
+  });
+
+  it('does not record a steer for a normal idle prompt (submitted between turns)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens the idle window
+    await vi.advanceTimersByTimeAsync(30_000);
+    fixture.run('input', { type: 'input', text: 'next', source: 'interactive' }); // no streamingBehavior
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
+  });
+
+  it('does not record a steer when no keystrokes preceded the submit (no onset)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    // no sendEditorKey — steerComposeStart stays null
+    await vi.advanceTimersByTimeAsync(30_000);
+    fixture.run('input', steerInput('steer'));
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
+  });
+
+  it('records multiple steers in one run, each with its own onset', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('a');
+    await vi.advanceTimersByTimeAsync(10_000);
+    fixture.run('input', steerInput('steer', 'interactive', 'a'));
+    fixture.sendEditorKey('b'); // new onset
+    await vi.advanceTimersByTimeAsync(20_000);
+    fixture.run('input', steerInput('steer', 'interactive', 'b'));
+
+    const steers = fixture.readSidecarEvents().filter((e) => e.kind === 'steer') as SteerEvent[];
+    expect(steers).toHaveLength(2);
+    expect(steers[0]!.billedMs).toBe(10_000);
+    expect(steers[1]!.billedMs).toBe(20_000);
+  });
+
+  it('carries an unsubmitted in-run composition into the post-turn idle window (backdated onset)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('h'); // onset during the run
+    const onset = Date.now();
+    await vi.advanceTimersByTimeAsync(20_000); // 20s into the run, still composing
+    // the agent finishes before the human submits — no `input` fires mid-stream
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // idle window backdated to onset
+    await vi.advanceTimersByTimeAsync(0); // flush the wizard's resolved promise
+
+    const open = fixture.lastSidecarEvent('human-open') as { openedAt: number } | undefined;
+    expect(open).toBeDefined();
+    expect(open!.openedAt).toBe(onset);
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // not submitted mid-stream
+
+    await vi.advanceTimersByTimeAsync(10_000); // 10s more → 30s since onset
+    fixture.run('input', { type: 'input', text: 'h', source: 'interactive' }); // idle prompt
+    fixture.run('agent_start', { type: 'agent_start' }); // closes the window
+
+    const close = fixture.lastSidecarEvent('human-close') as
+      | {
+          billedMs: number;
+          idleMs: number;
+          openedAt: number;
+        }
+      | undefined;
+    expect(close).toBeDefined();
+    expect(close!.openedAt).toBe(onset);
+    expect(close!.idleMs).toBe(30_000); // onset → agent_start = 30s
+    expect(close!.billedMs).toBe(30_000); // under the 1m grace
+  });
+
+  it('opens a fresh idle window (not backdated) when the steer was submitted mid-run', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('h');
+    const onset = Date.now();
+    await vi.advanceTimersByTimeAsync(15_000); // 15s composing
+    fixture.run('input', steerInput('steer')); // submitted mid-run → recorded, onset reset
+    expect(lastSteer(fixture)!.startedAt).toBe(onset);
+    const afterSubmit = Date.now();
+    await vi.advanceTimersByTimeAsync(25_000); // agent keeps working
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // idle window opens fresh
+    await vi.advanceTimersByTimeAsync(0);
+
+    const open = fixture.lastSidecarEvent('human-open') as { openedAt: number } | undefined;
+    expect(open).toBeDefined();
+    expect(open!.openedAt).toBe(afterSubmit + 25_000); // agent_end time, NOT the steer onset
+    expect(open!.openedAt).not.toBe(onset);
+  });
+
+  it('shows in-progress steer composition in /ledger while the run is active', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('h'); // onset
+    await vi.advanceTimersByTimeAsync(30_000); // 30s composing (not yet submitted)
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
+    expect(msg).toContain('human 0.01h (1 windows)'); // 30s counted as 1 in-progress window
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // not submitted yet
+  });
+
+  it('rehydrates steer events into human time and rolling credit', async () => {
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      {
+        kind: 'steer',
+        startedAt: 1000,
+        submittedAt: 31_000,
+        durationMs: 30_000,
+        billedMs: 30_000,
+        behavior: 'steer',
+        grantedBudgetMs: 60_000,
+        extensionBudgetMs: 0,
+        timestamp: 31_000,
+      },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
+    expect(msg).toContain('human 0.01h'); // 30s steer rehydrated as human time
+    expect(msg).toContain('(2 windows)'); // 1 rehydrated steer + 1 open initial window
   });
 });

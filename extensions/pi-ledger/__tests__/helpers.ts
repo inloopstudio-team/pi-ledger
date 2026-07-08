@@ -4,6 +4,34 @@ import { vi } from 'vitest';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { sidecarPathFor, type SidecarEvent } from '../index';
 
+// Minimal fakes for instantiating a CustomEditor headlessly in tests: the
+// editor wrapper delegates every keystroke to the base editor, which only
+// needs these to process a key without a real terminal. See LedgerEditor.
+const FAKE_TUI = {
+  requestRender() {},
+  requestGlobalRender() {},
+  getColumns() {
+    return 80;
+  },
+  getRows() {
+    return 24;
+  },
+};
+const FAKE_THEME = {
+  borderColor: '',
+  borderMutedColor: '',
+  text: '',
+  accent: '',
+  muted: '',
+  dim: '',
+  success: '',
+  error: '',
+  warning: '',
+  bg: (s: string) => s,
+  fg: (_c: string, s: string) => s,
+};
+const FAKE_KB = { matches: () => false };
+
 const TEST_SESSION_ID = '019fabcd-aaaa-bbbb-cccc-dddddddddddd';
 
 export interface TestFixture {
@@ -22,6 +50,9 @@ export interface TestFixture {
   setStatusSpy: ReturnType<typeof vi.fn>;
   customSpy: ReturnType<typeof vi.fn>;
   registerCommandSpy: ReturnType<typeof vi.fn>;
+  setEditorComponentSpy: ReturnType<typeof vi.fn>;
+  /** Send a keystroke into the editor wrapper installed via setEditorComponent. */
+  sendEditorKey: (data: string) => void;
   emitEvent: (event: string, payload: unknown) => void;
   /** Invoke a lifecycle handler registered via pi.on(name, fn) with (event, ctx). */
   run: (name: string, event: unknown) => void;
@@ -88,6 +119,17 @@ export function createTestFixture(): TestFixture {
   const registerCommandSpy = vi.fn((name: string, options: unknown) => {
     commands[name] = options as TestFixture['commands'][string];
   });
+  const setEditorComponentSpy = vi.fn();
+  let editorFactory:
+    | ((tui: unknown, theme: unknown, kb: unknown) => { handleInput(data: string): void })
+    | null = null;
+  let editorComponent: { handleInput(data: string): void } | null = null;
+  setEditorComponentSpy.mockImplementation((factory: unknown) => {
+    if (typeof factory === 'function') {
+      editorFactory = factory as typeof editorFactory;
+      editorComponent = null; // rebuild on reinstall (e.g. session reload)
+    }
+  });
 
   const mockEntries: Array<{ type?: string; customType?: string; data?: unknown }> = [];
 
@@ -104,6 +146,7 @@ export function createTestFixture(): TestFixture {
       notify: notifySpy,
       setStatus: setStatusSpy,
       custom: customSpy,
+      setEditorComponent: setEditorComponentSpy,
     },
     sessionManager: {
       getEntries: vi.fn().mockReturnValue(mockEntries),
@@ -182,6 +225,12 @@ export function createTestFixture(): TestFixture {
     }
   };
 
+  const sendEditorKey = (data: string) => {
+    if (!editorFactory) return;
+    if (!editorComponent) editorComponent = editorFactory(FAKE_TUI, FAKE_THEME, FAKE_KB);
+    editorComponent.handleInput(data);
+  };
+
   return {
     mockPi,
     handlers,
@@ -191,6 +240,8 @@ export function createTestFixture(): TestFixture {
     setStatusSpy,
     customSpy,
     registerCommandSpy,
+    setEditorComponentSpy,
+    sendEditorKey,
     emitEvent,
     run,
     setCustomResult,

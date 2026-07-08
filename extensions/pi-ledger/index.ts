@@ -37,9 +37,11 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  KeybindingsManager,
   Theme,
 } from '@earendil-works/pi-coding-agent';
 import {
+  CustomEditor,
   DynamicBorder,
   getSelectListTheme,
   getSettingsListTheme,
@@ -51,8 +53,10 @@ import {
   SettingsList,
   Spacer,
   Text,
+  type EditorTheme,
   type SelectItem,
   type SettingItem,
+  type TUI,
 } from '@earendil-works/pi-tui';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -164,6 +168,32 @@ export interface HumanCloseEvent {
   timestamp: number;
 }
 
+/** A steer/followUp the human composed and submitted WHILE the agent was
+ *  running (a mid-stream interrupt or a message queued until the agent
+ *  finishes). Billed as human time under the same grace + rolling-credit cap
+ *  as an idle window. The editor hook records the composition onset (first
+ *  keystroke during the run); the `input` event records the submit and how
+ *  it was delivered. */
+export interface SteerEvent {
+  kind: 'steer';
+  /** First keystroke during the run (composition onset). */
+  startedAt: number;
+  /** Submit time (the `input` event). */
+  submittedAt: number;
+  /** Composition duration (submittedAt − startedAt), kept for audit. */
+  durationMs: number;
+  /** Billed = min(duration, granted budget). */
+  billedMs: number;
+  /** How the message was delivered: "steer" (mid-stream interrupt) or
+   *  "followUp" (queued until the agent finishes). */
+  behavior: 'steer' | 'followUp';
+  /** The window's billing cap = grace + rolling extension budget at submit. */
+  grantedBudgetMs: number;
+  /** Remaining rolling extension budget after this steer (carried forward). */
+  extensionBudgetMs: number;
+  timestamp: number;
+}
+
 /** A settings snapshot (rates, grace, project, …). Last one wins on replay. */
 export interface SettingsEvent {
   kind: 'settings';
@@ -172,7 +202,12 @@ export interface SettingsEvent {
 }
 
 /** The sidecar event log: per-session, append-only, survives compaction. */
-export type SidecarEvent = SettingsEvent | AgentEvent | HumanOpenEvent | HumanCloseEvent;
+export type SidecarEvent =
+  | SettingsEvent
+  | AgentEvent
+  | HumanOpenEvent
+  | HumanCloseEvent
+  | SteerEvent;
 
 /** The slice of pi-tps's `tps:telemetry` payload that we read. */
 interface TpsTelemetry {
@@ -421,6 +456,14 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
         e,
         (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE
       );
+    } else if (e.kind === 'steer') {
+      // A steer/followUp composed during a run is human time, billed under the
+      // same grace + rolling-credit cap as an idle window. It consumes rolling
+      // credit beyond grace; its `extensionBudgetMs` is the credit remaining
+      // after the steer (carried forward, last wins on replay).
+      humanMs += e.billedMs;
+      humanWindows += 1;
+      extensionBudgetMs = e.extensionBudgetMs;
     }
   }
   // Last unclosed human-open (by append order) is the in-progress window.
@@ -743,6 +786,17 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // it's exhausted.
   let extensionBudgetMs = 0;
 
+  // Whether the agent loop is currently running (between agent_start and
+  // agent_end). Steering composition is metered only while this is true — the
+  // initial and idle windows already capture typing outside a run.
+  let agentRunning = false;
+  // Wall-clock of the first keystroke during the current run — the onset of a
+  // steer/followUp the human is composing while the agent works. Set by the
+  // editor hook (`noteKeystroke`), consumed by the `input` event when the steer
+  // is submitted, and reset at agent_start and after each recorded steer.
+  // Null when the human isn't composing mid-run.
+  let steerComposeStart: number | null = null;
+
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Latest ctx (event-bus listeners for tps:telemetry don't receive one).
@@ -850,6 +904,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       const elapsed = Math.max(0, now - humanWindow.openedAt);
       openHumanMs = Math.min(elapsed, humanWindow.grantedBudgetMs);
       openWindows = 1;
+    } else if (agentRunning && steerComposeStart !== null) {
+      // In-progress steer/followUp composition during the run — no idle window
+      // is open while the agent works, so show the composition so far (capped
+      // at grace + current rolling credit) like an open human window, until
+      // it's submitted (then it's recorded as a `steer` event).
+      const elapsed = Math.max(0, now - steerComposeStart);
+      const cap = settings.graceMinutes * MS_PER_MINUTE + extensionBudgetMs;
+      openHumanMs = Math.min(elapsed, cap);
+      openWindows = 1;
     }
     if (totals.agentTurns === 0 && totals.humanWindows === 0) {
       let tps: TpsMarker[] = [];
@@ -933,22 +996,27 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *  closes at the next `agent_start` (or `session_shutdown`) and bills
    *  `min(idle, cap)`, so the first grace minute is always billable and the
    *  rest is scale-to-zero unless explicitly extended. */
-  function openHumanWindow(ctx: ExtensionContext, opts: { silent: boolean }) {
+  function openHumanWindow(ctx: ExtensionContext, opts: { silent: boolean; openedAt?: number }) {
     if (humanWindow) closeHumanWindow(ctx); // safety: close any stale window
     const graceMs = settings.graceMinutes * MS_PER_MINUTE;
     const cap = graceMs + extensionBudgetMs;
+    // `openedAt` lets a post-turn idle window backdate to the onset of a
+    // composition that started during the run (see `agent_end`) — so typing
+    // begun mid-run that's submitted after the agent finishes is metered as
+    // one continuous human window from the first keystroke.
+    const openedAt = opts.openedAt ?? Date.now();
     humanWindow = {
-      openedAt: Date.now(),
+      openedAt,
       grantedBudgetMs: cap,
       extensions: 0,
     };
     appendSidecar({
       kind: 'human-open',
-      openedAt: humanWindow.openedAt,
+      openedAt,
       grantedBudgetMs: humanWindow.grantedBudgetMs,
       extensions: 0,
       extensionBudgetMs,
-      timestamp: humanWindow.openedAt,
+      timestamp: openedAt,
     });
     if (!opts.silent) {
       // Don't nag while provisioned capacity remains: arm the wizard to fire
@@ -956,6 +1024,45 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       // pop immediately so the user can buy a pomodoro block.
       if (extensionBudgetMs > 0) armWizardForBoundary(ctx);
       else armWizardNow(ctx);
+    }
+    updateStatus(ctx);
+  }
+
+  // Steering composition: the human types a steer/followUp while the agent
+  // runs. The editor hook (`noteKeystroke`) marks the composition onset; the
+  // `input` event records the submit. Billed as human time under the same
+  // grace + rolling-credit cap as an idle window — steering is human oversight,
+  // not agent work, so it's metered separately from generation.
+  function noteKeystroke() {
+    // Record the onset of a mid-run composition on its first keystroke.
+    // Subsequent keystrokes (and the submitting Enter) are no-ops here — only
+    // the onset matters; the `input` event closes the window. Outside a run
+    // this is a no-op (the initial/idle windows already capture typing).
+    if (agentRunning && steerComposeStart === null) steerComposeStart = Date.now();
+  }
+
+  function recordSteer(ctx: ExtensionContext, behavior: 'steer' | 'followUp', startedAt: number) {
+    const submittedAt = Date.now();
+    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
+    const cap = graceMs + extensionBudgetMs;
+    const { idleMs: durationMs, billedMs } = closeWindowBudget(startedAt, submittedAt, cap);
+    // Only billed time beyond the per-window grace consumes rolling credit;
+    // the leftover rolls forward (same rule as an idle window).
+    extensionBudgetMs -= consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
+    appendSidecar({
+      kind: 'steer',
+      startedAt,
+      submittedAt,
+      durationMs,
+      billedMs,
+      behavior,
+      grantedBudgetMs: cap,
+      extensionBudgetMs,
+      timestamp: submittedAt,
+    });
+    if (billedMs > 0) {
+      totals.humanMs += billedMs;
+      totals.humanWindows += 1;
     }
     updateStatus(ctx);
   }
@@ -1120,6 +1227,19 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.on('session_start', (_event, ctx) => {
     lastCtx = ctx;
     rehydrate(ctx);
+    agentRunning = false;
+    steerComposeStart = null;
+    // Wrap the input editor so keystrokes during an agent run mark the onset
+    // of a steer/followUp composition (metered on submit via the `input`
+    // event). Extends CustomEditor and delegates every keystroke to the base
+    // editor, so app keybindings (escape-to-abort, ctrl+d, …) are preserved.
+    // TUI-only: non-interactive modes have no editor to type into, so there's
+    // no composition onset to capture (and `input` skips non-interactive steers).
+    if (ctx.mode === 'tui' && ctx.hasUI) {
+      ctx.ui.setEditorComponent(
+        (tui, theme, kb) => new LedgerEditor(tui, theme, kb, noteKeystroke)
+      );
+    }
     // Open an INITIAL human window if none was restored by rehydrate — it
     // spans first-prompt composition (session_start → first agent_start) and
     // post-/resume or /new review time. Same cap as any window (grace + rolling
@@ -1326,11 +1446,23 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   pi.on('agent_start', (_event, ctx) => {
     lastCtx = ctx;
+    agentRunning = true;
+    steerComposeStart = null; // a new run starts; any prior onset is stale
     closeHumanWindow(ctx);
   });
 
   pi.on('agent_end', (event, ctx) => {
     lastCtx = ctx;
+    agentRunning = false;
+    // If the human was composing during the run but hadn't submitted a
+    // steer/followUp before the agent finished, carry that onset into the
+    // post-turn idle window — composition that started mid-run and continues
+    // into idle is then metered as one continuous human window from the first
+    // keystroke. (A steer submitted mid-stream was already recorded as a
+    // `steer` event and reset this, so the idle window opens fresh.) Reset
+    // either way.
+    const composeStart = steerComposeStart;
+    steerComposeStart = null;
     if (!tpsEverSeen && !fallbackNotified) {
       fallbackNotified = true;
       notify(
@@ -1353,8 +1485,26 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (lastAssistantStopReason(event.messages) === 'error') return;
     // Open the post-turn idle window (grace + rolling credit). The wizard pops
     // here — immediately when no credit remains, or armed for exhaustion when
-    // some does — so this is where billing extensions are offered.
-    openHumanWindow(ctx, { silent: false });
+    // some does — so this is where billing extensions are offered. Backdate the
+    // window to a mid-run composition onset (if any) so typing begun during the
+    // run that's submitted after the agent finishes is metered continuously.
+    openHumanWindow(ctx, { silent: false, openedAt: composeStart ?? undefined });
+  });
+
+  // Steering composition is submitted via the `input` event, which tells us
+  // how the message is delivered (`streamingBehavior`: "steer" for a mid-stream
+  // interrupt, "followUp" for a queued message) and where it came from
+  // (`source`: "interactive" for a human typing). Record the composition window
+  // [onset, submit] as human time. Pass-through: never transform or handle the
+  // input — only observe it for billing.
+  pi.on('input', (event, ctx) => {
+    lastCtx = ctx;
+    const behavior = event.streamingBehavior;
+    if (behavior !== 'steer' && behavior !== 'followUp') return; // only mid-run
+    if (event.source !== 'interactive') return; // only human-typed steers
+    if (steerComposeStart === null) return; // no onset (e.g. non-TUI / no editor)
+    recordSteer(ctx, behavior, steerComposeStart);
+    steerComposeStart = null;
   });
 
   // ── Commands ──────────────────────────────────────────────────────────
@@ -1648,6 +1798,27 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 }
 
 // ─── Module-local helpers ──────────────────────────────────────────────────
+
+/** Editor wrapper that observes keystrokes so pi-ledger can meter steering
+ *  composition while the agent runs. Extends `CustomEditor` (app keybindings,
+ *  escape-to-abort, ctrl+d, model switching, autocomplete, …) and delegates
+ *  every keystroke to the base editor; the only addition is a lightweight
+ *  `onKeystroke` callback fired before `super.handleInput`. The callback is
+ *  trivial (sets one timestamp) and never throws, so input is never blocked. */
+class LedgerEditor extends CustomEditor {
+  constructor(
+    tui: TUI,
+    theme: EditorTheme,
+    keybindings: KeybindingsManager,
+    private readonly onKeystroke: () => void
+  ) {
+    super(tui, theme, keybindings);
+  }
+  override handleInput(data: string): void {
+    this.onKeystroke();
+    super.handleInput(data);
+  }
+}
 
 function defaultAuthor(): string {
   try {
