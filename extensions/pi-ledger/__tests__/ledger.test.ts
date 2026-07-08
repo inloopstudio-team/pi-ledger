@@ -354,7 +354,12 @@ describe('rehydrateFromSidecar', () => {
       },
     ];
     const r = rehydrateFromSidecar(events);
-    expect(r.humanWindow).toEqual({ openedAt: 5000, grantedBudgetMs: 60_000, extensions: 0 });
+    expect(r.humanWindow).toEqual({
+      openedAt: 5000,
+      grantedBudgetMs: 60_000,
+      extensions: 0,
+      engagedVia: 'keystroke',
+    });
   });
   it('does not reconstruct a human window that was closed', () => {
     const events: SidecarEvent[] = [
@@ -398,6 +403,7 @@ describe('rehydrateFromSidecar', () => {
       openedAt: 1000,
       grantedBudgetMs: 21 * 60_000,
       extensions: 1,
+      engagedVia: 'keystroke',
     });
     expect(r.extensionBudgetMs).toBe(20 * 60_000);
   });
@@ -766,17 +772,22 @@ describe('extension integration', () => {
     expect(agentEntries).toHaveLength(1); // only the turn-0 tps entry
   });
 
-  it('pops the wizard immediately at agent_end and bills actual idle under grace when ignored', async () => {
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately (no selection → ignored)
+  it('pops the wizard at agent_end (no credit) and bills engaged idle under grace when committed', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // install the editor (no pop)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → wizard pops (engagement prompt)
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(5000); // 5s idle, under 1m grace
-    fixture.run('agent_start', { type: 'agent_start' });
+    await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard promise
+    fixture.sendEditorKey('k'); // ENGAGE the idle window at onset (now)
+    await vi.advanceTimersByTimeAsync(5000); // 5s idle from onset, under 1m grace
+    fixture.run('agent_start', { type: 'agent_start' }); // COMMIT → bills 5s
 
     const seg = lastEntry(fixture, 'ledger-human');
     expect(seg).toBeDefined();
     expect(seg.billedMs).toBe(5000);
     expect(seg.grantedBudgetMs).toBe(60_000);
     expect(seg.extensions).toBe(0);
+    expect(seg.committed).toBe(true);
+    expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('keystroke');
   });
 
   // ── Retry/queue turns (pi-retry backoff) are not human idle ─────────────
@@ -796,21 +807,22 @@ describe('extension integration', () => {
   });
 
   it('does not bill the retry backoff between an errored turn and the retry agent_start', async () => {
-    // turn 1 errors → retry in flight (no human window opened)
+    // turn 1 errors → retry in flight (no human window opened, no engagement)
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'error' }],
     });
-    await vi.advanceTimersByTimeAsync(60_000); // 60s backoff — would bill a grace minute if a window were open
-    fixture.run('agent_start', { type: 'agent_start' }); // retry runs; nothing to close
-    // retry succeeds → a real human window opens now for genuine post-turn idle
+    await vi.advanceTimersByTimeAsync(60_000); // 60s backoff — would bill if a window were open
+    fixture.run('agent_start', { type: 'agent_start' }); // retry runs; nothing to close (no window)
+    expect(fixture.lastSidecarEvent('human-close')).toBeUndefined(); // backoff NOT billed
+    // retry succeeds → the agent hands back control, but no window opens until the
+    // human engages (idle is engagement-gated now); nothing is billed yet.
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'stop' }],
     });
-    const opens = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
-    expect(opens).toHaveLength(1); // only the post-success window, not during the retry
-    expect(fixture.lastSidecarEvent('human-close')).toBeUndefined(); // still open
+    expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-open')).toHaveLength(0);
+    expect(fixture.lastSidecarEvent('human-close')).toBeUndefined(); // still nothing billed
   });
 
   it('does not bill backoff across a multi-retry storm (one error turn per retry)', async () => {
@@ -828,34 +840,48 @@ describe('extension integration', () => {
     expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-close')).toHaveLength(0);
   });
 
-  it('opens the human window for a normal (stop) agent_end — regression guard', async () => {
+  it('pops the wizard for a normal (stop) agent_end; a keystroke then engages the window', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'stop' }],
     });
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops (engagement prompt)
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no window until engaged
+    fixture.sendEditorKey('k'); // engage → opens the idle window
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
   });
 
-  it('still opens the human window for an aborted agent_end (a retry is not in flight)', async () => {
+  it('still pops the wizard for an aborted agent_end (a retry is not in flight)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'aborted' }],
     });
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops (not an error retry)
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no window until engaged
+    fixture.sendEditorKey('k');
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
   });
 
-  it('opens the human window when agent_end has no assistant message (unchanged)', async () => {
+  it('pops the wizard when agent_end has no assistant message; a keystroke engages', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
+    fixture.sendEditorKey('k');
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
   });
 
-  it('caps human time at the grace minute when the wizard is dismissed', async () => {
+  it('caps engaged idle at the grace minute when the wizard is dismissed', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('stop');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately, dismissed ('stop')
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops, dismissed ('stop' → no engagement)
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(90_000); // 90s idle, no re-arm after dismiss
-    fixture.run('agent_start', { type: 'agent_start' });
+    await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard
+    fixture.sendEditorKey('k'); // engage the idle window at onset (wizard dismissed → engage via keystroke)
+    await vi.advanceTimersByTimeAsync(90_000); // 90s engaged idle, no extension
+    fixture.run('agent_start', { type: 'agent_start' }); // commit
 
     const seg = lastEntry(fixture, 'ledger-human');
     expect(seg.billedMs).toBe(60_000); // capped at grace
@@ -876,38 +902,42 @@ describe('extension integration', () => {
   });
 
   it('suppresses the wizard at the next agent_end while rolling extension credit remains', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pops → +20m
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pops → +20m, engages via extension
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(120_000); // 2m idle (under 21m cap); flushes the extend
-    fixture.run('agent_start', { type: 'agent_start' }); // close: 2m billed, 1m ext consumed → 19m left
+    fixture.run('agent_start', { type: 'agent_start' }); // commit: 2m billed, 1m ext consumed → 19m left
 
     const seg1 = lastEntry(fixture, 'ledger-human');
     expect(seg1.billedMs).toBe(120_000);
     expect(seg1.extensionBudgetMs).toBe(19 * 60_000);
 
-    // next agent_end: 19m credit remains → wizard is NOT shown (armed for exhaustion instead)
+    // next agent_end: 19m credit remains → wizard is NOT shown (no pop, no auto-open)
     fixture.customSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     expect(fixture.customSpy).not.toHaveBeenCalled();
-    // the new window's cap = per-window grace (1m) + 19m rolling credit = 20m
+    // the idle window opens only on engagement; engage via keystroke → cap = grace + 19m
+    fixture.sendEditorKey('k');
     const open = fixture.lastSidecarEvent('human-open');
-    expect(open!.grantedBudgetMs).toBe(20 * 60_000);
+    expect(open!.grantedBudgetMs).toBe(20 * 60_000); // per-window grace (1m) + 19m rolling credit
     expect(open!.extensionBudgetMs).toBe(19 * 60_000);
   });
 
   it('rolls unused extension credit across multiple agent turns', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // +20m
-    await vi.advanceTimersByTimeAsync(120_000); // 2m idle
-    fixture.run('agent_start', { type: 'agent_start' }); // close → 1m ext consumed → 19m left
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pops → +20m, engages via extension
+    await vi.advanceTimersByTimeAsync(120_000); // 2m idle (flushes the extend)
+    fixture.run('agent_start', { type: 'agent_start' }); // commit → 2m billed, 1m ext consumed → 19m left
 
-    // turn 2: credit remains → no pop
+    // turn 2: 19m credit remains → no pop at agent_end; engage via keystroke
     fixture.customSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     expect(fixture.customSpy).not.toHaveBeenCalled();
+    fixture.sendEditorKey('k'); // engage the new window (cap = grace + 19m)
     await vi.advanceTimersByTimeAsync(120_000); // 2m idle
-    fixture.run('agent_start', { type: 'agent_start' }); // close → 1m ext consumed → 18m left
+    fixture.run('agent_start', { type: 'agent_start' }); // commit → 1m ext consumed → 18m left
     expect(lastEntry(fixture, 'ledger-human').extensionBudgetMs).toBe(18 * 60_000);
 
     // turn 3: still 18m credit → still suppressed
@@ -918,7 +948,7 @@ describe('extension integration', () => {
 
   it('pops the wizard at agent_end when no rolling credit remains', async () => {
     fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
-    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate settings; no pop (startup)
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     expect(fixture.customSpy).toHaveBeenCalledTimes(1); // no credit → pop immediately
   });
@@ -947,9 +977,10 @@ describe('extension integration', () => {
         timestamp: 2000,
       },
     ]);
-    fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // rehydrate 19m credit
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate 19m credit; no pop
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     expect(fixture.customSpy).not.toHaveBeenCalled(); // 19m credit → suppressed
+    fixture.sendEditorKey('k'); // engage → open window with cap = grace + 19m
     const open = fixture.lastSidecarEvent('human-open');
     expect(open!.grantedBudgetMs).toBe(20 * 60_000); // grace 1m + 19m credit
     expect(open!.extensionBudgetMs).toBe(19 * 60_000);
@@ -976,12 +1007,16 @@ describe('extension integration', () => {
     expect(seg.billedMs).toBe(100_000);
   });
 
-  it('/ledger-extend warns when no window is open', async () => {
-    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx);
-    expect(fixture.notifySpy).toHaveBeenCalledWith(
-      expect.stringContaining('No active human-time window'),
-      'warning'
-    );
+  it('/ledger-extend opens the wizard with no window open (engage via extension)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.setCustomResult('extend');
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // no window → wizard → extend engages
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(0); // flush the extend → openIdleWindow('extension', 5m)
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open).toBeDefined();
+    expect(open!.engagedVia).toBe('extension');
+    expect(open!.grantedBudgetMs).toBe(60_000 + 5 * 60_000); // grace + 5m
   });
 
   it('rehydrates totals + settings on session_start and /ledger reports them', async () => {
@@ -1026,9 +1061,9 @@ describe('extension integration', () => {
 
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
     expect(msg).toContain('agent 1.00h (1 turns)');
-    // 1 closed human window (rehydrated) + 1 open initial window (opened at
-    // session_start) = 2 windows; the initial window's idle is ~0 here.
-    expect(msg).toContain('human 0.50h (2 windows)');
+    // 1 rehydrated closed human window — no initial window opens at session_start
+    // (engagement-gated), so just 1 window.
+    expect(msg).toContain('human 0.50h (1 windows)');
     expect(msg).toContain('total $125.00');
     // status line shows the live hours, grey (dim) like pi-core's footer
     expect(fixture.setStatusSpy).toHaveBeenCalledWith(
@@ -1074,8 +1109,11 @@ describe('extension integration', () => {
   });
 
   it('counts the in-progress open human window in /ledger (entire session up to now)', async () => {
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens a human window (wizard pops, ignored)
-    await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window still open
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops (no credit)
+    await vi.advanceTimersByTimeAsync(0); // flush dismissed wizard
+    fixture.sendEditorKey('k'); // ENGAGE the idle window at onset
+    await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window still open (uncommitted)
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
     // the open window's 30s idle is counted now (capped at the 1m grace), not deferred to close
@@ -1230,20 +1268,23 @@ describe('extension integration', () => {
     }
   });
 
-  it('session_shutdown closes the open window and persists its idle (exit recorded)', async () => {
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens a window (wizard pops, ignored)
-    await vi.advanceTimersByTimeAsync(30_000); // 30s idle
-    fixture.run('session_shutdown', { type: 'session_shutdown' }); // exit → close + record
-    const close = fixture.lastSidecarEvent('human-close') as { billedMs: number } | undefined;
+  it('session_shutdown abandons an uncommitted idle window (exit recorded, bills 0)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops (no credit)
+    await vi.advanceTimersByTimeAsync(0); // flush dismissed wizard
+    fixture.sendEditorKey('k'); // engage the idle window
+    await vi.advanceTimersByTimeAsync(30_000); // 30s idle, uncommitted (no submit)
+    fixture.run('session_shutdown', { type: 'session_shutdown' }); // exit → close, ABANDONED
+    const close = fixture.lastSidecarEvent('human-close');
     expect(close).toBeDefined();
-    expect(close!.billedMs).toBe(30_000); // 30s retained, capped at the 1m grace
-    // re-entering (rehydrate) retains the closed window's idle — not lost on exit.
-    // The closed 30s window + the open initial window (opened at session_start)
-    // = 2 windows; the idle (30s) is retained.
-    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    expect(close!.billedMs).toBe(0); // uncommitted idle bills nothing
+    expect(close!.committed).toBe(false);
+    // re-entering: the abandoned (0-billed) window is closed, not in-progress; idle
+    // was NOT retained (idle with no output is wasted). No initial window opens.
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
-    expect(msg).toContain('human 0.01h (2 windows)');
+    expect(msg).toContain('human 0.00h (0 windows)');
   });
 
   it('rehydrates from the sidecar, so compaction (empty JSONL) does not reset totals', async () => {
@@ -1284,7 +1325,10 @@ describe('extension integration', () => {
   });
 
   it('session_tree keeps the open human window idle (the growing-idle case)', async () => {
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens a window; idle grows
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops; no window yet
+    await vi.advanceTimersByTimeAsync(0);
+    fixture.sendEditorKey('k'); // engage the idle window; idle grows
     await vi.advanceTimersByTimeAsync(30_000); // 30s idle
     fixture.run('session_tree', { type: 'session_tree' }); // /tree → "go back"
     // status keeps the open window's idle — not reset to $0
@@ -1304,28 +1348,33 @@ describe('extension integration', () => {
 
   // ── Initial human window (first-prompt composition) ────────────────────
 
-  it('opens an initial human window at session_start and bills first-prompt composition (silent — no wizard)', async () => {
+  it('engages an initial human window on first keystroke and bills first-prompt composition (no wizard at startup)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    // the initial window opens silently — the wizard never auto-pops here
+    // no window opens at session_start — engagement is gated on the first keystroke
     expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
+    fixture.sendEditorKey('k'); // first keystroke ENGAGES the initial window at onset
     const open = fixture.lastSidecarEvent('human-open');
     expect(open).toBeDefined();
     expect(open!.grantedBudgetMs).toBe(60_000); // grace 1m; no credit provisioned yet
+    expect(open!.engagedVia).toBe('keystroke');
     expect(open!.extensionBudgetMs).toBe(0);
 
     await vi.advanceTimersByTimeAsync(30_000); // 30s composing the first prompt
-    fixture.run('agent_start', { type: 'agent_start' }); // submitted → close
+    fixture.run('agent_start', { type: 'agent_start' }); // submitted → commit
 
     const close = fixture.lastSidecarEvent('human-close');
     expect(close).toBeDefined();
     expect(close!.billedMs).toBe(30_000); // under the 1m grace → billed in full
+    expect(close!.committed).toBe(true);
     expect(close!.extensions).toBe(0);
   });
 
-  it('caps the initial window at the grace minute — a long composition bills only grace (abuse guard)', async () => {
+  it('caps the initial window at the grace minute — engaged idle beyond grace bills only grace (abuse guard)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    await vi.advanceTimersByTimeAsync(5 * 60_000); // 5m "thinking" before the first prompt
-    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('k'); // engage the initial window at onset
+    await vi.advanceTimersByTimeAsync(5 * 60_000); // 5m idle after engagement (no extension)
+    fixture.run('agent_start', { type: 'agent_start' }); // commit
 
     const close = fixture.lastSidecarEvent('human-close');
     expect(close!.billedMs).toBe(60_000); // capped at the 1m grace; the rest is unbilled
@@ -1347,9 +1396,15 @@ describe('extension integration', () => {
       },
     ]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
-    // rehydrate restored the unclosed window — don't open a second initial window
+    // rehydrate does NOT restore the stale unclosed window (idle with no committed
+    // agent action is wasted) — it abandons it (a human-close committed:false, 0)
+    // and opens no second window.
     const opens = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
     expect(opens).toHaveLength(1); // only the seeded one; no new human-open appended
+    const abandon = fixture.lastSidecarEvent('human-close');
+    expect(abandon).toBeDefined();
+    expect(abandon!.billedMs).toBe(0); // uncommitted → unbilled
+    expect(abandon!.committed).toBe(false);
   });
 
   it('carries rehydrated rolling credit into the initial window (cap = grace + credit), wizard silent', async () => {
@@ -1376,12 +1431,13 @@ describe('extension integration', () => {
         timestamp: 2000,
       },
     ]);
-    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
-    // the initial window inherits the 19m rolling credit: cap = grace 1m + 19m
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate 19m credit; no pop
+    // engaging inherits the 19m rolling credit: cap = grace 1m + 19m
+    fixture.sendEditorKey('k');
     const open = fixture.lastSidecarEvent('human-open');
     expect(open!.grantedBudgetMs).toBe(20 * 60_000);
     expect(open!.extensionBudgetMs).toBe(19 * 60_000);
-    // silent — the wizard never auto-pops for the initial window
+    // silent — the wizard never auto-pops at startup
     expect(fixture.customSpy).not.toHaveBeenCalled();
   });
 
@@ -1587,57 +1643,45 @@ describe('steering composition (human types while the agent runs)', () => {
   it('discards an unsubmitted in-run composition (no backdate — it never reached the agent)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
-    const firstKey = Date.now();
     await typeBurst(fixture, 20_000); // 20s of typing mid-run, NOT submitted
-    const agentEnd = Date.now(); // == the moment agent_end opens the idle window
     // the agent finishes before the human submits — no `input` fires mid-stream
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // idle window opens FRESH
-    await vi.advanceTimersByTimeAsync(0); // flush the wizard's resolved promise
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // discard staging; no idle window opens
+    await vi.advanceTimersByTimeAsync(0); // flush the wizard's dismissed promise
 
-    const open = fixture.lastSidecarEvent('human-open') as { openedAt: number } | undefined;
-    expect(open).toBeDefined();
-    expect(open!.openedAt).toBe(agentEnd); // fresh at agent_end, NOT backdated to the first key
-    expect(open!.openedAt).not.toBe(firstKey);
-    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // unsubmitted typing is discarded
+    // No steer (never submitted) and no idle window (no engagement yet) — the
+    // mid-run typing never reached the agent, so it bills nothing and opens nothing.
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
 
+    // The human engages AFTER the run (a fresh keystroke) and commits — only the
+    // post-run idle bills; the discarded mid-run typing isn't folded in.
+    fixture.sendEditorKey('k'); // engage the idle window at onset (now, post-run)
     await vi.advanceTimersByTimeAsync(10_000); // 10s of post-run idle
-    fixture.run('input', { type: 'input', text: 'h', source: 'interactive' }); // idle prompt
-    fixture.run('agent_start', { type: 'agent_start' }); // closes the idle window
+    fixture.run('agent_start', { type: 'agent_start' }); // commit → bills 10s
 
-    const close = fixture.lastSidecarEvent('human-close') as
-      | {
-          billedMs: number;
-          idleMs: number;
-          openedAt: number;
-        }
-      | undefined;
+    const close = fixture.lastSidecarEvent('human-close');
     expect(close).toBeDefined();
-    expect(close!.openedAt).toBe(agentEnd); // the idle window, not the discarded typing
-    expect(close!.idleMs).toBe(10_000); // only the 10s post-run idle — the 20s mid-run typing is unbilled
-    expect(close!.billedMs).toBe(10_000);
+    expect(close!.billedMs).toBe(10_000); // only the 10s post-run idle — the 20s mid-run typing is unbilled
   });
 
-  it('bills a submitted steer from its burst; the post-turn idle window bills only post-run idle', async () => {
+  it('bills a submitted steer from its burst; the post-turn idle bills only post-run idle', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 15_000); // 15s typing burst mid-run
-    fixture.run('input', steerInput('steer')); // submitted mid-run → recorded
+    fixture.run('input', steerInput('steer')); // committed mid-run
     const steer = lastSteer(fixture);
     expect(steer!.billedMs).toBe(15_000); // the typing burst
-    const afterAgentEnd = Date.now() + 25_000; // agent_end will fire 25s later
     await vi.advanceTimersByTimeAsync(25_000); // agent keeps working (no typing)
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // idle window opens fresh
-    await vi.advanceTimersByTimeAsync(0);
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no idle window opens (engagement-gated)
+    await vi.advanceTimersByTimeAsync(0); // flush the wizard's dismissed promise
 
-    const open = fixture.lastSidecarEvent('human-open') as { openedAt: number } | undefined;
-    expect(open).toBeDefined();
-    expect(open!.openedAt).toBe(afterAgentEnd); // fresh at agent_end, NOT the steer's first keystroke
+    // No idle window yet — the human hasn't engaged post-run.
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
 
+    fixture.sendEditorKey('k'); // engage the post-run idle window at onset
     await vi.advanceTimersByTimeAsync(10_000); // 10s post-run idle
-    fixture.run('agent_start', { type: 'agent_start' }); // closes the idle window
-    const close = fixture.lastSidecarEvent('human-close') as
-      | { billedMs: number; idleMs: number }
-      | undefined;
+    fixture.run('agent_start', { type: 'agent_start' }); // commit → bills 10s
+    const close = fixture.lastSidecarEvent('human-close');
     expect(close!.idleMs).toBe(10_000); // only post-run idle — no overlap with the steer's burst
     expect(close!.billedMs).toBe(10_000);
   });
@@ -1681,6 +1725,23 @@ describe('steering composition (human types while the agent runs)', () => {
     expect(steer!.keystrokes).toBe(4);
   });
 
+  it('collapses a held key (auto-repeat) so it cannot fabricate a sustained burst', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    // hold one key for ~1s: auto-repeat fires the SAME data every 10ms (well under
+    // AUTO_REPEAT_MS). Each repeat collapses to one timestamp → a zero-length burst.
+    for (let i = 0; i < 100; i++) {
+      fixture.sendEditorKey('a');
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    fixture.run('input', steerInput('steer'));
+
+    const steer = lastSteer(fixture);
+    expect(steer).toBeDefined();
+    expect(steer!.billedMs).toBe(0); // a held key bills nothing — no fabricated burst
+    expect(steer!.keystrokes).toBe(1); // 100 auto-repeats collapsed to one staged keystroke
+  });
+
   it('rehydrates steer events into human time and rolling credit', async () => {
     fixture.seedSidecar([
       { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
@@ -1698,9 +1759,10 @@ describe('steering composition (human types while the agent runs)', () => {
       },
     ]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    await vi.advanceTimersByTimeAsync(0); // flush the resume wizard pop (no engagement)
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
     expect(msg).toContain('human 0.01h'); // 30s steer rehydrated as human time
-    expect(msg).toContain('(2 windows)'); // 1 rehydrated steer + 1 open initial window
+    expect(msg).toContain('(1 windows)'); // just the rehydrated steer — no initial window (engagement-gated)
   });
 });

@@ -14,12 +14,16 @@
  * (a stall produces no tokens) and the real wall-clock generation/stall ms
  * stay on the event for audit; tool-execution time is billed as-is.
  *
- * Human time = the idle window between agent_end and the next agent_start,
- * capped by a granted budget: the first grace minute is always billable,
- * then a non-blocking wizard offers +pomodoro extensions; `/ledger-extend`
- * does the same manually. Extensions are ROLLING credit — provisioned
- * pomodoro blocks survive across agent turns, so the wizard stays silent
- * while credit remains and only re-pops when it's exhausted.
+ * Human time = the idle window the human ENGAGES with (first keystroke or
+ * extension) after agent_end, committed when their next submit produces agent
+ * work (agent_start) — so idle with no engagement, or engagement with no
+ * submit, bills nothing (idle with no output is wasted). Capped by a granted
+ * budget (grace + rolling extension credit). A non-blocking wizard prompts
+ * engagement (agent_end with no credit, /resume) and offers +pomodoro
+ * extensions; `/ledger-extend` does the same manually. Extensions are ROLLING
+ * credit — provisioned pomodoro blocks survive across agent turns, so the
+ * wizard stays silent while credit remains and only re-pops when it's
+ * exhausted.
  *
  * Commands: /ledger, /ledger-settings, /ledger-extend [m], /ledger-receipt
  *
@@ -77,6 +81,14 @@ const STALL_THRESHOLD_MS = 500;
  *  tighter to make farming a burst harder (at the cost of splitting legitimate
  *  brief pauses), or looser to preserve longer thinking pauses. */
 const STEER_GAP_MS = 3000;
+
+/** Max gap (ms) between two identical keystrokes to collapse as auto-repeat
+ *  (a held key) when staging a steer burst. A held key fires handleInput rapidly
+ *  with the same data; collapsing consecutive identical keys within this
+ *  window to one timestamp prevents a sustained burst (zero-length) from being
+ *  fabricated by holding a key. Human typing — varied keys, or same-key gaps at
+ *  or above this threshold (e.g. deliberate double letters) — is unaffected. */
+const AUTO_REPEAT_MS = 50;
 
 const MS_PER_HOUR = 3_600_000;
 const MS_PER_MINUTE = 60_000;
@@ -153,6 +165,11 @@ export interface HumanOpenEvent {
   openedAt: number;
   grantedBudgetMs: number;
   extensions: number;
+  /** How the window engaged: "keystroke" (first key typed) or "extension"
+   *  (the wizard's extend / `/ledger-extend` — which both grant capacity and
+   *  count as engagement). Optional on legacy events; backfilled to
+   *  "keystroke" on replay. */
+  engagedVia?: 'keystroke' | 'extension';
   /** Remaining rolling extension budget at the time of this event. Optional
    *  on legacy events; backfilled from `grantedBudgetMs` − grace on replay. */
   extensionBudgetMs?: number;
@@ -170,6 +187,11 @@ export interface HumanCloseEvent {
   idleMs: number;
   grantedBudgetMs: number;
   extensions: number;
+  /** Whether the window's idle was committed by an agent action (a submitted
+   *  prompt at `agent_start`). `false` = abandoned (the session ended with no
+   *  submit): idle with no output bills nothing, so `billedMs` is 0. Optional
+   *  on legacy events; backfilled to `true` (the old model billed every close). */
+  committed?: boolean;
   /** Remaining rolling extension budget after this window's consumption.
    *  Optional on legacy events; backfilled on replay. */
   extensionBudgetMs?: number;
@@ -453,7 +475,12 @@ export function applySettingValue(
 export function rehydrateFromSidecar(events: SidecarEvent[]): {
   settings: LedgerSettings;
   totals: Totals;
-  humanWindow: { openedAt: number; grantedBudgetMs: number; extensions: number } | null;
+  humanWindow: {
+    openedAt: number;
+    grantedBudgetMs: number;
+    extensions: number;
+    engagedVia: 'keystroke' | 'extension';
+  } | null;
   extensionBudgetMs: number;
 } {
   let settings: LedgerSettings | null = null;
@@ -483,7 +510,7 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
     } else if (e.kind === 'human-close') {
       closedOpenedAts.add(e.openedAt);
       humanMs += e.billedMs;
-      humanWindows += 1;
+      if (e.billedMs > 0) humanWindows += 1; // match live: only billed windows count
       extensionBudgetMs = resolveExtensionBudget(
         e,
         (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE
@@ -504,13 +531,19 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
     }
   }
   // Last unclosed human-open (by append order) is the in-progress window.
-  let humanWindow: { openedAt: number; grantedBudgetMs: number; extensions: number } | null = null;
+  let humanWindow: {
+    openedAt: number;
+    grantedBudgetMs: number;
+    extensions: number;
+    engagedVia: 'keystroke' | 'extension';
+  } | null = null;
   for (const e of events) {
     if (e.kind === 'human-open' && !closedOpenedAts.has(e.openedAt)) {
       humanWindow = {
         openedAt: e.openedAt,
         grantedBudgetMs: e.grantedBudgetMs,
         extensions: e.extensions,
+        engagedVia: e.engagedVia ?? 'keystroke',
       };
     }
   }
@@ -813,7 +846,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // Current human idle window (null while the agent is working). Its
   // `grantedBudgetMs` is this window's billing cap = grace + the rolling
   // extension budget carried into it.
-  let humanWindow: { openedAt: number; grantedBudgetMs: number; extensions: number } | null = null;
+  let humanWindow: {
+    openedAt: number;
+    grantedBudgetMs: number;
+    extensions: number;
+    engagedVia: 'keystroke' | 'extension';
+  } | null = null;
 
   // Rolling billable-human-time budget: provisioned pomodoro credit that
   // survives across agent turns (the serverless "provisioned capacity"
@@ -835,6 +873,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // steered to the agent — an uncommitted buffer is discarded at agent_end, so
   // typing that never reaches the agent costs nothing.
   let steerStaging: number[] = [];
+
+  // Held-key collapse for steer burst billing: auto-repeat (a held key) fires
+  // handleInput rapidly with the same data. Consecutive identical keystrokes
+  // within AUTO_REPEAT_MS collapse to one timestamp (a zero-length burst), so
+  // holding a key can't fabricate a sustained typing burst. Human typing —
+  // varied keys, or same-key gaps at/above the threshold (deliberate doubles) —
+  // is unaffected. Reset at agent_start with the staging buffer.
+  let lastKey: string | null = null;
+  let lastKeyTime = 0;
 
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -996,25 +1043,38 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // ── Human idle window ──────────────────────────────────────────────────
 
-  function closeHumanWindow(ctx: ExtensionContext | null) {
+  function closeHumanWindow(ctx: ExtensionContext | null, committed: boolean) {
     disarmWizard();
     const w = humanWindow;
     humanWindow = null;
     if (!w) return;
     const closedAt = Date.now();
-    const { idleMs, billedMs } = closeWindowBudget(w.openedAt, closedAt, w.grantedBudgetMs);
-    // Only the billed time beyond the per-window grace consumes the rolling
-    // extension budget; the leftover rolls forward to the next idle window.
     const graceMs = settings.graceMinutes * MS_PER_MINUTE;
-    extensionBudgetMs -= consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
-    // Always record the close (even 0-billed) so the open window is marked
-    // closed on replay — never restored as a stale in-progress window.
+    // An idle window bills only when the human's submit produces agent work
+    // (a prompt at `agent_start` = `committed`). Abandoned idle — the session
+    // ended with no submit — bills nothing: idle time with no output is wasted.
+    let billedMs: number;
+    let idleMs: number;
+    if (committed) {
+      const r = closeWindowBudget(w.openedAt, closedAt, w.grantedBudgetMs);
+      idleMs = r.idleMs;
+      billedMs = r.billedMs;
+      // Only billed time beyond the per-window grace consumes the rolling
+      // extension budget; the leftover rolls forward to the next idle window.
+      extensionBudgetMs -= consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
+    } else {
+      idleMs = Math.max(0, closedAt - w.openedAt); // span, kept for audit only
+      billedMs = 0; // abandoned → unbilled
+    }
+    // Always record the close (even abandoned/0-billed) so the open window is
+    // marked closed on replay — never restored as a stale in-progress window.
     appendSidecar({
       kind: 'human-close',
       openedAt: w.openedAt,
       closedAt,
       billedMs,
       idleMs,
+      committed,
       grantedBudgetMs: w.grantedBudgetMs,
       extensions: w.extensions,
       extensionBudgetMs,
@@ -1027,39 +1087,44 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     updateStatus(ctx);
   }
 
-  /** Open a human idle window with cap = per-window grace + rolling extension
-   *  budget, persisting a `human-open` event. `silent` skips the wizard
-   *  auto-pop: the initial `session_start` window is silent so it never
-   *  interrupts first-prompt composition (the wizard belongs at `agent_end`);
-   *  `/ledger-extend` still provisions more before submitting. The window
-   *  closes at the next `agent_start` (or `session_shutdown`) and bills
-   *  `min(idle, cap)`, so the first grace minute is always billable and the
-   *  rest is scale-to-zero unless explicitly extended. */
-  function openHumanWindow(ctx: ExtensionContext, opts: { silent: boolean }) {
-    if (humanWindow) closeHumanWindow(ctx); // safety: close any stale window
+  /** Open a human idle window at the moment of first engagement — the first
+   *  keystroke the human types, or the first extension (wizard/`/ledger-extend`,
+   *  which both grant capacity and engage). No engagement → no window → no bill:
+   *  pure idle (no typing, no extension) until the end bills nothing. The
+   *  window bills wall-clock from this onset (capturing thinking, not just
+   *  keystrokes), capped at `grace + credit`, but ONLY when committed by a
+   *  submitted prompt at `agent_start` — abandoned idle bills 0. `engagedVia`
+   *  records how the human signaled presence (audit). `extendMs` provisions a
+   *  pomodoro block on open (the engagement-via-extension case). */
+  function openIdleWindow(
+    ctx: ExtensionContext,
+    engagedVia: 'keystroke' | 'extension',
+    extendMs = 0
+  ) {
+    if (humanWindow) return; // safety: never open a second window
     const graceMs = settings.graceMinutes * MS_PER_MINUTE;
+    if (extendMs > 0) extensionBudgetMs += extendMs;
     const cap = graceMs + extensionBudgetMs;
     const openedAt = Date.now();
     humanWindow = {
       openedAt,
+      engagedVia,
       grantedBudgetMs: cap,
-      extensions: 0,
+      extensions: extendMs > 0 ? 1 : 0,
     };
     appendSidecar({
       kind: 'human-open',
       openedAt,
-      grantedBudgetMs: humanWindow.grantedBudgetMs,
-      extensions: 0,
+      engagedVia,
+      grantedBudgetMs: cap,
+      extensions: humanWindow.extensions,
       extensionBudgetMs,
       timestamp: openedAt,
     });
-    if (!opts.silent) {
-      // Don't nag while provisioned capacity remains: arm the wizard to fire
-      // only when this window's budget is exhausted. With no credit left,
-      // pop immediately so the user can buy a pomodoro block.
-      if (extensionBudgetMs > 0) armWizardForBoundary(ctx);
-      else armWizardNow(ctx);
-    }
+    // Arm the wizard to fire when this window's budget is exhausted (from the
+    // onset) — never pop now: the human is engaging, and an immediate pop would
+    // interrupt. The exhaustion pop offers the next extension.
+    armWizardForBoundary(ctx);
     updateStatus(ctx);
   }
 
@@ -1069,11 +1134,26 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // (not wall-clock) under the same grace + rolling-credit cap as an idle
   // window — a single key or keys spread minutes apart bill nothing, so typing
   // is only billed when it's actually queued/steered to the agent.
-  function noteKeystroke() {
-    // Stage every keystroke during a run (the cadence drives burst detection).
-    // Outside a run this is a no-op — the initial/idle windows already capture
-    // typing. Never throws and never blocks: the callback just pushes a number.
-    if (agentRunning) steerStaging.push(Date.now());
+  function noteKeystroke(data: string) {
+    const now = Date.now();
+    if (agentRunning) {
+      // Held-key collapse: a held key auto-repeats the same data within
+      // AUTO_REPEAT_MS. Collapse to one timestamp so it can't fabricate a
+      // sustained (zero-length) burst. Varied keys, or same-key gaps at/above
+      // the threshold, stage normally.
+      if (data === lastKey && now - lastKeyTime < AUTO_REPEAT_MS) {
+        lastKeyTime = now;
+        return;
+      }
+      steerStaging.push(now);
+      lastKey = data;
+      lastKeyTime = now;
+    } else if (!humanWindow && lastCtx) {
+      // First keystroke after a turn (or at session start) engages an idle
+      // window at this onset — no engagement means no bill. Subsequent idle
+      // keystrokes are no-ops (the onset is set; idle bills wall-clock from it).
+      openIdleWindow(lastCtx, 'keystroke');
+    }
   }
 
   function recordSteer(ctx: ExtensionContext, behavior: 'steer' | 'followUp') {
@@ -1089,6 +1169,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const durationMs = Math.max(0, submittedAt - startedAt); // wall-clock span (audit)
     const keystrokes = steerStaging.length;
     steerStaging = [];
+    lastKey = null; // reset held-key tracking so the next burst starts fresh
+    lastKeyTime = 0;
     // Only billed time beyond the per-window grace consumes rolling credit;
     // the leftover rolls forward (same rule as an idle window).
     extensionBudgetMs -= consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
@@ -1136,24 +1218,28 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     wizardTimer = setTimeout(() => showWizard(ctx), delay);
   }
 
-  /** Show the wizard immediately at the start of a human idle window (no grace
-   *  wait). The grace budget still caps billing if the user makes no selection. */
+  /** Show the wizard immediately — to prompt engagement at `agent_end` (no
+   *  credit) or on `/resume` (no window yet), or as a re-offer. Works with or
+   *  without an open window: the extend action engages one if none is open. */
   function armWizardNow(ctx: ExtensionContext) {
     clearWizardTimer();
-    if (!humanWindow || !settings.autoWizard || !ctx.hasUI || ctx.mode !== 'tui') return;
+    if (!settings.autoWizard || !ctx.hasUI || ctx.mode !== 'tui') return;
     showWizard(ctx);
   }
 
   function showWizard(ctx: ExtensionContext, extendMins: number = settings.pomodoroMinutes) {
     wizardTimer = null;
-    if (!humanWindow) return;
     const pomodoro = extendMins;
+    // Works with or without an open window. With no window this is the
+    // engagement prompt (agent_end no-credit / /resume): extend engages one.
     // Snapshot the rolling credit still provisioned (and unconsumed so far) so
     // the user knows extending ADDS to existing capacity, not replaces it.
-    // Captured before the async custom() closure — `humanWindow` can change.
+    // Captured before the async custom() closure — state can change.
     const graceMs = settings.graceMinutes * MS_PER_MINUTE;
-    const elapsedNow = Math.max(0, Date.now() - humanWindow.openedAt);
-    const remainingProvisioned = Math.max(0, extensionBudgetMs - Math.max(0, elapsedNow - graceMs));
+    const elapsedNow = humanWindow ? Math.max(0, Date.now() - humanWindow.openedAt) : 0;
+    const remainingProvisioned = humanWindow
+      ? Math.max(0, extensionBudgetMs - Math.max(0, elapsedNow - graceMs))
+      : extensionBudgetMs;
 
     ctx.ui
       .custom<string>((tui, theme, _kb, done) => {
@@ -1219,14 +1305,23 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         };
       })
       .then((choice) => {
-        if (!humanWindow || choice !== 'extend') return;
+        if (choice !== 'extend') return; // stop/dismiss = no engagement, no change
         const addMs = pomodoro * MS_PER_MINUTE;
+        if (!humanWindow) {
+          // No window yet: extend both engages (onset = now) and grants capacity.
+          // openIdleWindow opens, records, arms for exhaustion, and re-renders.
+          openIdleWindow(ctx, 'extension', addMs);
+          notify(ctx, `Extended billable human time by ${pomodoro}m.`, 'info');
+          return;
+        }
+        // Window already engaged: grant capacity and re-record the cap bump.
         humanWindow.grantedBudgetMs += addMs;
         humanWindow.extensions += 1;
         extensionBudgetMs += addMs;
         appendSidecar({
           kind: 'human-open',
           openedAt: humanWindow.openedAt,
+          engagedVia: humanWindow.engagedVia,
           grantedBudgetMs: humanWindow.grantedBudgetMs,
           extensions: humanWindow.extensions,
           extensionBudgetMs,
@@ -1262,37 +1357,56 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       totals.agentTurns = r.totals.agentTurns;
       totals.humanWindows = r.totals.humanWindows;
       totals.agentTokens = r.totals.agentTokens;
-      humanWindow = r.humanWindow;
-      extensionBudgetMs = r.extensionBudgetMs;
+      extensionBudgetMs = r.extensionBudgetMs; // rolling credit carries forward
+      // An unclosed window from a prior session was never committed by an agent
+      // action — idle with no output is wasted, so abandon it (bills 0) rather
+      // than continuing its stale onset across the session gap. Mark it closed
+      // (committed: false) so a future replay doesn't treat it as in-progress.
+      if (r.humanWindow) {
+        appendSidecar({
+          kind: 'human-close',
+          openedAt: r.humanWindow.openedAt,
+          closedAt: Date.now(),
+          billedMs: 0,
+          idleMs: 0,
+          committed: false,
+          grantedBudgetMs: r.humanWindow.grantedBudgetMs,
+          extensions: r.humanWindow.extensions,
+          extensionBudgetMs,
+          timestamp: Date.now(),
+        });
+      }
+      humanWindow = null; // never restore a stale window; engage fresh instead
     }
     updateStatus(ctx);
   }
 
-  pi.on('session_start', (_event, ctx) => {
+  pi.on('session_start', (event, ctx) => {
     lastCtx = ctx;
     rehydrate(ctx);
     agentRunning = false;
     steerStaging = [];
-    // Wrap the input editor so keystrokes during an agent run are staged for
-    // billing a steer/followUp (committed on submit via the `input` event).
-    // Extends CustomEditor and delegates every keystroke to the base editor,
-    // so app keybindings (escape-to-abort, ctrl+d, …) are preserved. TUI-only:
-    // non-interactive modes have no editor to type into, so there's nothing to
-    // stage (and `input` skips non-interactive steers).
+    lastKey = null;
+    lastKeyTime = 0;
+    // Wrap the input editor so keystrokes stage for billing: during a run they
+    // feed a steer/followUp burst (committed on submit via `input`); between
+    // turns the FIRST keystroke engages an idle window at its onset. Extends
+    // CustomEditor and delegates every keystroke to the base editor, so app
+    // keybindings (escape-to-abort, ctrl+d, …) are preserved. TUI-only: non-
+    // interactive modes have no editor to type into, so nothing stages.
     if (ctx.mode === 'tui' && ctx.hasUI) {
       ctx.ui.setEditorComponent(
         (tui, theme, kb) => new LedgerEditor(tui, theme, kb, noteKeystroke)
       );
     }
-    // Open an INITIAL human window if none was restored by rehydrate — it
-    // spans first-prompt composition (session_start → first agent_start) and
-    // post-/resume or /new review time. Same cap as any window (grace + rolling
-    // credit) and billed min(idle, cap): the first grace minute is billable, the
-    // rest is scale-to-zero unless explicitly extended. Silent — the wizard
-    // never auto-pops here (it belongs at agent_end); /ledger-extend provisions
-    // more before submitting. Skip if rehydrate already restored an open window
-    // (e.g., a crashed prior process left one unclosed).
-    if (!humanWindow) openHumanWindow(ctx, { silent: true });
+    // No initial window is opened here — engagement is gated on the first
+    // keystroke/extension, so pre-engagement time (reading the transcript,
+    // thinking) bills nothing unless the human extends. On /resume (or
+    // /reload) pop the wizard to prompt that engagement, so review time can be
+    // billed via an extension. (Startup/new start typing right away — no pop.)
+    if ((event.reason === 'resume' || event.reason === 'reload') && settings.autoWizard) {
+      armWizardNow(ctx);
+    }
   });
 
   pi.on('session_tree', (_event, ctx) => {
@@ -1306,9 +1420,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   });
 
   pi.on('session_shutdown', () => {
-    // Record the exit: close any open human window so its accrued idle (up to
-    // the granted budget) is persisted — not lost when the process exits.
-    closeHumanWindow(lastCtx);
+    // Record the exit: close any open human window. Idle only bills when
+    // committed by a submitted prompt (an agent action) — a window still open
+    // at shutdown was never committed, so it's abandoned and bills 0 (idle
+    // with no output is wasted). Persisted as a close for replay cleanliness.
+    closeHumanWindow(lastCtx, false);
   });
 
   // ── Agent timing (tool execution) ─────────────────────────────────────
@@ -1492,18 +1608,26 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     agentRunning = true;
     steerStaging = []; // a new run starts; any prior staging is stale
-    closeHumanWindow(ctx);
+    lastKey = null;
+    lastKeyTime = 0;
+    // A submitted prompt is the agent action that COMMITS the idle window —
+    // its idle (from the engagement onset) bills now, capped at grace + credit.
+    // If the human never engaged (no keystroke, no extension), there's no
+    // window to close and the turn handoff bills nothing.
+    closeHumanWindow(ctx, true);
   });
 
   pi.on('agent_end', (event, ctx) => {
     lastCtx = ctx;
     agentRunning = false;
     // Discard any uncommitted in-run typing: a steer/followUp that was never
-    // submitted never reached the agent, so it bills nothing. (A submitted
-    // steer already cleared the buffer in `recordSteer`.) The post-turn idle
-    // window opens fresh at agent_end — no backdate — so mid-run typing that
-    // isn't actually queued/steered can't inflate the idle window.
+    // submitted never reached the agent, so it bills nothing (a submitted
+    // steer already cleared the buffer in `recordSteer`). The post-turn idle
+    // window opens only on the next engagement — no backdate — so mid-run
+    // typing that isn't actually queued/steered can't inflate it.
     steerStaging = [];
+    lastKey = null;
+    lastKeyTime = 0;
     if (!tpsEverSeen && !fallbackNotified) {
       fallbackNotified = true;
       notify(
@@ -1524,10 +1648,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // gap is small and they're ambiguous without a retry extension (a bare
     // max_tokens stop hands control back to the human to decide).
     if (lastAssistantStopReason(event.messages) === 'error') return;
-    // Open the post-turn idle window (grace + rolling credit). The wizard pops
-    // here — immediately when no credit remains, or armed for exhaustion when
-    // some does — so this is where billing extensions are offered.
-    openHumanWindow(ctx, { silent: false });
+    // The idle window is NOT opened here — it opens only when the human
+    // engages (first keystroke or extension). Until then, idle bills nothing.
+    // If the human has no rolling credit (hasn't extended), pop the wizard now
+    // to prompt that engagement (an extension both engages and grants
+    // capacity). With credit, stay quiet — the window opens on the first
+    // keystroke and arms for exhaustion then.
+    if (extensionBudgetMs <= 0) armWizardNow(ctx);
   });
 
   // Steering composition is submitted via the `input` event, which tells us
@@ -1580,13 +1707,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         .map((p) => ({ value: p, label: `${p}m` }));
     },
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      if (!humanWindow) {
-        ctx.ui.notify(
-          'No active human-time window. Extend after the agent finishes a turn.',
-          'warning'
-        );
-        return;
-      }
       if (ctx.mode !== 'tui' || !ctx.hasUI) {
         ctx.ui.notify(
           'Open the wizard in a TUI session (extend after the agent finishes a turn).',
@@ -1594,6 +1714,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         );
         return;
       }
+      // Works with or without an open window: with no window, extend engages
+      // one (onset = now) and grants the block — an explicit engagement signal.
       const mins = parseMinutes(args) ?? settings.pomodoroMinutes;
       showWizard(ctx, mins);
     },
@@ -1849,12 +1971,12 @@ class LedgerEditor extends CustomEditor {
     tui: TUI,
     theme: EditorTheme,
     keybindings: KeybindingsManager,
-    private readonly onKeystroke: () => void
+    private readonly onKeystroke: (data: string) => void
   ) {
     super(tui, theme, keybindings);
   }
   override handleInput(data: string): void {
-    this.onKeystroke();
+    this.onKeystroke(data);
     super.handleInput(data);
   }
 }
