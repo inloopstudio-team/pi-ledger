@@ -100,8 +100,8 @@ the session and rehydrate on resume and `/tree` navigation.
 
 | Setting          | Default  | Notes                                            |
 | ---------------- | -------- | ------------------------------------------------ |
-| Agent rate       | `0`      | $/hour billed for agent work                     |
-| Human rate       | `0`      | $/hour billed for human work                     |
+| Agent rate       | `60`     | $/hour billed for agent work                     |
+| Human rate       | `60`     | $/hour billed for human work                     |
 | Grace minutes    | `1`      | First N minutes of idle billed before the wizard |
 | Pomodoro minutes | `20`     | Minutes added per extension                      |
 | Project          | _(cwd)_  | Shown on the receipt; falls back to the cwd name |

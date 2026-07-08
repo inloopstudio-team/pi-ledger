@@ -17,15 +17,6 @@ export interface TestFixture {
   setStatusSpy: ReturnType<typeof vi.fn>;
   customSpy: ReturnType<typeof vi.fn>;
   registerCommandSpy: ReturnType<typeof vi.fn>;
-  setFooterSpy: ReturnType<typeof vi.fn>;
-  /** The footer component captured from ctx.ui.setFooter(factory), if installed. */
-  footerComponent: {
-    render: (width: number) => string[];
-    invalidate: () => void;
-    dispose?: () => void;
-  } | null;
-  /** The fake tui passed to the footer factory (with a requestRender spy). */
-  footerTuiMock: { requestRender: ReturnType<typeof vi.fn> };
   emitEvent: (event: string, payload: unknown) => void;
   /** Invoke a lifecycle handler registered via pi.on(name, fn) with (event, ctx). */
   run: (name: string, event: unknown) => void;
@@ -81,21 +72,6 @@ export function createTestFixture(): TestFixture {
   const notifySpy = vi.fn();
   const setStatusSpy = vi.fn();
   const customSpy = vi.fn();
-  const footerTuiMock = { requestRender: vi.fn() };
-  let footerComponent: TestFixture['footerComponent'] = null;
-  const setFooterSpy = vi.fn((factory: unknown) => {
-    // Invoke the factory like pi would, capturing the component and wiring the
-    // extension's footerTui to our fake tui so updateStatus() can requestRender.
-    const fn = factory as (
-      tui: typeof footerTuiMock,
-      theme: unknown,
-      data: { getGitBranch: () => string | null; onBranchChange: (cb: () => void) => () => void }
-    ) => TestFixture['footerComponent'];
-    footerComponent = fn(footerTuiMock, undefined, {
-      getGitBranch: () => 'main',
-      onBranchChange: () => () => {},
-    });
-  });
   const registerCommandSpy = vi.fn((name: string, options: unknown) => {
     commands[name] = options as TestFixture['commands'][string];
   });
@@ -114,7 +90,6 @@ export function createTestFixture(): TestFixture {
     ui: {
       notify: notifySpy,
       setStatus: setStatusSpy,
-      setFooter: setFooterSpy,
       custom: customSpy,
     },
     sessionManager: {
@@ -174,11 +149,6 @@ export function createTestFixture(): TestFixture {
     setStatusSpy,
     customSpy,
     registerCommandSpy,
-    setFooterSpy,
-    get footerComponent() {
-      return footerComponent;
-    },
-    footerTuiMock,
     emitEvent,
     run,
     setCustomResult,

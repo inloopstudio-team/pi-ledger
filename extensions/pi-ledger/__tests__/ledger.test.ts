@@ -28,8 +28,8 @@ import {
 vi.mock('node:child_process', () => ({ execSync: vi.fn() }));
 
 const DEFAULTS: LedgerSettings = {
-  agentRatePerHour: 0,
-  humanRatePerHour: 0,
+  agentRatePerHour: 60,
+  humanRatePerHour: 60,
   graceMinutes: 1,
   pomodoroMinutes: 20,
   project: '',
@@ -111,7 +111,10 @@ describe('formatting', () => {
 describe('applySettingValue', () => {
   it('parses numeric rates and clamps negatives', () => {
     expect(applySettingValue(DEFAULTS, 'agentRatePerHour', '100').agentRatePerHour).toBe(100);
-    expect(applySettingValue(DEFAULTS, 'agentRatePerHour', '-5').agentRatePerHour).toBe(0); // reject negative
+    expect(
+      applySettingValue({ ...DEFAULTS, agentRatePerHour: 50 }, 'agentRatePerHour', '-5')
+        .agentRatePerHour
+    ).toBe(50); // reject negative → keeps old
     expect(applySettingValue(DEFAULTS, 'humanRatePerHour', '12.5').humanRatePerHour).toBe(12.5);
   });
   it('clamps grace/pomodoro to sane integers', () => {
@@ -129,7 +132,10 @@ describe('applySettingValue', () => {
     expect(applySettingValue(DEFAULTS, 'autoWizard', 'on').autoWizard).toBe(true);
   });
   it('ignores non-numeric input for numeric fields', () => {
-    expect(applySettingValue(DEFAULTS, 'agentRatePerHour', 'nope').agentRatePerHour).toBe(0);
+    expect(
+      applySettingValue({ ...DEFAULTS, agentRatePerHour: 50 }, 'agentRatePerHour', 'nope')
+        .agentRatePerHour
+    ).toBe(50);
   });
 });
 
@@ -632,13 +638,11 @@ describe('extension integration', () => {
     expect(msg).toContain('agent 1.00h (1 turns)');
     expect(msg).toContain('human 0.50h (1 windows)');
     expect(msg).toContain('total $125.00');
-    // custom grey footer installed and shows the live hours
-    expect(fixture.setFooterSpy).toHaveBeenCalledTimes(1);
-    expect(fixture.footerComponent).not.toBeNull();
-    const bar = fixture.footerComponent!.render(120)[0]!;
-    expect(bar).toContain('\x1b[48;5;240m'); // grey background
-    expect(bar).toContain('agent 1.00h');
-    expect(bar).toContain('main'); // git branch from footerData
+    // status line shows the live hours, grey (dim) like pi-core's footer
+    expect(fixture.setStatusSpy).toHaveBeenCalledWith(
+      'ledger',
+      expect.stringContaining('agent 1.00h')
+    );
   });
 
   it('derives the footer + /ledger hours from pi-tps markers for a tps-only session', async () => {
@@ -659,9 +663,11 @@ describe('extension integration', () => {
     });
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
 
-    const bar = fixture.footerComponent!.render(120)[0]!;
-    expect(bar).toContain('\x1b[48;5;240m');
-    expect(bar).toContain('agent 1.00h'); // 3.6M ms = 1h
+    // status line derives agent hours from the tps marker, grey like pi-core
+    expect(fixture.setStatusSpy).toHaveBeenCalledWith(
+      'ledger',
+      expect.stringContaining('agent 1.00h')
+    );
 
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-2)![0] as string;
@@ -671,6 +677,32 @@ describe('extension integration', () => {
         (c) => typeof c[0] === 'string' && c[0].includes('Derived from 1 pi-tps markers')
       )
     ).toBe(true);
+  });
+
+  it('defaults agent and human rates to $60/h', async () => {
+    // no settings entry → the extension defaults ($60/h) apply
+    fixture.mockEntries.push({
+      type: 'custom',
+      customType: 'ledger-agent',
+      data: {
+        kind: 'agent',
+        turnIndex: 0,
+        agentMs: 3_600_000,
+        generationMs: 3_600_000,
+        stallMs: 0,
+        toolMs: 0,
+        tokens: { input: 0, output: 0, total: 0 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'tps',
+        timestamp: 1000,
+      },
+    });
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
+    // 1h agent @ $60/h = $60; 0h human; total $60
+    expect(msg).toContain('= $60.00');
+    expect(msg).toContain('total $60.00');
   });
 
   it('notifies (once, info) that built-in timing is in use when pi-tps is absent', async () => {

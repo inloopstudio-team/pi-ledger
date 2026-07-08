@@ -31,7 +31,6 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
-  ReadonlyFooterDataProvider,
   Theme,
 } from '@earendil-works/pi-coding-agent';
 import {
@@ -45,12 +44,9 @@ import {
   SelectList,
   SettingsList,
   Text,
-  truncateToWidth,
-  visibleWidth,
   type OverlayHandle,
   type SelectItem,
   type SettingItem,
-  type TUI,
 } from '@earendil-works/pi-tui';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -83,8 +79,8 @@ const CURRENCY_SYMBOL: Record<string, string> = {
 };
 
 const DEFAULT_SETTINGS: LedgerSettings = {
-  agentRatePerHour: 0,
-  humanRatePerHour: 0,
+  agentRatePerHour: 60,
+  humanRatePerHour: 60,
   graceMinutes: 1,
   pomodoroMinutes: 20,
   project: '',
@@ -639,13 +635,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     model: null as { provider: string; modelId: string } | null,
   };
 
-  // Footer (custom grey status bar) + totals derived from pi-tps markers,
-  // used for the status/receipt when the session has no live ledger data.
+  // Totals derived from pi-tps markers, used for the status/receipt when the
+  // session has no live ledger data.
   let derivedDisplay: ReturnType<typeof convertTpsEntries> | null = null;
-  let footerTui: TUI | null = null;
-  let footerCtx: ExtensionContext | null = null;
-  let footerData: ReadonlyFooterDataProvider | null = null;
-  let footerUnsub: (() => void) | null = null;
 
   // ── Settings persistence ───────────────────────────────────────────────
 
@@ -661,7 +653,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     return settings.project || basename(ctx.cwd);
   }
 
-  // ── Status footer (custom grey bar) ────────────────────────────────────
+  // ── Status footer ──────────────────────────────────────────────────────
 
   /** Live ledger totals, or — for a pi-tps-only session — totals derived
    *  from the session's `tps` markers, so the status reflects real hours. */
@@ -679,71 +671,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     return totals;
   }
 
-  function renderFooterBar(width: number): string {
+  function updateStatus(ctx: ExtensionContext | null) {
+    if (!ctx || !ctx.hasUI) return;
     const t = effectiveTotals();
     const b = computeBilling(t.agentMs, t.humanMs, settings);
-    const totalsStr = `agent ${fmtHours(t.agentMs)} · human ${fmtHours(t.humanMs)} · ${fmtMoney(b.total, settings.currency)}`;
-    const theme = footerCtx?.ui?.theme;
-    let left = theme
-      ? theme.fg('text', 'ledger · ') + theme.fg('accent', totalsStr)
-      : `ledger · ${totalsStr}`;
-    const rightParts: string[] = [];
-    const usage = footerCtx?.getContextUsage?.();
-    if (usage && usage.percent != null) rightParts.push(`${usage.percent}%`);
-    if (footerCtx?.model?.id) rightParts.push(footerCtx.model.id);
-    const git = footerData?.getGitBranch?.() ?? null;
-    if (git) rightParts.push(git);
-    let right = theme ? theme.fg('text', rightParts.join(' · ')) : rightParts.join(' · ');
-    let lw = visibleWidth(left);
-    let rw = visibleWidth(right);
-    if (lw + rw + 1 > width) {
-      const room = width - rw - 1;
-      if (room >= 8) left = truncateToWidth(left, room, '');
-      else {
-        right = truncateToWidth(right, Math.max(1, width - 2), '');
-        left = '';
-      }
-      lw = visibleWidth(left);
-      rw = visibleWidth(right);
-    }
-    const pad = Math.max(1, width - lw - rw);
-    return '\x1b[48;5;240m' + left + ' '.repeat(pad) + right + '\x1b[0m';
-  }
-
-  function installFooter(ctx: ExtensionContext) {
-    if (ctx.mode !== 'tui' || !ctx.hasUI) return;
-    footerCtx = ctx;
-    ctx.ui.setFooter((tui, _theme, data) => {
-      footerTui = tui;
-      footerData = data;
-      footerUnsub = data.onBranchChange(() => tui.requestRender());
-      return {
-        render: (w: number) => [renderFooterBar(w)],
-        invalidate: () => tui.requestRender(),
-        dispose: () => {
-          if (footerUnsub) {
-            footerUnsub();
-            footerUnsub = null;
-          }
-        },
-      };
-    });
-    footerTui?.requestRender();
-  }
-
-  function restoreFooter(ctx: ExtensionContext) {
-    if (ctx.hasUI) ctx.ui.setFooter(undefined);
-    if (footerUnsub) {
-      footerUnsub();
-      footerUnsub = null;
-    }
-    footerTui = null;
-    footerData = null;
-    footerCtx = null;
-  }
-
-  function updateStatus(_ctx: ExtensionContext | null) {
-    if (footerTui) footerTui.requestRender();
+    const text = `ledger · agent ${fmtHours(t.agentMs)} · human ${fmtHours(t.humanMs)} · ${fmtMoney(b.total, settings.currency)}`;
+    const theme = ctx.ui.theme;
+    ctx.ui.setStatus('ledger', theme ? theme.fg('dim', text) : text);
   }
 
   // ── Human idle window ──────────────────────────────────────────────────
@@ -921,7 +855,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.on('session_start', (_event, ctx) => {
     lastCtx = ctx;
     rehydrate(ctx);
-    installFooter(ctx);
   });
 
   pi.on('session_tree', (_event, ctx) => {
@@ -929,9 +862,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     rehydrate(ctx);
   });
 
-  pi.on('session_shutdown', (_event, ctx) => {
+  pi.on('session_shutdown', () => {
     disarmWizard();
-    restoreFooter(ctx);
   });
 
   // ── Agent timing (tool execution) ─────────────────────────────────────
