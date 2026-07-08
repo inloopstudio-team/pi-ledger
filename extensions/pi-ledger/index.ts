@@ -18,8 +18,8 @@
  *
  * Commands: /ledger, /ledger-settings, /ledger-extend [m], /ledger-receipt
  *
- * Requires @monotykamary/pi-tps installed as a peer — it emits the
- * `tps:telemetry` event this extension consumes.
+ * Standalone but pi-tps-aware: works on its own, and uses pi-tps's
+ * `tps:telemetry` event for refined per-turn timing when present.
  */
 
 import { execSync } from 'node:child_process';
@@ -31,6 +31,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  ReadonlyFooterDataProvider,
   Theme,
 } from '@earendil-works/pi-coding-agent';
 import {
@@ -44,9 +45,12 @@ import {
   SelectList,
   SettingsList,
   Text,
+  truncateToWidth,
+  visibleWidth,
   type OverlayHandle,
   type SelectItem,
   type SettingItem,
+  type TUI,
 } from '@earendil-works/pi-tui';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -422,7 +426,9 @@ function fmtDate(ms: number): string {
 }
 
 function reveal(text: string): string {
-  return ` data-reveal="${esc(text)}">${esc(text)}`;
+  // Empty content — the typewriter fills it in, avoiding a flash of final
+  // text when the block unhides. data-reveal carries the final string.
+  return ` data-reveal="${esc(text)}">`;
 }
 
 /**
@@ -460,7 +466,7 @@ export function buildReceiptHtml(d: ReceiptData): string {
 
   const rowHtml = rows
     .map(
-      (r) => `      <div class="line">
+      (r) => `      <div class="line r-block r-hidden">
         <div class="left">
           <span class="label"${reveal(r.label)}</span>
           <span class="detail"${reveal(r.detail)}</span>
@@ -505,47 +511,61 @@ export function buildReceiptHtml(d: ReceiptData): string {
   .foot { margin-top: 22px; font-size: 10px; color: #c2c2c2; text-align: center; }
   .cursor { display: inline-block; width: 7px; height: 1em; vertical-align: -0.12em; background: #111; margin-left: 2px; animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
-  @media print { .cursor { display: none; } body { padding: 0; } .receipt { box-shadow: none; border-color: #ddd; } }
+  .r-hidden { display: none !important; }
+  .r-block { animation: rFade .15s ease both; }
+  @keyframes rFade { from { opacity: 0 } to { opacity: 1 } }
+  @media print { .cursor { display: none; } body { padding: 0; } .receipt { box-shadow: none; border-color: #ddd; } .r-block { animation: none; } }
 </style>
 </head>
 <body>
   <div class="receipt">
-    <div class="brand"${reveal('pi-ledger')}</div>
-    <div class="tagline"${reveal('billed like serverless')}</div>
-    <hr class="rule" />
+    <div class="brand r-block r-hidden"><span${reveal('pi-ledger')}</span></div>
+    <div class="tagline r-block r-hidden"><span${reveal('billed like serverless')}</span></div>
+    <hr class="rule r-block r-hidden" />
     <div class="meta">
-      <div class="mrow"><span class="k">Project</span><span${reveal(d.project)}</span></div>
-      <div class="mrow"><span class="k">Author</span><span${reveal(d.author)}</span></div>
-      <div class="mrow"><span class="k">Session</span><span${reveal(d.sessionId)}</span></div>
-      <div class="mrow"><span class="k">Date</span><span${reveal(dateLine)}</span></div>
+      <div class="mrow r-block r-hidden"><span class="k">Project</span><span${reveal(d.project)}</span></div>
+      <div class="mrow r-block r-hidden"><span class="k">Author</span><span${reveal(d.author)}</span></div>
+      <div class="mrow r-block r-hidden"><span class="k">Session</span><span${reveal(d.sessionId)}</span></div>
+      <div class="mrow r-block r-hidden"><span class="k">Date</span><span${reveal(dateLine)}</span></div>
     </div>
-    <hr class="rule" />
+    <hr class="rule r-block r-hidden" />
 ${rowHtml}
-    <hr class="rule" />
-    <div class="blended"><span${reveal('Blended rate')}</span><span${reveal(blended)}</span></div>
-    <div class="total"><span${reveal('Total')}</span><span class="amt"${reveal(fmtMoney(d.total, cur))}</span></div>
-    <div class="foot"${reveal('generated ' + fmtDate(d.generatedAt) + ' · pi-ledger')}</div>
+    <hr class="rule r-block r-hidden" />
+    <div class="blended r-block r-hidden"><span${reveal('Blended rate')}</span><span${reveal(blended)}</span></div>
+    <div class="total r-block r-hidden"><span${reveal('Total')}</span><span class="amt"${reveal(fmtMoney(d.total, cur))}</span></div>
+    <div class="foot r-block r-hidden"><span${reveal('generated ' + fmtDate(d.generatedAt) + ' · pi-ledger')}</span></div>
     <span class="cursor" id="cursor"></span>
   </div>
 <script>
 (function () {
-  var els = document.querySelectorAll('[data-reveal]');
+  // Reveal the receipt block-by-block: each line unhides (card grows), then
+  // its values type in autoregressively; the cursor tracks the active span.
+  var blocks = document.querySelectorAll('.r-block');
   var cursor = document.getElementById('cursor');
-  var i = 0;
-  function typeNext() {
-    if (i >= els.length) { if (cursor) cursor.remove(); return; }
-    var el = els[i++];
-    var final = el.getAttribute('data-reveal');
-    el.textContent = '';
-    if (cursor && el.parentNode) el.parentNode.appendChild(cursor);
-    var c = 0;
-    function step() {
-      if (c <= final.length) { el.textContent = final.slice(0, c); c++; setTimeout(step, 16); }
-      else setTimeout(typeNext, 90);
+  var bi = 0;
+  function nextBlock() {
+    if (bi >= blocks.length) { if (cursor) cursor.remove(); return; }
+    var block = blocks[bi++];
+    block.classList.remove('r-hidden');
+    var spans = block.querySelectorAll('[data-reveal]');
+    if (spans.length === 0) { setTimeout(nextBlock, 140); return; }
+    var si = 0;
+    function nextSpan() {
+      if (si >= spans.length) { setTimeout(nextBlock, 90); return; }
+      var el = spans[si++];
+      var final = el.getAttribute('data-reveal') || '';
+      el.textContent = '';
+      if (cursor) { try { el.after(cursor); } catch (e) {} }
+      var c = 0;
+      function step() {
+        if (c <= final.length) { el.textContent = final.slice(0, c); c++; setTimeout(step, 16); }
+        else { setTimeout(nextSpan, 60); }
+      }
+      step();
     }
-    step();
+    nextSpan();
   }
-  window.addEventListener('load', typeNext);
+  window.addEventListener('load', nextBlock);
 })();
 </script>
 </body>
@@ -619,6 +639,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     model: null as { provider: string; modelId: string } | null,
   };
 
+  // Footer (custom grey status bar) + totals derived from pi-tps markers,
+  // used for the status/receipt when the session has no live ledger data.
+  let derivedDisplay: ReturnType<typeof convertTpsEntries> | null = null;
+  let footerTui: TUI | null = null;
+  let footerCtx: ExtensionContext | null = null;
+  let footerData: ReadonlyFooterDataProvider | null = null;
+  let footerUnsub: (() => void) | null = null;
+
   // ── Settings persistence ───────────────────────────────────────────────
 
   function persistSettings() {
@@ -633,15 +661,89 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     return settings.project || basename(ctx.cwd);
   }
 
-  // ── Status footer ──────────────────────────────────────────────────────
+  // ── Status footer (custom grey bar) ────────────────────────────────────
 
-  function updateStatus(ctx: ExtensionContext | null) {
-    if (!ctx || !ctx.hasUI) return;
-    const b = computeBilling(totals.agentMs, totals.humanMs, settings);
-    ctx.ui.setStatus(
-      'ledger',
-      `ledger · agent ${fmtHours(totals.agentMs)} · human ${fmtHours(totals.humanMs)} · ${fmtMoney(b.total, settings.currency)}`
-    );
+  /** Live ledger totals, or — for a pi-tps-only session — totals derived
+   *  from the session's `tps` markers, so the status reflects real hours. */
+  function effectiveTotals(): Totals {
+    if (totals.agentTurns > 0 || totals.humanWindows > 0) return totals;
+    if (derivedDisplay) {
+      return {
+        agentMs: derivedDisplay.agentMs,
+        humanMs: derivedDisplay.humanMs,
+        agentTurns: derivedDisplay.agentTurns,
+        humanWindows: derivedDisplay.humanWindows,
+        agentTokens: derivedDisplay.agentTokens,
+      };
+    }
+    return totals;
+  }
+
+  function renderFooterBar(width: number): string {
+    const t = effectiveTotals();
+    const b = computeBilling(t.agentMs, t.humanMs, settings);
+    const totalsStr = `agent ${fmtHours(t.agentMs)} · human ${fmtHours(t.humanMs)} · ${fmtMoney(b.total, settings.currency)}`;
+    const theme = footerCtx?.ui?.theme;
+    let left = theme
+      ? theme.fg('text', 'ledger · ') + theme.fg('accent', totalsStr)
+      : `ledger · ${totalsStr}`;
+    const rightParts: string[] = [];
+    const usage = footerCtx?.getContextUsage?.();
+    if (usage && usage.percent != null) rightParts.push(`${usage.percent}%`);
+    if (footerCtx?.model?.id) rightParts.push(footerCtx.model.id);
+    const git = footerData?.getGitBranch?.() ?? null;
+    if (git) rightParts.push(git);
+    let right = theme ? theme.fg('text', rightParts.join(' · ')) : rightParts.join(' · ');
+    let lw = visibleWidth(left);
+    let rw = visibleWidth(right);
+    if (lw + rw + 1 > width) {
+      const room = width - rw - 1;
+      if (room >= 8) left = truncateToWidth(left, room, '');
+      else {
+        right = truncateToWidth(right, Math.max(1, width - 2), '');
+        left = '';
+      }
+      lw = visibleWidth(left);
+      rw = visibleWidth(right);
+    }
+    const pad = Math.max(1, width - lw - rw);
+    return '\x1b[48;5;240m' + left + ' '.repeat(pad) + right + '\x1b[0m';
+  }
+
+  function installFooter(ctx: ExtensionContext) {
+    if (ctx.mode !== 'tui' || !ctx.hasUI) return;
+    footerCtx = ctx;
+    ctx.ui.setFooter((tui, _theme, data) => {
+      footerTui = tui;
+      footerData = data;
+      footerUnsub = data.onBranchChange(() => tui.requestRender());
+      return {
+        render: (w: number) => [renderFooterBar(w)],
+        invalidate: () => tui.requestRender(),
+        dispose: () => {
+          if (footerUnsub) {
+            footerUnsub();
+            footerUnsub = null;
+          }
+        },
+      };
+    });
+    footerTui?.requestRender();
+  }
+
+  function restoreFooter(ctx: ExtensionContext) {
+    if (ctx.hasUI) ctx.ui.setFooter(undefined);
+    if (footerUnsub) {
+      footerUnsub();
+      footerUnsub = null;
+    }
+    footerTui = null;
+    footerData = null;
+    footerCtx = null;
+  }
+
+  function updateStatus(_ctx: ExtensionContext | null) {
+    if (footerTui) footerTui.requestRender();
   }
 
   // ── Human idle window ──────────────────────────────────────────────────
@@ -803,12 +905,23 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     totals.agentTurns = r.totals.agentTurns;
     totals.humanWindows = r.totals.humanWindows;
     totals.agentTokens = r.totals.agentTokens;
+    // No live ledger data → derive display totals from pi-tps markers so the
+    // status/receipt reflect this session's hours even if pi-ledger wasn't
+    // tracking live.
+    if (totals.agentTurns === 0 && totals.humanWindows === 0) {
+      const tps = extractTpsEntries(entries);
+      derivedDisplay =
+        tps.length > 0 ? convertTpsEntries(tps, settings.graceMinutes * MS_PER_MINUTE) : null;
+    } else {
+      derivedDisplay = null;
+    }
     updateStatus(ctx);
   }
 
   pi.on('session_start', (_event, ctx) => {
     lastCtx = ctx;
     rehydrate(ctx);
+    installFooter(ctx);
   });
 
   pi.on('session_tree', (_event, ctx) => {
@@ -816,8 +929,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     rehydrate(ctx);
   });
 
-  pi.on('session_shutdown', () => {
+  pi.on('session_shutdown', (_event, ctx) => {
     disarmWizard();
+    restoreFooter(ctx);
   });
 
   // ── Agent timing (tool execution) ─────────────────────────────────────
@@ -1014,21 +1128,19 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.registerCommand('ledger', {
     description: 'Show running billable totals (agent + human hours, blended rate, total).',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      const b = computeBilling(totals.agentMs, totals.humanMs, settings);
+      const t = effectiveTotals();
+      const b = computeBilling(t.agentMs, t.humanMs, settings);
       const msg =
-        `agent ${fmtHours(totals.agentMs)} (${totals.agentTurns} turns) @ ${fmtMoney(settings.agentRatePerHour, settings.currency)}/h = ${fmtMoney(b.agentCost, settings.currency)}` +
-        ` · human ${fmtHours(totals.humanMs)} (${totals.humanWindows} windows) @ ${fmtMoney(settings.humanRatePerHour, settings.currency)}/h = ${fmtMoney(b.humanCost, settings.currency)}` +
+        `agent ${fmtHours(t.agentMs)} (${t.agentTurns} turns) @ ${fmtMoney(settings.agentRatePerHour, settings.currency)}/h = ${fmtMoney(b.agentCost, settings.currency)}` +
+        ` · human ${fmtHours(t.humanMs)} (${t.humanWindows} windows) @ ${fmtMoney(settings.humanRatePerHour, settings.currency)}/h = ${fmtMoney(b.humanCost, settings.currency)}` +
         ` · blended ${b.totalHours > 0 ? fmtMoney(b.blendedRate, settings.currency) + '/h' : '—'}` +
         ` · total ${fmtMoney(b.total, settings.currency)}`;
       ctx.ui.notify(msg, 'info');
-      if (totals.agentTurns === 0) {
-        const tps = extractTpsEntries(ctx.sessionManager.getBranch());
-        if (tps.length > 0) {
-          ctx.ui.notify(
-            `No live ledger data; ${tps.length} pi-tps markers available — /ledger-receipt converts them.`,
-            'info'
-          );
-        }
+      if (totals.agentTurns === 0 && derivedDisplay) {
+        ctx.ui.notify(
+          `Derived from ${derivedDisplay.agentTurns} pi-tps markers (lower fidelity: no tool time; human time estimated).`,
+          'info'
+        );
       }
     },
   });

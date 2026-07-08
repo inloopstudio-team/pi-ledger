@@ -324,8 +324,8 @@ describe('buildReceiptHtml', () => {
   });
   it('renders agent + human line items and the total', () => {
     const html = buildReceiptHtml(data);
-    expect(html).toContain('>Agent<');
-    expect(html).toContain('>Human<');
+    expect(html).toContain('data-reveal="Agent"');
+    expect(html).toContain('data-reveal="Human"');
     expect(html).toContain('$120.00');
     expect(html).toContain('$25.00');
     expect(html).toContain('$145.00');
@@ -339,7 +339,8 @@ describe('buildReceiptHtml', () => {
     const html = buildReceiptHtml(data);
     const reveals = html.match(/data-reveal="/g);
     expect(reveals && reveals.length).toBeGreaterThan(10);
-    expect(html).toContain('typeNext'); // typewriter engine present
+    expect(html).toContain('nextBlock'); // block-by-block typewriter engine
+    expect(html).toContain('r-block r-hidden'); // starts blank, grows line by line
   });
 });
 
@@ -631,11 +632,45 @@ describe('extension integration', () => {
     expect(msg).toContain('agent 1.00h (1 turns)');
     expect(msg).toContain('human 0.50h (1 windows)');
     expect(msg).toContain('total $125.00');
-    // footer status also updated
-    expect(fixture.setStatusSpy).toHaveBeenCalledWith(
-      'ledger',
-      expect.stringContaining('agent 1.00h')
-    );
+    // custom grey footer installed and shows the live hours
+    expect(fixture.setFooterSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.footerComponent).not.toBeNull();
+    const bar = fixture.footerComponent!.render(120)[0]!;
+    expect(bar).toContain('\x1b[48;5;240m'); // grey background
+    expect(bar).toContain('agent 1.00h');
+    expect(bar).toContain('main'); // git branch from footerData
+  });
+
+  it('derives the footer + /ledger hours from pi-tps markers for a tps-only session', async () => {
+    fixture.mockEntries.push({
+      type: 'custom',
+      customType: 'ledger-settings',
+      data: { ...DEFAULTS, agentRatePerHour: 120, humanRatePerHour: 60 },
+    });
+    fixture.mockEntries.push({
+      type: 'custom',
+      customType: 'tps',
+      data: {
+        timing: { generationMs: 3_600_000, stallMs: 0, totalMs: 3_700_000 },
+        tokens: { input: 0, output: 0, total: 1500 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        timestamp: 1000,
+      },
+    });
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+
+    const bar = fixture.footerComponent!.render(120)[0]!;
+    expect(bar).toContain('\x1b[48;5;240m');
+    expect(bar).toContain('agent 1.00h'); // 3.6M ms = 1h
+
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-2)![0] as string;
+    expect(msg).toContain('agent 1.00h (1 turns)');
+    expect(
+      fixture.notifySpy.mock.calls.some(
+        (c) => typeof c[0] === 'string' && c[0].includes('Derived from 1 pi-tps markers')
+      )
+    ).toBe(true);
   });
 
   it('notifies (once, info) that built-in timing is in use when pi-tps is absent', async () => {
