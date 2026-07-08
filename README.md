@@ -188,6 +188,33 @@ action, the time you spend _deciding_ in the wizard is unbilled if you decline
 after a short idle; it rolls into the next window. But idle you never commit
 (walk away, dismiss, quit) bills nothing.
 
+## Design principles
+
+pi-ledger bills **forward progress, not process** — four choices shape the
+whole engine:
+
+- **Bill the outcome, not the time spent.** Idle bills only when a submit
+  produces agent work; steering bills only typing actually queued to the agent.
+  Thinking that led nowhere (you dismissed, walked away, or the agent did
+  nothing) costs nothing. We charge for collaboration that moved the session,
+  not for minutes the human spent.
+- **Detect engagement instead of demanding a button.** A window opens on your
+  first keystroke or extension — engagement is _observed_, not self-reported —
+  yet a single stray key bills nothing; only a real typing burst counts. You
+  don't start a timer, but you do have to actually be there.
+- **You set the budget; the engine spends it.** Billable idle is capped at the
+  pomodoro credit you provision, and it drains as you use it — no billable idle
+  accrues beyond what you authorized, and the leftover rolls forward so a short
+  productive idle isn't forfeited.
+- **Noise and stalls drop out.** Generation is token-normalized (model speed
+  can't move the bill), stalls emit no tokens so they're never billed, and
+  unsubmitted typing never reached the agent so it's discarded. The receipt
+  tracks value delivered, not wall-clock spent.
+
+The shape is a deliberate hybrid: Toggl's _you-decide-the-budget_ control with
+the convenience of automatic tracking, gated on a real outcome — so it never
+bills the process of working, only the work that landed.
+
 ## Settings
 
 `/ledger-settings` opens a pi-core-style bordered, searchable list. Rate and
