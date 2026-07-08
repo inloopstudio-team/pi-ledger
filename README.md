@@ -44,8 +44,8 @@ Didn't run a full pi-ledger session? `/ledger-receipt` also works on a session
 that only has pi-tps markers (e.g. resume an older pi-tps session, set rates
 with `/ledger-settings`, then `/ledger-receipt`). With no live ledger data it
 converts the `tps` entries into the receipt — lower fidelity (no tool time;
-human time estimated from inter-turn gaps, capped at the grace budget) but
-enough to demo the output.
+human time estimated from inter-turn gaps plus the trailing idle up to now,
+capped at the grace budget) but enough to demo the output.
 
 ## Commands
 
@@ -83,10 +83,15 @@ granted_budget = grace_minutes + Σ extensions (each + pomodoro_minutes)
 ```
 
 - The first **grace minute** (configurable) is always billable.
-- **Immediately at `agent_end`**, a **non-blocking wizard** pops:
-  _Extend +pomodoro?_ — `Enter` adds a block and re-arms at the next boundary;
-  `Esc`/dismiss (or ignoring it) caps billing at the grace minute.
+- **Immediately at `agent_end`**, a **non-blocking wizard** pops as a
+  bottom-left, full-width panel (pi-core settings style): _Extend +pomodoro?_
+  — `Enter` adds a block and re-arms at the next boundary; `Esc`/dismiss (or
+  ignoring it) caps billing at the grace minute.
 - `/ledger-extend [m]` raises the budget manually, any time the window is open.
+- The status bar and receipt total the **entire session up to now** — they
+  include the in-progress open human window's idle (capped at its granted
+  budget) and, for a pi-tps-only session, the trailing idle after the last
+  marker. Unlike pi-tps (per-turn), this is the full session so far.
 
 Because billing is `min(actual_idle, budget)`, the 8 seconds you spend
 _deciding_ in the wizard are correctly unbilled if you decline.
@@ -161,7 +166,8 @@ with the turn. The wizard is driven entirely by the extension (the agent is
 unaware), auto-fires immediately at `agent_end`, and is disarmed on the next
 `agent_start` or `session_shutdown`. Rehydration dedups `ledger-agent` by
 `turnIndex`, keeping the last (so a `fallback` → `tps` correction never
-double-counts).
+double-counts). The status and receipt compute the whole session up to the
+current moment, including the in-progress open human window.
 
 ## Testing
 

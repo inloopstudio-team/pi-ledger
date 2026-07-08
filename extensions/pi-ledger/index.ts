@@ -359,10 +359,14 @@ export function extractTpsEntries(
  * Agent time per marker = (generationMs − stallMs); tool time is unavailable
  * from pi-tps markers. Human time is estimated from inter-turn gaps — each
  * gap is capped at the grace budget (no wizard ran, so no extensions) —
- * which mirrors the scale-to-zero billing rule. @internal */
+ * which mirrors the scale-to-zero billing rule. When `nowMs` is given, the
+ * trailing idle after the last marker (up to now) is added as a final human
+ * window, capped at grace — the in-progress "last idle" minute, for display
+ * only (never persisted). @internal */
 export function convertTpsEntries(
   tps: TpsMarker[],
-  graceMs: number
+  graceMs: number,
+  nowMs?: number
 ): {
   agentMs: number;
   agentTurns: number;
@@ -390,6 +394,16 @@ export function convertTpsEntries(
         humanMs += Math.min(gap, graceMs);
         humanWindows += 1;
       }
+    }
+  }
+  // Trailing idle after the last turn, up to `nowMs` (the in-progress "last
+  // idle" minute). Display-only; only added when nowMs is provided.
+  if (nowMs != null && tps.length > 0) {
+    const last = tps[tps.length - 1]!;
+    const trailing = Math.max(0, nowMs - (last.timestamp || 0));
+    if (trailing > 0) {
+      humanMs += Math.min(trailing, graceMs);
+      humanWindows += 1;
     }
   }
   return {
@@ -635,10 +649,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     model: null as { provider: string; modelId: string } | null,
   };
 
-  // Totals derived from pi-tps markers, used for the status/receipt when the
-  // session has no live ledger data.
-  let derivedDisplay: ReturnType<typeof convertTpsEntries> | null = null;
-
   // ── Settings persistence ───────────────────────────────────────────────
 
   function persistSettings() {
@@ -655,25 +665,56 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // ── Status footer ──────────────────────────────────────────────────────
 
-  /** Live ledger totals, or — for a pi-tps-only session — totals derived
-   *  from the session's `tps` markers, so the status reflects real hours. */
-  function effectiveTotals(): Totals {
-    if (totals.agentTurns > 0 || totals.humanWindows > 0) return totals;
-    if (derivedDisplay) {
-      return {
-        agentMs: derivedDisplay.agentMs,
-        humanMs: derivedDisplay.humanMs,
-        agentTurns: derivedDisplay.agentTurns,
-        humanWindows: derivedDisplay.humanWindows,
-        agentTokens: derivedDisplay.agentTokens,
-      };
+  /** Entire-session display totals for the status + receipt.
+   *
+   *  - When pi-ledger is tracking (or a human window is open), use the live
+   *    cumulative `totals` PLUS the in-progress open human window's idle so
+   *    far (capped at its granted budget) — the "last idle" minute is counted
+   *    even before the window closes.
+   *  - When pi-ledger has no live data (e.g., a resumed pi-tps-only session),
+   *    derive the whole session from pi-tps `tps` markers, including the
+   *    trailing idle up to now.
+   *
+   *  Unlike pi-tps (per-turn), this is the full session up to the moment. */
+  function computeDisplayTotals(ctx: ExtensionContext): Totals {
+    const now = Date.now();
+    let openHumanMs = 0;
+    let openWindows = 0;
+    if (humanWindow) {
+      const elapsed = Math.max(0, now - humanWindow.openedAt);
+      openHumanMs = Math.min(elapsed, humanWindow.grantedBudgetMs);
+      openWindows = 1;
     }
-    return totals;
+    if (totals.agentTurns === 0 && totals.humanWindows === 0 && !humanWindow) {
+      let tps: TpsMarker[] = [];
+      try {
+        tps = extractTpsEntries(ctx.sessionManager.getBranch());
+      } catch {
+        tps = [];
+      }
+      if (tps.length > 0) {
+        const c = convertTpsEntries(tps, settings.graceMinutes * MS_PER_MINUTE, now);
+        return {
+          agentMs: c.agentMs,
+          humanMs: c.humanMs,
+          agentTurns: c.agentTurns,
+          humanWindows: c.humanWindows,
+          agentTokens: c.agentTokens,
+        };
+      }
+    }
+    return {
+      agentMs: totals.agentMs,
+      humanMs: totals.humanMs + openHumanMs,
+      agentTurns: totals.agentTurns,
+      humanWindows: totals.humanWindows + openWindows,
+      agentTokens: totals.agentTokens,
+    };
   }
 
   function updateStatus(ctx: ExtensionContext | null) {
     if (!ctx || !ctx.hasUI) return;
-    const t = effectiveTotals();
+    const t = computeDisplayTotals(ctx);
     const b = computeBilling(t.agentMs, t.humanMs, settings);
     const text = `ledger · agent ${fmtHours(t.agentMs)} · human ${fmtHours(t.humanMs)} · ${fmtMoney(b.total, settings.currency)}`;
     const theme = ctx.ui.theme;
@@ -812,7 +853,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         },
         {
           overlay: true,
-          overlayOptions: { anchor: 'center', width: '50%', minWidth: 48 },
+          overlayOptions: {
+            anchor: 'bottom-left',
+            width: '100%',
+            margin: { left: 0, right: 0, bottom: 0 },
+          },
           onHandle: (handle) => {
             wizardHandle = handle;
           },
@@ -847,16 +892,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     totals.agentTurns = r.totals.agentTurns;
     totals.humanWindows = r.totals.humanWindows;
     totals.agentTokens = r.totals.agentTokens;
-    // No live ledger data → derive display totals from pi-tps markers so the
-    // status/receipt reflect this session's hours even if pi-ledger wasn't
-    // tracking live.
-    if (totals.agentTurns === 0 && totals.humanWindows === 0) {
-      const tps = extractTpsEntries(entries);
-      derivedDisplay =
-        tps.length > 0 ? convertTpsEntries(tps, settings.graceMinutes * MS_PER_MINUTE) : null;
-    } else {
-      derivedDisplay = null;
-    }
     updateStatus(ctx);
   }
 
@@ -1068,18 +1103,21 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.registerCommand('ledger', {
     description: 'Show running billable totals (agent + human hours, total).',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      const t = effectiveTotals();
+      const t = computeDisplayTotals(ctx);
       const b = computeBilling(t.agentMs, t.humanMs, settings);
       const msg =
         `agent ${fmtHours(t.agentMs)} (${t.agentTurns} turns) @ ${fmtMoney(settings.agentRatePerHour, settings.currency)}/h = ${fmtMoney(b.agentCost, settings.currency)}` +
         ` · human ${fmtHours(t.humanMs)} (${t.humanWindows} windows) @ ${fmtMoney(settings.humanRatePerHour, settings.currency)}/h = ${fmtMoney(b.humanCost, settings.currency)}` +
         ` · total ${fmtMoney(b.total, settings.currency)}`;
       ctx.ui.notify(msg, 'info');
-      if (totals.agentTurns === 0 && derivedDisplay) {
-        ctx.ui.notify(
-          `Derived from ${derivedDisplay.agentTurns} pi-tps markers (lower fidelity: no tool time; human time estimated).`,
-          'info'
-        );
+      if (totals.agentTurns === 0 && totals.humanWindows === 0) {
+        const tps = extractTpsEntries(ctx.sessionManager.getBranch());
+        if (tps.length > 0) {
+          ctx.ui.notify(
+            `Derived from ${tps.length} pi-tps markers (lower fidelity: no tool time; human time estimated).`,
+            'info'
+          );
+        }
       }
     },
   });
@@ -1161,35 +1199,27 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.registerCommand('ledger-receipt', {
     description: 'Export an HTML receipt for this session (billable agent + human hours, total).',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      let agentMs = totals.agentMs;
-      let humanMs = totals.humanMs;
-      let agentTurns = totals.agentTurns;
-      let humanWindows = totals.humanWindows;
-      const agentTokens = { ...totals.agentTokens };
-      let startedAt = earliestLedgerTimestamp(ctx);
+      // Entire-session totals: live ledger data + the in-progress open human
+      // window, or — if pi-ledger tracked nothing — derived from pi-tps markers
+      // (including the trailing idle up to now).
+      const t = computeDisplayTotals(ctx);
+      const b = computeBilling(t.agentMs, t.humanMs, settings);
 
-      // No live ledger data (pi-ledger wasn't tracking) → convert pi-tps markers
-      // from the session so an existing pi-tps session still yields a receipt.
-      if (agentTurns === 0) {
+      let startedAt = earliestLedgerTimestamp(ctx);
+      if (startedAt === 0) {
+        const tps = extractTpsEntries(ctx.sessionManager.getBranch());
+        if (tps.length > 0) startedAt = tps[0]!.timestamp;
+      }
+      if (totals.agentTurns === 0 && totals.humanWindows === 0) {
         const tps = extractTpsEntries(ctx.sessionManager.getBranch());
         if (tps.length > 0) {
-          const c = convertTpsEntries(tps, settings.graceMinutes * MS_PER_MINUTE);
-          agentMs = c.agentMs;
-          agentTurns = c.agentTurns;
-          agentTokens.input = c.agentTokens.input;
-          agentTokens.output = c.agentTokens.output;
-          agentTokens.total = c.agentTokens.total;
-          humanMs = c.humanMs;
-          humanWindows = c.humanWindows;
-          startedAt = c.startedAt;
           ctx.ui.notify(
-            `Receipt built from ${tps.length} pi-tps markers (lower fidelity: no tool time; human time estimated from inter-turn gaps).`,
+            `Receipt derived from ${tps.length} pi-tps markers (lower fidelity: no tool time; human time estimated; includes idle up to now).`,
             'info'
           );
         }
       }
 
-      const b = computeBilling(agentMs, humanMs, settings);
       const sessionId = ctx.sessionManager.getSessionId?.() ?? 'unknown';
       const data: ReceiptData = {
         project: effectiveProject(ctx),
@@ -1203,9 +1233,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         agentCost: b.agentCost,
         humanCost: b.humanCost,
         total: b.total,
-        agentTurns,
-        humanWindows,
-        agentTokens,
+        agentTurns: t.agentTurns,
+        humanWindows: t.humanWindows,
+        agentTokens: { ...t.agentTokens },
         startedAt,
         generatedAt: Date.now(),
       };

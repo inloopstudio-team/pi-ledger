@@ -667,6 +667,15 @@ describe('extension integration', () => {
     ).toBe(true);
   });
 
+  it('counts the in-progress open human window in /ledger (entire session up to now)', async () => {
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens a human window (wizard pops, ignored)
+    await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window still open
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
+    // the open window's 30s idle is counted now (capped at the 1m grace), not deferred to close
+    expect(msg).toContain('human 0.01h (1 windows)');
+  });
+
   it('defaults agent and human rates to $60/h', async () => {
     // no settings entry → the extension defaults ($60/h) apply
     fixture.mockEntries.push({
@@ -800,7 +809,7 @@ describe('extension integration', () => {
       const files = fs.readdirSync(dir);
       expect(files).toHaveLength(1);
       const html = fs.readFileSync(path.join(dir, files[0]!), 'utf8');
-      // 1h agent @ $100 = $100; single marker → no inter-turn gap → no human time
+      // 1h agent @ $100 = $100; trailing idle (→ now) adds up to a grace minute of human time
       expect(html).toContain('$100.00');
       expect(html).toContain('demo');
       expect(
