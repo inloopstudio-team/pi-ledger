@@ -836,9 +836,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *    cumulative `totals` PLUS the in-progress open human window's idle so
    *    far (capped at its granted budget) — the "last idle" minute is counted
    *    even before the window closes.
-   *  - When pi-ledger has no live data (e.g., a resumed pi-tps-only session),
-   *    derive the whole session from pi-tps `tps` markers, including the
-   *    trailing idle up to now.
+   *  - When pi-ledger has no live data (a resumed pi-tps-only session), derive
+   *    the whole session from pi-tps `tps` markers, including the trailing idle
+   *    up to now. The in-progress initial human window (opened at session_start)
+   *    doesn't suppress this — it has no accrued ledger data of its own.
    *
    *  Unlike pi-tps (per-turn), this is the full session up to the moment. */
   function computeDisplayTotals(ctx: ExtensionContext): Totals {
@@ -850,7 +851,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       openHumanMs = Math.min(elapsed, humanWindow.grantedBudgetMs);
       openWindows = 1;
     }
-    if (totals.agentTurns === 0 && totals.humanWindows === 0 && !humanWindow) {
+    if (totals.agentTurns === 0 && totals.humanWindows === 0) {
       let tps: TpsMarker[] = [];
       try {
         tps = extractTpsEntries(ctx.sessionManager.getBranch());
@@ -920,6 +921,41 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (billedMs > 0) {
       totals.humanMs += billedMs;
       totals.humanWindows += 1;
+    }
+    updateStatus(ctx);
+  }
+
+  /** Open a human idle window with cap = per-window grace + rolling extension
+   *  budget, persisting a `human-open` event. `silent` skips the wizard
+   *  auto-pop: the initial `session_start` window is silent so it never
+   *  interrupts first-prompt composition (the wizard belongs at `agent_end`);
+   *  `/ledger-extend` still provisions more before submitting. The window
+   *  closes at the next `agent_start` (or `session_shutdown`) and bills
+   *  `min(idle, cap)`, so the first grace minute is always billable and the
+   *  rest is scale-to-zero unless explicitly extended. */
+  function openHumanWindow(ctx: ExtensionContext, opts: { silent: boolean }) {
+    if (humanWindow) closeHumanWindow(ctx); // safety: close any stale window
+    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
+    const cap = graceMs + extensionBudgetMs;
+    humanWindow = {
+      openedAt: Date.now(),
+      grantedBudgetMs: cap,
+      extensions: 0,
+    };
+    appendSidecar({
+      kind: 'human-open',
+      openedAt: humanWindow.openedAt,
+      grantedBudgetMs: humanWindow.grantedBudgetMs,
+      extensions: 0,
+      extensionBudgetMs,
+      timestamp: humanWindow.openedAt,
+    });
+    if (!opts.silent) {
+      // Don't nag while provisioned capacity remains: arm the wizard to fire
+      // only when this window's budget is exhausted. With no credit left,
+      // pop immediately so the user can buy a pomodoro block.
+      if (extensionBudgetMs > 0) armWizardForBoundary(ctx);
+      else armWizardNow(ctx);
     }
     updateStatus(ctx);
   }
@@ -1084,6 +1120,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.on('session_start', (_event, ctx) => {
     lastCtx = ctx;
     rehydrate(ctx);
+    // Open an INITIAL human window if none was restored by rehydrate — it
+    // spans first-prompt composition (session_start → first agent_start) and
+    // post-/resume or /new review time. Same cap as any window (grace + rolling
+    // credit) and billed min(idle, cap): the first grace minute is billable, the
+    // rest is scale-to-zero unless explicitly extended. Silent — the wizard
+    // never auto-pops here (it belongs at agent_end); /ledger-extend provisions
+    // more before submitting. Skip if rehydrate already restored an open window
+    // (e.g., a crashed prior process left one unclosed).
+    if (!humanWindow) openHumanWindow(ctx, { silent: true });
   });
 
   pi.on('session_tree', (_event, ctx) => {
@@ -1286,25 +1331,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   pi.on('agent_end', (_event, ctx) => {
     lastCtx = ctx;
-    if (humanWindow) closeHumanWindow(ctx); // safety: should already be null
-    // This window's cap = the per-window grace + whatever rolling pomodoro
-    // credit survived the last idle window. The grace minute is always
-    // billable; the extension credit rolls across turns.
-    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
-    const cap = graceMs + extensionBudgetMs;
-    humanWindow = {
-      openedAt: Date.now(),
-      grantedBudgetMs: cap,
-      extensions: 0,
-    };
-    appendSidecar({
-      kind: 'human-open',
-      openedAt: humanWindow.openedAt,
-      grantedBudgetMs: humanWindow.grantedBudgetMs,
-      extensions: 0,
-      extensionBudgetMs,
-      timestamp: humanWindow.openedAt,
-    });
     if (!tpsEverSeen && !fallbackNotified) {
       fallbackNotified = true;
       notify(
@@ -1313,12 +1339,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         'info'
       );
     }
-    // Don't nag while provisioned capacity remains: arm the wizard to fire
-    // only when this window's budget is exhausted. With no credit left, pop
-    // immediately so the user can buy a pomodoro block.
-    if (extensionBudgetMs > 0) armWizardForBoundary(ctx);
-    else armWizardNow(ctx);
-    updateStatus(ctx);
+    // Open the post-turn idle window (grace + rolling credit). The wizard pops
+    // here — immediately when no credit remains, or armed for exhaustion when
+    // some does — so this is where billing extensions are offered.
+    openHumanWindow(ctx, { silent: false });
   });
 
   // ── Commands ──────────────────────────────────────────────────────────
@@ -1432,18 +1456,19 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       const b = computeBilling(t.agentMs, t.humanMs, settings);
 
       let startedAt = earliestSidecarTimestamp();
-      if (startedAt === 0) {
-        const tps = extractTpsEntries(ctx.sessionManager.getBranch());
-        if (tps.length > 0) startedAt = tps[0]!.timestamp;
+      const tpsEntries = extractTpsEntries(ctx.sessionManager.getBranch());
+      // When pi-ledger has no live data (a resumed pi-tps-only session whose
+      // only sidecar event may be the initial human-open), fall back to the
+      // first pi-tps marker for the receipt's start date.
+      const noLiveData = totals.agentTurns === 0 && totals.humanWindows === 0;
+      if ((startedAt === 0 || noLiveData) && tpsEntries.length > 0) {
+        startedAt = tpsEntries[0]!.timestamp;
       }
-      if (totals.agentTurns === 0 && totals.humanWindows === 0) {
-        const tps = extractTpsEntries(ctx.sessionManager.getBranch());
-        if (tps.length > 0) {
-          ctx.ui.notify(
-            `Receipt derived from ${tps.length} pi-tps markers (lower fidelity: no tool time; human time estimated; includes idle up to now).`,
-            'info'
-          );
-        }
+      if (noLiveData && tpsEntries.length > 0) {
+        ctx.ui.notify(
+          `Receipt derived from ${tpsEntries.length} pi-tps markers (lower fidelity: no tool time; human time estimated; includes idle up to now).`,
+          'info'
+        );
       }
 
       const sessionId = ctx.sessionManager.getSessionId?.() ?? 'unknown';

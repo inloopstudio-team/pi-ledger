@@ -921,7 +921,9 @@ describe('extension integration', () => {
 
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
     expect(msg).toContain('agent 1.00h (1 turns)');
-    expect(msg).toContain('human 0.50h (1 windows)');
+    // 1 closed human window (rehydrated) + 1 open initial window (opened at
+    // session_start) = 2 windows; the initial window's idle is ~0 here.
+    expect(msg).toContain('human 0.50h (2 windows)');
     expect(msg).toContain('total $125.00');
     // status line shows the live hours, grey (dim) like pi-core's footer
     expect(fixture.setStatusSpy).toHaveBeenCalledWith(
@@ -1130,11 +1132,13 @@ describe('extension integration', () => {
     const close = fixture.lastSidecarEvent('human-close') as { billedMs: number } | undefined;
     expect(close).toBeDefined();
     expect(close!.billedMs).toBe(30_000); // 30s retained, capped at the 1m grace
-    // re-entering (rehydrate) retains the closed window's idle — not lost on exit
+    // re-entering (rehydrate) retains the closed window's idle — not lost on exit.
+    // The closed 30s window + the open initial window (opened at session_start)
+    // = 2 windows; the idle (30s) is retained.
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
-    expect(msg).toContain('human 0.01h (1 windows)');
+    expect(msg).toContain('human 0.01h (2 windows)');
   });
 
   it('rehydrates from the sidecar, so compaction (empty JSONL) does not reset totals', async () => {
@@ -1191,5 +1195,112 @@ describe('extension integration', () => {
     fixture.clearSidecar(); // simulate a missing/failed sidecar read
     fixture.run('session_start', { type: 'session_start', reason: 'reload' });
     expect(fixture.setStatusSpy.mock.calls.at(-1)![1]).toContain('agent 1.00h');
+  });
+
+  // ── Initial human window (first-prompt composition) ────────────────────
+
+  it('opens an initial human window at session_start and bills first-prompt composition (silent — no wizard)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    // the initial window opens silently — the wizard never auto-pops here
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open).toBeDefined();
+    expect(open!.grantedBudgetMs).toBe(60_000); // grace 1m; no credit provisioned yet
+    expect(open!.extensionBudgetMs).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(30_000); // 30s composing the first prompt
+    fixture.run('agent_start', { type: 'agent_start' }); // submitted → close
+
+    const close = fixture.lastSidecarEvent('human-close');
+    expect(close).toBeDefined();
+    expect(close!.billedMs).toBe(30_000); // under the 1m grace → billed in full
+    expect(close!.extensions).toBe(0);
+  });
+
+  it('caps the initial window at the grace minute — a long composition bills only grace (abuse guard)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    await vi.advanceTimersByTimeAsync(5 * 60_000); // 5m "thinking" before the first prompt
+    fixture.run('agent_start', { type: 'agent_start' });
+
+    const close = fixture.lastSidecarEvent('human-close');
+    expect(close!.billedMs).toBe(60_000); // capped at the 1m grace; the rest is unbilled
+    expect(close!.idleMs).toBe(5 * 60_000);
+    expect(close!.extensions).toBe(0);
+  });
+
+  it('does not open a second initial window when rehydrate restores an open one (crashed prior process)', async () => {
+    const openedAt = 5_000_000;
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      {
+        kind: 'human-open',
+        openedAt,
+        grantedBudgetMs: 60_000,
+        extensions: 0,
+        extensionBudgetMs: 0,
+        timestamp: openedAt,
+      },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    // rehydrate restored the unclosed window — don't open a second initial window
+    const opens = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
+    expect(opens).toHaveLength(1); // only the seeded one; no new human-open appended
+  });
+
+  it('carries rehydrated rolling credit into the initial window (cap = grace + credit), wizard silent', async () => {
+    // A prior idle window left 19m of rolling pomodoro credit on the sidecar.
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      {
+        kind: 'human-open',
+        openedAt: 0,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 20 * 60_000,
+        timestamp: 1000,
+      },
+      {
+        kind: 'human-close',
+        openedAt: 0,
+        closedAt: 2 * 60_000,
+        billedMs: 2 * 60_000,
+        idleMs: 2 * 60_000,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 19 * 60_000,
+        timestamp: 2000,
+      },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    // the initial window inherits the 19m rolling credit: cap = grace 1m + 19m
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open!.grantedBudgetMs).toBe(20 * 60_000);
+    expect(open!.extensionBudgetMs).toBe(19 * 60_000);
+    // silent — the wizard never auto-pops for the initial window
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+  });
+
+  it('/ledger-extend extends the initial window before the first prompt is submitted', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    expect(fixture.customSpy).not.toHaveBeenCalled(); // initial window is silent
+    fixture.setCustomResult('extend');
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // manually provision +5m
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4 * 60_000); // 4m composing (under grace 1m + 5m = 6m)
+    fixture.run('agent_start', { type: 'agent_start' });
+
+    const close = fixture.lastSidecarEvent('human-close');
+    expect(close!.grantedBudgetMs).toBe(60_000 + 5 * 60_000);
+    expect(close!.extensions).toBe(1);
+    expect(close!.billedMs).toBe(4 * 60_000); // 4m, under the 6m cap
+  });
+
+  it('the silent initial window does not suppress the wizard at the following agent_end', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    expect(fixture.customSpy).not.toHaveBeenCalled(); // initial window silent
+    fixture.run('agent_start', { type: 'agent_start' }); // first prompt → close initial (~0 billed)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // post-turn window → wizard pops
+    // the wizard pops at agent_end (where it belongs), not at session_start
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
   });
 });

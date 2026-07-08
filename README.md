@@ -29,9 +29,12 @@ The agent is the on-demand function; each turn is an invocation billed by
 duration, with stalls excluded (a slow or queued provider is a retry, not
 billable time). Human oversight — review, steering, the next prompt — is
 metered separately, like managed capacity, with a free grace tier and opt-in
-pomodoro extensions. Idle costs nothing by default: only the first grace minute
-of each idle window is billable (per-window, never rolls), and a wizard pops at
-`agent_end` (inline, pi-core settings style) to offer pomodoro-style blocks.
+pomodoro extensions. Even the time spent writing the first prompt is metered:
+an initial window opens at `session_start` and closes when you send it, billed
+under the same grace minute. Idle costs nothing by default: only the first
+grace minute of each idle window is billable (per-window, never rolls), and a
+wizard pops at `agent_end` (inline, pi-core settings style) to offer
+pomodoro-style blocks.
 Extensions are **rolling credit** — provisioned pomodoro blocks survive across
 agent turns (like provisioned capacity), so the wizard stays silent while
 credit remains and only re-pops when it's exhausted. `/ledger-receipt` then
@@ -76,10 +79,11 @@ capped at the grace budget) but enough to demo the output.
 
 ## How time is measured
 
-| Phase     | Bracket                                        | Billed as  |
-| --------- | ---------------------------------------------- | ---------- |
-| **Agent** | `agent_start` → `agent_end` (sum of turns)     | Agent time |
-| **Human** | `agent_end` → next `agent_start` (idle window) | Human time |
+| Phase     | Bracket                                                | Billed as  |
+| --------- | ------------------------------------------------------ | ---------- |
+| **Agent** | `agent_start` → `agent_end` (sum of turns)             | Agent time |
+| **Human** | `agent_end` → next `agent_start` (idle window)         | Human time |
+| **Human** | `session_start` → first `agent_start` (initial window) | Human time |
 
 **Agent time** is the billable agent work per turn — generation normalized to a
 reference TPS plus real tool-execution time — summed across turns and priced at
@@ -103,7 +107,10 @@ agent_cost        = agent_hours × agent_rate_per_hour
 
 **Human time** is the idle window between when the agent hands control back
 (`agent_end`) and when the user takes it again (`agent_start`), capped by a
-granted budget:
+granted budget. The **first prompt** is special — nothing precedes it — so an
+**initial window** opens at `session_start` and closes at the first
+`agent_start`, metering the time you spend composing (or reviewing a resumed
+session before your next prompt) under the same cap:
 
 ```
 billed_human  = min(actual_idle, granted_budget)
@@ -112,6 +119,12 @@ granted_budget = grace_minutes + remaining_extension_credit
 
 - The first **grace minute** (configurable) of every idle window is always
   billable — per-window, it never rolls.
+- The **initial window** (`session_start` → first `agent_start`) meters
+  first-prompt composition and post-`/resume`/`/new` review time with the same
+  `grace + credit` cap, so a long "I thought for a while" bills only the grace
+  minute unless you extend. It's **silent** — the wizard never auto-pops
+  mid-composition (it belongs at `agent_end`); use `/ledger-extend` to provision
+  more before submitting.
 - Extensions are **rolling credit**: `remaining_extension_credit` is the
   provisioned pomodoro balance carried across agent turns. Only billed time
   **beyond** grace consumes it; the remainder rolls forward to the next idle
@@ -178,12 +191,13 @@ entries) and accumulates across **all branches** of the session. Events:
 
 - `settings` — a settings snapshot (last one wins on replay).
 - `agent` — one per turn: `{ id, turnIndex, agentMs, generationMs, stallMs, toolMs, tokens, model, source, supersedes?, timestamp }`. `agentMs` is the billable time (generation normalized to the reference TPS + tool time); `generationMs`/`stallMs` are the real wall-clock (audit). A `'tps'` turn may `supersede` an earlier `'fallback'` for the same turn (load-order race) so it isn't double-counted.
-- `human-open` — on `agent_end` (and re-recorded on each wizard extend): `{ openedAt, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. `grantedBudgetMs` is the window's cap = `grace + extensionBudgetMs`; `extensionBudgetMs` is the rolling credit carried into the window.
+- `human-open` — on `session_start` (the initial first-prompt window), on `agent_end` (each idle window), and re-recorded on each wizard extend: `{ openedAt, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. `grantedBudgetMs` is the window's cap = `grace + extensionBudgetMs`; `extensionBudgetMs` is the rolling credit carried into the window.
 - `human-close` — on the next `agent_start` **or on `session_shutdown`** (exit): `{ openedAt, closedAt, billedMs, idleMs, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. Its `extensionBudgetMs` is the rolling credit remaining after this window's consumption (carried forward). Legacy events lacking `extensionBudgetMs` are backfilled on replay.
 
 On `session_start` (fresh load/reload), pi-ledger replays the sidecar to rebuild
 totals, settings, the rolling extension credit, and the in-progress human
-window (the last unclosed `human-open`). `/tree` branching stays in the same
+window (the last unclosed `human-open`), then opens an initial human window if
+none is open (first-prompt composition). `/tree` branching stays in the same
 session, so the live in-memory totals are kept as-is (not re-read — never reset
 to $0). Recording the exit close means accrued idle is **retained**
 across exit/re-enter — not lost — and totals are **global across branches**.
@@ -191,6 +205,10 @@ across exit/re-enter — not lost — and totals are **global across branches**.
 ## Architecture
 
 ```
+session_start         → rehydrate from sidecar; if no window is open, open an
+                        INITIAL human window (grace + rolling credit) — spans
+                        first-prompt composition (session_start → first
+                        agent_start). Silent: the wizard never auto-pops here.
 turn_start            → reset per-turn tool + fallback accumulators
 tool_execution_start  → tool depth counter (union timing)
 tool_execution_end    →   (parallel tools don't double-count)
@@ -217,7 +235,9 @@ recorded for audit. Tool-execution time is always measured locally, billed as
 real time, and paired with the turn. The wizard is driven entirely by the extension (the agent is
 unaware), auto-fires at `agent_end` only when no rolling pomodoro credit
 remains (otherwise it's armed to fire when that credit is exhausted), and is
-disarmed on the next `agent_start` or `session_shutdown`. The first grace
+disarmed on the next `agent_start` or `session_shutdown`. The initial
+`session_start` window opens silently — the wizard never auto-pops
+mid-composition; only `agent_end` windows offer extensions. The first grace
 minute of every idle window is always billable and never rolls; only billed
 time beyond grace consumes the rolling extension credit, whose remainder
 carries forward to the next idle window. State is **stateless**: everything is
@@ -233,7 +253,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (67 tests)
+pnpm test            # vitest run (73 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```
