@@ -1937,6 +1937,82 @@ describe('steering composition (human types while the agent runs)', () => {
     expect(r.totals.idleWindows).toBe(0);
   });
 
+  it('restores itemized sub-totals on rehydrate (reload) so the receipt itemizes prior work', async () => {
+    // A prior session's sidecar: one agent turn (generation + tool), one
+    // committed idle window, and one steer — the kind of state a reload sees.
+    const t0 = 1_700_000_000_000;
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: t0 },
+      {
+        kind: 'agent',
+        id: 'a1',
+        turnIndex: 0,
+        agentMs: 3_600_000,
+        generationMs: 3_000_000,
+        stallMs: 0,
+        toolMs: 600_000,
+        tokens: { input: 100, output: 50, total: 150 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'tps',
+        timestamp: t0 + 1000,
+      },
+      {
+        kind: 'human-open',
+        openedAt: t0 + 2000,
+        grantedBudgetMs: 60_000,
+        extensions: 0,
+        engagedVia: 'keystroke',
+        extensionBudgetMs: 0,
+        timestamp: t0 + 2000,
+      },
+      {
+        kind: 'human-close',
+        openedAt: t0 + 2000,
+        closedAt: t0 + 62_000,
+        billedMs: 60_000,
+        idleMs: 60_000,
+        keystrokes: 10,
+        committed: true,
+        grantedBudgetMs: 60_000,
+        extensions: 0,
+        extensionBudgetMs: 0,
+        timestamp: t0 + 62_000,
+      },
+      {
+        kind: 'steer',
+        startedAt: t0 + 70_000,
+        submittedAt: t0 + 90_000,
+        durationMs: 20_000,
+        billedMs: 20_000,
+        keystrokes: 30,
+        behavior: 'steer',
+        grantedBudgetMs: 60_000,
+        extensionBudgetMs: 0,
+        timestamp: t0 + 90_000,
+      },
+    ]);
+    // Reload → session_start rehydrates the in-memory totals from the sidecar.
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+
+    // The receipt itemizes from the sub-totals; they must be restored (not 0).
+    await fixture.commands['ledger-receipt']!.handler('', fixture.mockCtx);
+    const file = fs
+      .readdirSync(path.join(cacheDir, 'pi-ledger'))
+      .filter((f) => f.startsWith('receipt-019fabcd-'))
+      .sort()
+      .pop();
+    expect(file).toBeDefined();
+    const html = fs.readFileSync(path.join(cacheDir, 'pi-ledger', file!), 'utf8');
+    // agent sub-items restored: generation 3m @ $60 = $50, tool 0.167h = $10
+    expect(html).toContain('$50.00'); // Compute (generation)
+    expect(html).toContain('$10.00'); // Tool execution
+    // human sub-items restored: idle 1m @ $60 = $1, steer 20s = $0.33
+    expect(html).toContain('$1.00'); // Review / think
+    expect(html).toContain('$0.33'); // Steering
+    // total reconciles from the restored sub-totals (not just the in-progress window)
+    expect(html).toContain('$61.33');
+  });
+
   it('discards an unsubmitted in-run composition (no backdate — it never reached the agent)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });

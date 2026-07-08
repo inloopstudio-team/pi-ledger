@@ -1687,11 +1687,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (events.length > 0) {
       const r = rehydrateFromSidecar(events);
       settings = r.settings;
-      totals.agentMs = r.totals.agentMs;
-      totals.humanMs = r.totals.humanMs;
-      totals.agentTurns = r.totals.agentTurns;
-      totals.humanWindows = r.totals.humanWindows;
-      totals.agentTokens = r.totals.agentTokens;
+      // Restore the ENTIRE totals object — including the itemized sub-totals
+      // the receipt itemizes from (agent gen/tool/stall, human idle/steer/queue/
+      // abandoned, extensions). Copying only the bundled ms left the sub-totals
+      // at 0 after a reload, so the receipt collapsed to just the in-progress
+      // window while the status bar (which uses the bundled ms) stayed correct.
+      Object.assign(totals, r.totals);
       extensionBudgetMs = r.extensionBudgetMs; // rolling credit carries forward
       // An unclosed window from a prior session was never committed by an agent
       // action — idle with no output is wasted, so abandon it (bills 0) rather
