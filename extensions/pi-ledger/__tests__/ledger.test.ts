@@ -901,6 +901,27 @@ describe('extension integration', () => {
     expect(seg.billedMs).toBe(360_000); // 6 min
   });
 
+  it('bills the thinking span for extend + extend + extend + type-and-go (the nuance pattern)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.setCustomResult('extend'); // every wizard pop → extend (engages + grants capacity)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → 1st pop → engage + +20m
+    await vi.advanceTimersByTimeAsync(0); // flush the 1st extend → openIdleWindow('extension', 20m), cap 21m
+    // idle to the first exhaustion (grace 1m + 20m) → 2nd pop → +20m (cap 41m)
+    await vi.advanceTimersByTimeAsync(21 * 60_000);
+    // idle to the next exhaustion (another 20m) → 3rd pop → +20m (cap 61m)
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    // 10m more thinking (under the 61m cap), then type and go (submit → agent_start commits)
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    fixture.run('agent_start', { type: 'agent_start' });
+
+    const seg = lastEntry(fixture, 'ledger-human');
+    expect(seg).toBeDefined();
+    expect(seg.extensions).toBe(3); // three pomodoro blocks granted
+    expect(seg.billedMs).toBe(51 * 60_000); // the whole thinking span (21 + 20 + 10) min, under the 61m cap
+    expect(seg.committed).toBe(true); // committed by the submit (agent action), not abandoned
+    expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('extension'); // engaged via the first extend
+  });
+
   it('suppresses the wizard at the next agent_end while rolling extension credit remains', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend');
