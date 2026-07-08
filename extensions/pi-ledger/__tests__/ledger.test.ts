@@ -556,10 +556,21 @@ describe('extension integration', () => {
     expect(seg.billedMs).toBe(360_000); // 6 min
   });
 
-  it('/ledger-extend manually raises the budget and caps billing', async () => {
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately (ignored); grace 1m
-    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // +5m → budget 6m
-    await vi.advanceTimersByTimeAsync(100_000); // 100s idle, under 6m budget, wizard (6m) not fired
+  it('/ledger-extend opens the wizard; confirming extends by the given minutes', async () => {
+    fixture.mockEntries.push({
+      type: 'custom',
+      customType: 'ledger-settings',
+      data: { ...DEFAULTS, autoWizard: false },
+    });
+    fixture.setCustomResult('extend');
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // apply autoWizard: false
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens window; autoWizard off → no auto-pop
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // opens the wizard → confirm → +5m
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(100_000); // 100s idle, under 6m budget
     fixture.run('agent_start', { type: 'agent_start' });
 
     const seg = lastEntry(fixture, 'ledger-human');

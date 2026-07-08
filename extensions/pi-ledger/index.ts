@@ -219,16 +219,6 @@ function fmtRate(rate: number): string {
   return rate === Math.round(rate) ? `${rate}` : `${rate.toFixed(2)}`;
 }
 
-export function fmtDuration(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const h = Math.floor(totalSeconds / 3600);
-  const m = Math.floor((totalSeconds % 3600) / 60);
-  const s = totalSeconds % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
 function parseNumber(raw: string): number | null {
   const n = Number(raw);
   if (!Number.isFinite(n)) return null;
@@ -748,15 +738,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     updateStatus(ctx);
   }
 
-  function extendWindow(ctx: ExtensionContext, mins: number) {
-    if (!humanWindow) return;
-    humanWindow.grantedBudgetMs += mins * MS_PER_MINUTE;
-    humanWindow.extensions += 1;
-    clearWizardTimer();
-    armWizardForBoundary(ctx);
-    updateStatus(ctx);
-  }
-
   // ── Wizard ─────────────────────────────────────────────────────────────
 
   function clearWizardTimer() {
@@ -802,10 +783,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     showWizard(ctx);
   }
 
-  function showWizard(ctx: ExtensionContext) {
+  function showWizard(ctx: ExtensionContext, extendMins: number = settings.pomodoroMinutes) {
     wizardTimer = null;
     if (!humanWindow) return;
-    const pomodoro = settings.pomodoroMinutes;
+    const pomodoro = extendMins;
 
     ctx.ui
       .custom<string>(
@@ -869,6 +850,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         humanWindow.grantedBudgetMs += pomodoro * MS_PER_MINUTE;
         humanWindow.extensions += 1;
         armWizardForBoundary(ctx);
+        updateStatus(ctx);
         notify(ctx, `Extended billable human time by ${pomodoro}m.`, 'info');
       });
   }
@@ -1124,7 +1106,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   pi.registerCommand('ledger-extend', {
     description:
-      'Extend the current human-time billing window by N minutes (default: pomodoro length).',
+      'Open the human-time wizard to extend the billing window by N minutes (default: pomodoro length); confirm or stop in the dialog.',
     getArgumentCompletions: (argumentPrefix: string) => {
       const presets = [String(settings.pomodoroMinutes), '40', '60', '90', '120'];
       return presets
@@ -1139,12 +1121,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         );
         return;
       }
+      if (ctx.mode !== 'tui' || !ctx.hasUI) {
+        ctx.ui.notify(
+          'Open the wizard in a TUI session (extend after the agent finishes a turn).',
+          'warning'
+        );
+        return;
+      }
       const mins = parseMinutes(args) ?? settings.pomodoroMinutes;
-      extendWindow(ctx, mins);
-      ctx.ui.notify(
-        `Extended billable human time by ${mins}m (budget now ${fmtDuration(humanWindow.grantedBudgetMs)}).`,
-        'info'
-      );
+      showWizard(ctx, mins);
     },
   });
 

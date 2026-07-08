@@ -49,12 +49,12 @@ capped at the grace budget) but enough to demo the output.
 
 ## Commands
 
-| Command              | What it does                                                                                              |
-| -------------------- | --------------------------------------------------------------------------------------------------------- |
-| `/ledger`            | Show running totals: agent/human hours, costs, total.                                                     |
-| `/ledger-settings`   | Bordered, searchable settings TUI (rates, grace, pomodoro, project, author, currency, auto-wizard).       |
-| `/ledger-extend [m]` | Extend the current human-time billing window by `m` minutes (default: pomodoro length). Works while idle. |
-| `/ledger-receipt`    | Export a self-contained HTML receipt for the session and open it.                                         |
+| Command              | What it does                                                                                                                                |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/ledger`            | Show running totals: agent/human hours, costs, total.                                                                                       |
+| `/ledger-settings`   | Bordered, searchable settings TUI (rates, grace, pomodoro, project, author, currency, auto-wizard).                                         |
+| `/ledger-extend [m]` | Open the human-time wizard to extend the window by `m` minutes (default: pomodoro length); confirm or stop in the dialog. Works while idle. |
+| `/ledger-receipt`    | Export a self-contained HTML receipt for the session and open it.                                                                           |
 
 ## How time is measured
 
@@ -87,7 +87,8 @@ granted_budget = grace_minutes + Σ extensions (each + pomodoro_minutes)
   bottom-left, full-width panel (pi-core settings style): _Extend +pomodoro?_
   — `Enter` adds a block and re-arms at the next boundary; `Esc`/dismiss (or
   ignoring it) caps billing at the grace minute.
-- `/ledger-extend [m]` raises the budget manually, any time the window is open.
+- `/ledger-extend [m]` opens the wizard manually (any time the window is
+  open) offering to extend by `m` minutes — confirm in the dialog, or stop.
 - The status bar and receipt total the **entire session up to now** — they
   include the in-progress open human window's idle (capped at its granted
   budget) and, for a pi-tps-only session, the trailing idle after the last
