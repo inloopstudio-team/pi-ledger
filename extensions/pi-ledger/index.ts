@@ -753,6 +753,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     wizardTimer = setTimeout(() => showWizard(ctx), delay);
   }
 
+  /** Show the wizard immediately at the start of a human idle window (no grace
+   *  wait). The grace budget still caps billing if the user makes no selection. */
+  function armWizardNow(ctx: ExtensionContext) {
+    clearWizardTimer();
+    if (!humanWindow || !settings.autoWizard || !ctx.hasUI || ctx.mode !== 'tui') return;
+    showWizard(ctx);
+  }
+
   function showWizard(ctx: ExtensionContext) {
     wizardTimer = null;
     if (!humanWindow) return;
@@ -768,7 +776,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
           );
           container.addChild(
             new Text(
-              theme.fg('muted', `Idle grace ending. Add a ${pomodoro}m pomodoro block?`),
+              theme.fg('muted', `Idle after the agent. Add a ${pomodoro}m pomodoro block?`),
               1,
               0
             )
@@ -1051,7 +1059,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         'info'
       );
     }
-    armWizardForBoundary(ctx);
+    armWizardNow(ctx);
     updateStatus(ctx);
   });
 

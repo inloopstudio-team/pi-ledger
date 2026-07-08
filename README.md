@@ -17,8 +17,8 @@ pi-ledger turns a pi session into a billable timesheet. Agent work and human
 work are metered separately and billed like serverless: **per-invocation,
 duration-based, scale-to-zero idle**. The agent is the on-demand function; the
 human prompt is the invocation. Idle costs nothing by default — only the first
-grace minute of human time is billable, and a non-blocking wizard offers
-pomodoro-style extensions.
+grace minute of human time is billable, and a non-blocking wizard pops
+immediately at `agent_end` to offer pomodoro-style extensions.
 
 > **Standalone, but pi-tps-aware.** pi-ledger works on its own — it measures
 > agent time itself when [`@monotykamary/pi-tps`](https://github.com/monotykamary/pi-tps)
@@ -83,9 +83,9 @@ granted_budget = grace_minutes + Σ extensions (each + pomodoro_minutes)
 ```
 
 - The first **grace minute** (configurable) is always billable.
-- At the grace boundary, if still idle, a **non-blocking wizard** pops:
-  _Extend +pomodoro?_ — `Enter` adds a block and re-arms for the next boundary;
-  `Esc`/dismiss caps billing at the current budget.
+- **Immediately at `agent_end`**, a **non-blocking wizard** pops:
+  _Extend +pomodoro?_ — `Enter` adds a block and re-arms at the next boundary;
+  `Esc`/dismiss (or ignoring it) caps billing at the grace minute.
 - `/ledger-extend [m]` raises the budget manually, any time the window is open.
 
 Because billing is `min(actual_idle, budget)`, the 8 seconds you spend
@@ -98,16 +98,16 @@ text fields open an inline input on `Enter`; currency and the auto-wizard
 toggle cycle through presets. Settings persist as a `ledger-settings` entry in
 the session and rehydrate on resume and `/tree` navigation.
 
-| Setting          | Default  | Notes                                            |
-| ---------------- | -------- | ------------------------------------------------ |
-| Agent rate       | `60`     | $/hour billed for agent work                     |
-| Human rate       | `60`     | $/hour billed for human work                     |
-| Grace minutes    | `1`      | First N minutes of idle billed before the wizard |
-| Pomodoro minutes | `20`     | Minutes added per extension                      |
-| Project          | _(cwd)_  | Shown on the receipt; falls back to the cwd name |
-| Author           | _(user)_ | Shown on the receipt; falls back to your OS user |
-| Currency         | `USD`    | Symbol for amounts                               |
-| Auto-wizard      | `on`     | Auto-popup at the end of the grace minute        |
+| Setting          | Default  | Notes                                                   |
+| ---------------- | -------- | ------------------------------------------------------- |
+| Agent rate       | `60`     | $/hour billed for agent work                            |
+| Human rate       | `60`     | $/hour billed for human work                            |
+| Grace minutes    | `1`      | Idle minutes billed by default if the wizard is ignored |
+| Pomodoro minutes | `20`     | Minutes added per extension                             |
+| Project          | _(cwd)_  | Shown on the receipt; falls back to the cwd name        |
+| Author           | _(user)_ | Shown on the receipt; falls back to your OS user        |
+| Currency         | `USD`    | Symbol for amounts                                      |
+| Auto-wizard      | `on`     | Auto-popup immediately at `agent_end`                   |
 
 ## Receipt
 
@@ -148,10 +148,9 @@ tps:telemetry (pi-tps)→ record 'tps' agent segment = (gen − stall) + tool
                         └ corrects a 'fallback' already written this turn
 
 turn_end (no pi-tps)  → record 'fallback' agent segment from own measurement
-agent_end             → open human window (grace budget), arm wizard timer
-                        └ at grace boundary → non-blocking wizard overlay
-                            ├ extend → +pomodoro, re-arm
-                            └ dismiss → cap at current budget
+agent_end             → open human window (grace budget), pop wizard immediately
+                        └ extend → +pomodoro, re-arm at the next boundary
+                            └ dismiss/ignore → cap at the grace minute
 agent_start           → close window: billed = min(idle, budget)
 ```
 
@@ -159,7 +158,7 @@ Agent timing prefers pi-tps's `tps:telemetry` (`generationMs`, `stallMs`);
 when pi-tps is absent, pi-ledger measures generation + a basic stall gap gate
 itself at `turn_end`. Tool-execution time is always measured locally and paired
 with the turn. The wizard is driven entirely by the extension (the agent is
-unaware), auto-fires at `agent_end + grace`, and is disarmed on the next
+unaware), auto-fires immediately at `agent_end`, and is disarmed on the next
 `agent_start` or `session_shutdown`. Rehydration dedups `ledger-agent` by
 `turnIndex`, keeping the last (so a `fallback` → `tps` correction never
 double-counts).

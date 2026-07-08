@@ -518,9 +518,10 @@ describe('extension integration', () => {
     expect(agentEntries).toHaveLength(1); // only the turn-0 tps entry
   });
 
-  it('opens/closes a human window and bills actual idle under the grace budget', async () => {
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // grace 1m
-    await vi.advanceTimersByTimeAsync(5000); // 5s idle — wizard (60s) not yet fired
+  it('pops the wizard immediately at agent_end and bills actual idle under grace when ignored', async () => {
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately (no selection → ignored)
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5000); // 5s idle, under 1m grace
     fixture.run('agent_start', { type: 'agent_start' });
 
     const seg = lastEntry(fixture, 'ledger-human');
@@ -528,17 +529,15 @@ describe('extension integration', () => {
     expect(seg.billedMs).toBe(5000);
     expect(seg.grantedBudgetMs).toBe(60_000);
     expect(seg.extensions).toBe(0);
-    expect(fixture.customSpy).not.toHaveBeenCalled(); // wizard never popped
   });
 
   it('caps human time at the grace minute when the wizard is dismissed', async () => {
     fixture.setCustomResult('stop');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] });
-    await vi.advanceTimersByTimeAsync(60_000); // grace ends → wizard fires, dismissed
-    await vi.advanceTimersByTimeAsync(30_000); // 90s total idle, no re-arm after dismiss
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately, dismissed ('stop')
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(90_000); // 90s idle, no re-arm after dismiss
     fixture.run('agent_start', { type: 'agent_start' });
 
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     const seg = lastEntry(fixture, 'ledger-human');
     expect(seg.billedMs).toBe(60_000); // capped at grace
     expect(seg.extensions).toBe(0);
@@ -546,20 +545,19 @@ describe('extension integration', () => {
 
   it('extends the budget when the wizard is accepted', async () => {
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] });
-    await vi.advanceTimersByTimeAsync(60_000); // wizard fires, accepted → +20m
-    await vi.advanceTimersByTimeAsync(300_000); // 5m more idle, re-armed wizard (20m) not yet fired
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately, accepted → +20m, re-armed at 21m
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(360_000); // 6m idle, under 21m budget → re-armed wizard not fired
     fixture.run('agent_start', { type: 'agent_start' });
 
     const seg = lastEntry(fixture, 'ledger-human');
-    // budget grew to 1m + 20m = 21m; actual idle 6m is under budget → billed = actual
     expect(seg.grantedBudgetMs).toBe(60_000 + 20 * 60_000);
     expect(seg.extensions).toBe(1);
     expect(seg.billedMs).toBe(360_000); // 6 min
   });
 
   it('/ledger-extend manually raises the budget and caps billing', async () => {
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // grace 1m, timer armed
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately (ignored); grace 1m
     await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // +5m → budget 6m
     await vi.advanceTimersByTimeAsync(100_000); // 100s idle, under 6m budget, wizard (6m) not fired
     fixture.run('agent_start', { type: 'agent_start' });
