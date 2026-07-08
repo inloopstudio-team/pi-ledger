@@ -953,6 +953,18 @@ describe('extension integration', () => {
     expect(fixture.customSpy).toHaveBeenCalledTimes(1); // no credit → pop immediately
   });
 
+  it('pops the wizard on /resume (and /reload) to prompt engagement for review', async () => {
+    fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // resume → pop
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    fixture.customSpy.mockClear();
+    fixture.run('session_start', { type: 'session_start', reason: 'reload' }); // reload → pop
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    fixture.customSpy.mockClear();
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // startup → no pop
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+  });
+
   it('suppresses the wizard at agent_end when rolling credit is rehydrated', async () => {
     // A prior idle window left 19m of rolling pomodoro credit on the sidecar.
     fixture.seedSidecar([
