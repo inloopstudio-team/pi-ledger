@@ -2,9 +2,9 @@
 
 # 🧾 pi-ledger
 
-**Timesheet maker for [pi](https://github.com/earendil-works/pi-coding-agent) — billed like serverless.**
+**Billing engine for the serverless agency — a [pi](https://github.com/earendil-works/pi-coding-agent) extension that meters agentic dev work like cloud compute and invoices it like a timesheet.**
 
-_Metered agent + human time, a pomodoro human-time wizard, and an exportable receipt._
+_Per-invocation · duration-based · scale-to-zero idle. A pomodoro human-time wizard, and an invoice-grade receipt._
 
 [![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
@@ -13,12 +13,27 @@ _Metered agent + human time, a pomodoro human-time wizard, and an exportable rec
 
 ---
 
-pi-ledger turns a pi session into a billable timesheet. Agent work and human
-work are metered separately and billed like serverless: **per-invocation,
-duration-based, scale-to-zero idle**. The agent is the on-demand function; the
-human prompt is the invocation. Idle costs nothing by default — only the first
-grace minute of human time is billable, and a wizard pops immediately at
-`agent_end` (inline, pi-core settings style) to offer pomodoro-style extensions.
+pi-ledger is the billing engine for the **serverless agency** — a dev shop that
+runs on on-demand agents and bills the way serverless compute is billed:
+**per-invocation, duration-based, scale-to-zero idle**.
+
+| Serverless compute     | pi-ledger                                             |
+| ---------------------- | ----------------------------------------------------- |
+| On-demand function     | The agent — each turn is an invocation                |
+| Execution duration     | Per-turn agent time (generation − stalls + tool time) |
+| Scale-to-zero idle     | Human idle costs nothing by default                   |
+| Provisioned capacity   | Opt-in pomodoro extensions (billed human oversight)   |
+| Usage report / invoice | `/ledger-receipt` — an invoice-grade HTML receipt     |
+
+The agent is the on-demand function; each turn is an invocation billed by
+duration, with stalls excluded (a slow or queued provider is a retry, not
+billable time). Human oversight — review, steering, the next prompt — is
+metered separately, like managed capacity, with a free grace tier and opt-in
+pomodoro extensions. Idle costs nothing by default: only the first grace minute
+of human time is billable, and a wizard pops immediately at `agent_end`
+(inline, pi-core settings style) to offer pomodoro-style blocks.
+`/ledger-receipt` then emits the invoice — the cloud-provider usage report, for
+your own work.
 
 > **Standalone, but pi-tps-aware.** pi-ledger works on its own — it measures
 > agent time itself when [`@monotykamary/pi-tps`](https://github.com/monotykamary/pi-tps)
@@ -186,7 +201,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (42 tests)
+pnpm test            # vitest run (50 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```
