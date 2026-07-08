@@ -85,6 +85,9 @@ capped at the grace budget) but enough to demo the output.
 | **Human** | `agent_end` → next `agent_start` (idle window)         | Human time |
 | **Human** | `session_start` → first `agent_start` (initial window) | Human time |
 
+> A provider-error turn (`stopReason` `error`) opens **no** human window — its
+> retry/queue backoff isn't human idle and isn't billed (see below).
+
 **Agent time** is the billable agent work per turn — generation normalized to a
 reference TPS plus real tool-execution time — summed across turns and priced at
 the agent rate:
@@ -107,8 +110,14 @@ agent_cost        = agent_hours × agent_rate_per_hour
 
 **Human time** is the idle window between when the agent hands control back
 (`agent_end`) and when the user takes it again (`agent_start`), capped by a
-granted budget. The **first prompt** is special — nothing precedes it — so an
-**initial window** opens at `session_start` and closes at the first
+granted budget. A turn that ends in a **provider error** (`stopReason` `error`)
+does **not** open a window — that's a retry/queue in flight (a retry extension
+sleeps with backoff then re-prompts, or pi-core compacts an overflow and
+retries), not a human handoff, so the backoff wait is never billed as human
+time (scale-to-zero: a slow/queued provider is a retry, not billable). The
+window reopens at the next non-error `agent_end`. The **first prompt** is
+special — nothing precedes it — so an **initial window** opens at
+`session_start` and closes at the first
 `agent_start`, metering the time you spend composing (or reviewing a resumed
 session before your next prompt) under the same cap:
 
@@ -222,6 +231,11 @@ agent_end             → open human window (grace + rolling extension budget)
                         └ no credit left     → pop wizard immediately
                             └ extend → +pomodoro, re-arm at the next boundary
                             └ dismiss/ignore → cap at the grace minute
+                        └ last assistant stopReason "error" → open NO window
+                          (a retry/queue is in flight: a retry extension's
+                          backoff, or pi-core's compaction-retry — not human
+                          idle; the window reopens at the next non-error
+                          agent_end so the backoff is never billed)
 agent_start           → close window: billed = min(idle, grace + credit);
                         consume credit = max(0, billed − grace) (rolls the rest)
 session_shutdown      → close any open window (record the exit: idle is retained)

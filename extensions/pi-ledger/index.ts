@@ -1329,7 +1329,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     closeHumanWindow(ctx);
   });
 
-  pi.on('agent_end', (_event, ctx) => {
+  pi.on('agent_end', (event, ctx) => {
     lastCtx = ctx;
     if (!tpsEverSeen && !fallbackNotified) {
       fallbackNotified = true;
@@ -1339,6 +1339,18 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         'info'
       );
     }
+    // Skip the human idle window when the turn ended in a provider error
+    // (last assistant stopReason "error"). That's a retry/queue in flight, not
+    // a human handoff — a retry extension (pi-retry) sleeps with backoff then
+    // re-prompts, or pi-core compacts an overflow and retries — so opening a
+    // window here would bill the retry's backoff sleep as human time. That
+    // violates scale-to-zero: "a slow/queued provider is a retry, not billable
+    // time." No window means no billing (and no wizard pop) during the retry;
+    // the next non-error agent_end opens the window for genuine post-turn idle.
+    // max_tokens ("length") continuations are left alone: their pre-continue
+    // gap is small and they're ambiguous without a retry extension (a bare
+    // max_tokens stop hands control back to the human to decide).
+    if (lastAssistantStopReason(event.messages) === 'error') return;
     // Open the post-turn idle window (grace + rolling credit). The wizard pops
     // here — immediately when no credit remains, or armed for exhaustion when
     // some does — so this is where billing extensions are offered.
@@ -1660,4 +1672,21 @@ function asAssistant(message: unknown): {
     model?: string;
   };
   return m.role === 'assistant' ? m : null;
+}
+
+/** stopReason of the last assistant message in an `agent_end` event's
+ *  `messages`, or undefined when no assistant message is present. A turn whose
+ *  final assistant message has stopReason "error" is a provider failure — a
+ *  retry/queue in flight (pi-retry backoff, or pi-core compaction), not a
+ *  human idle moment — so its idle window must not open.
+ *  @internal Exported for testing only. */
+export function lastAssistantStopReason(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || typeof m !== 'object') continue;
+    const r = m as { role?: string; stopReason?: string };
+    if (r.role === 'assistant') return r.stopReason;
+  }
+  return undefined;
 }

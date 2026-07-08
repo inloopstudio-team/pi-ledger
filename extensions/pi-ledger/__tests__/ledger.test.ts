@@ -20,6 +20,7 @@ import {
   extractTpsEntries,
   fmtHours,
   fmtMoney,
+  lastAssistantStopReason,
   rehydrateFromSidecar,
   resolveExtensionBudget,
   sidecarPathFor,
@@ -187,6 +188,37 @@ describe('formatting', () => {
     expect(fmtMoney(125, 'EUR')).toBe('€125.00');
     expect(fmtMoney(125, 'VND')).toBe('₫125.00');
     expect(fmtMoney(125, 'XYZ')).toBe('125.00'); // unknown → no symbol
+  });
+});
+
+describe('lastAssistantStopReason', () => {
+  it('returns the stopReason of the last assistant message', () => {
+    expect(
+      lastAssistantStopReason([{ role: 'user' }, { role: 'assistant', stopReason: 'error' }])
+    ).toBe('error');
+    expect(lastAssistantStopReason([{ role: 'assistant', stopReason: 'stop' }])).toBe('stop');
+  });
+  it('scans from the end and stops at the first assistant', () => {
+    expect(
+      lastAssistantStopReason([
+        { role: 'assistant', stopReason: 'stop' },
+        { role: 'assistant', stopReason: 'error' },
+      ])
+    ).toBe('error');
+  });
+  it('skips a trailing toolResult/user message', () => {
+    expect(
+      lastAssistantStopReason([{ role: 'assistant', stopReason: 'error' }, { role: 'toolResult' }])
+    ).toBe('error');
+  });
+  it('returns undefined when no assistant is present', () => {
+    expect(lastAssistantStopReason([{ role: 'user' }, { role: 'toolResult' }])).toBeUndefined();
+    expect(lastAssistantStopReason([])).toBeUndefined();
+  });
+  it('returns undefined for non-array input', () => {
+    expect(lastAssistantStopReason(undefined)).toBeUndefined();
+    expect(lastAssistantStopReason(null)).toBeUndefined();
+    expect(lastAssistantStopReason({})).toBeUndefined();
   });
 });
 
@@ -743,6 +775,77 @@ describe('extension integration', () => {
     expect(seg.billedMs).toBe(5000);
     expect(seg.grantedBudgetMs).toBe(60_000);
     expect(seg.extensions).toBe(0);
+  });
+
+  // ── Retry/queue turns (pi-retry backoff) are not human idle ─────────────
+
+  it('does not open a human window when agent_end carries a provider error (retry in flight)', async () => {
+    fixture.run('agent_end', {
+      type: 'agent_end',
+      messages: [{ role: 'assistant', stopReason: 'error' }],
+    });
+    // no human window → no wizard, no human-open event
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
+    // the retry's backoff sleep is NOT billed: agent_start has no window to close
+    await vi.advanceTimersByTimeAsync(60_000); // a full grace minute of backoff
+    fixture.run('agent_start', { type: 'agent_start' });
+    expect(fixture.lastSidecarEvent('human-close')).toBeUndefined();
+  });
+
+  it('does not bill the retry backoff between an errored turn and the retry agent_start', async () => {
+    // turn 1 errors → retry in flight (no human window opened)
+    fixture.run('agent_end', {
+      type: 'agent_end',
+      messages: [{ role: 'assistant', stopReason: 'error' }],
+    });
+    await vi.advanceTimersByTimeAsync(60_000); // 60s backoff — would bill a grace minute if a window were open
+    fixture.run('agent_start', { type: 'agent_start' }); // retry runs; nothing to close
+    // retry succeeds → a real human window opens now for genuine post-turn idle
+    fixture.run('agent_end', {
+      type: 'agent_end',
+      messages: [{ role: 'assistant', stopReason: 'stop' }],
+    });
+    const opens = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
+    expect(opens).toHaveLength(1); // only the post-success window, not during the retry
+    expect(fixture.lastSidecarEvent('human-close')).toBeUndefined(); // still open
+  });
+
+  it('does not bill backoff across a multi-retry storm (one error turn per retry)', async () => {
+    // simulate 3 errored retries, each separated by a 60s backoff
+    for (let i = 0; i < 3; i++) {
+      fixture.run('agent_end', {
+        type: 'agent_end',
+        messages: [{ role: 'assistant', stopReason: 'error' }],
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      fixture.run('agent_start', { type: 'agent_start' }); // retry fires
+    }
+    // no human window was ever opened or billed across the whole storm
+    expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-open')).toHaveLength(0);
+    expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-close')).toHaveLength(0);
+  });
+
+  it('opens the human window for a normal (stop) agent_end — regression guard', async () => {
+    fixture.run('agent_end', {
+      type: 'agent_end',
+      messages: [{ role: 'assistant', stopReason: 'stop' }],
+    });
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops
+    expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
+  });
+
+  it('still opens the human window for an aborted agent_end (a retry is not in flight)', async () => {
+    fixture.run('agent_end', {
+      type: 'agent_end',
+      messages: [{ role: 'assistant', stopReason: 'aborted' }],
+    });
+    expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
+  });
+
+  it('opens the human window when agent_end has no assistant message (unchanged)', async () => {
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
   });
 
   it('caps human time at the grace minute when the wizard is dismissed', async () => {
