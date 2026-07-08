@@ -231,7 +231,7 @@ entries) and accumulates across **all branches** of the session. Events:
 - `settings` — a settings snapshot (last one wins on replay).
 - `agent` — one per turn: `{ id, turnIndex, agentMs, generationMs, stallMs, toolMs, tokens, model, source, supersedes?, timestamp }`. `agentMs` is the billable time (generation normalized to the reference TPS + tool time); `generationMs`/`stallMs` are the real wall-clock (audit). A `'tps'` turn may `supersede` an earlier `'fallback'` for the same turn (load-order race) so it isn't double-counted.
 - `human-open` — on **engagement** (the first keystroke you type after a turn, or the first extension — both open the window), and re-recorded on each wizard extend: `{ openedAt, engagedVia, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. `openedAt` is the engagement onset; `engagedVia` is `"keystroke"` or `"extension"` (audit); `grantedBudgetMs` is the window's cap = `grace + extensionBudgetMs`; `extensionBudgetMs` is the rolling credit carried into the window. No `human-open` is written at `session_start` or `agent_end` — the window is engagement-gated.
-- `human-close` — on the next `agent_start` (**committed** = your submit produced agent work) **or on `session_shutdown`** (**abandoned** = you left without submitting): `{ openedAt, closedAt, billedMs, idleMs, committed, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. Committed bills `min([onset, agent_start], grace + credit)`; abandoned bills 0 (idle with no output is wasted). `committed` defaults to `true` on legacy events. Its `extensionBudgetMs` is the rolling credit remaining after this window's consumption (carried forward). Legacy events lacking `extensionBudgetMs` are backfilled on replay.
+- `human-close` — on the next `agent_start` (**committed** = your submit produced agent work) **or on `session_shutdown`** (**abandoned** = you left without submitting): `{ openedAt, closedAt, billedMs, idleMs, keystrokes, committed, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. Committed bills `min([onset, agent_start], grace + credit)`; abandoned bills 0 (idle with no output is wasted). `keystrokes` is the composition-density count while the window was open (after held-key collapse; idle bills wall-clock, so it's analytics, not a billing input). `committed` defaults to `true` on legacy events. Its `extensionBudgetMs` is the rolling credit remaining after this window's consumption (carried forward). Legacy events lacking `extensionBudgetMs` are backfilled on replay.
 - `steer` — a steer/followUp composed while the agent ran (editor keystrokes → `input` submit): `{ startedAt, submittedAt, durationMs, billedMs, keystrokes, behavior, grantedBudgetMs, extensionBudgetMs, timestamp }`. `billedMs` is `min` of the typing-burst sum and `grace + credit` (not the wall-clock span — `durationMs` is the span, kept for audit); `keystrokes` is the staged count; `behavior` is `"steer"` (mid-stream interrupt) or `"followUp"` (queued). Billed as human time, consuming rolling credit beyond grace (same rule as an idle window).
 
 On `session_start` (fresh load/reload), pi-ledger replays the sidecar to rebuild
@@ -288,7 +288,8 @@ input (steer/followUp)→ commit staged keystrokes as a `steer` event: billed =
                         only; pass-through (never transform the input). An
                         uncommitted buffer is discarded at agent_end — typing
                         never queued/steered bills nothing. Held keys
-                        (auto-repeat) collapse, so they can't fake a burst.
+                        (auto-repeat) collapse, so they can't fake a burst;
+                        idle keystrokes are counted (composition density).
 session_shutdown      → ABANDON any open window (committed: false, billed 0 —
                         idle with no submit is wasted; nothing retained).
 ```
@@ -320,7 +321,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (107 tests)
+pnpm test            # vitest run (111 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```

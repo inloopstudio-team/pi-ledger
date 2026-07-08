@@ -187,6 +187,11 @@ export interface HumanCloseEvent {
   idleMs: number;
   grantedBudgetMs: number;
   extensions: number;
+  /** Keystrokes the human typed while the window was open (analytics — idle
+   *  bills wall-clock from onset, so the count isn't load-bearing for the bill;
+   *  it records composition density, after held-key collapse). Optional on
+   *  legacy events. */
+  keystrokes?: number;
   /** Whether the window's idle was committed by an agent action (a submitted
    *  prompt at `agent_start`). `false` = abandoned (the session ended with no
    *  submit): idle with no output bills nothing, so `billedMs` is 0. Optional
@@ -883,6 +888,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   let lastKey: string | null = null;
   let lastKeyTime = 0;
 
+  // Idle keystroke count for analytics: every keystroke while an idle window is
+  // open (after held-key collapse), recorded on the window's `human-close`.
+  // Idle bills wall-clock from onset, so this is composition density, not a
+  // billing input. Reset when a window opens/closes and at session_start.
+  let idleKeystrokes = 0;
+
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Latest ctx (event-bus listeners for tps:telemetry don't receive one).
@@ -1074,12 +1085,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       closedAt,
       billedMs,
       idleMs,
+      keystrokes: idleKeystrokes,
       committed,
       grantedBudgetMs: w.grantedBudgetMs,
       extensions: w.extensions,
       extensionBudgetMs,
       timestamp: closedAt,
     });
+    idleKeystrokes = 0; // reset for the next window
     if (billedMs > 0) {
       totals.humanMs += billedMs;
       totals.humanWindows += 1;
@@ -1102,6 +1115,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     extendMs = 0
   ) {
     if (humanWindow) return; // safety: never open a second window
+    idleKeystrokes = 0; // reset the composition-density count for the new window
     const graceMs = settings.graceMinutes * MS_PER_MINUTE;
     if (extendMs > 0) extensionBudgetMs += extendMs;
     const cap = graceMs + extensionBudgetMs;
@@ -1136,23 +1150,24 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // is only billed when it's actually queued/steered to the agent.
   function noteKeystroke(data: string) {
     const now = Date.now();
+    // Held-key collapse: a held key auto-repeats the same data within
+    // AUTO_REPEAT_MS. Collapse to one event so a single physical action can't
+    // fabricate a sustained burst (steer staging) or inflate the idle keystroke
+    // count. Varied keys, same-key gaps at/above the threshold, and voice/paste
+    // (distinct blobs) are unaffected. Reset at agent_start/end and recordSteer.
+    const autoRepeat = data === lastKey && now - lastKeyTime < AUTO_REPEAT_MS;
+    lastKey = data;
+    lastKeyTime = now;
+    if (autoRepeat) return;
     if (agentRunning) {
-      // Held-key collapse: a held key auto-repeats the same data within
-      // AUTO_REPEAT_MS. Collapse to one timestamp so it can't fabricate a
-      // sustained (zero-length) burst. Varied keys, or same-key gaps at/above
-      // the threshold, stage normally.
-      if (data === lastKey && now - lastKeyTime < AUTO_REPEAT_MS) {
-        lastKeyTime = now;
-        return;
-      }
       steerStaging.push(now);
-      lastKey = data;
-      lastKeyTime = now;
-    } else if (!humanWindow && lastCtx) {
+    } else if (lastCtx) {
       // First keystroke after a turn (or at session start) engages an idle
       // window at this onset — no engagement means no bill. Subsequent idle
-      // keystrokes are no-ops (the onset is set; idle bills wall-clock from it).
-      openIdleWindow(lastCtx, 'keystroke');
+      // keystrokes add to the composition-density count (idle bills wall-clock
+      // from the onset, not keystrokes).
+      if (!humanWindow) openIdleWindow(lastCtx, 'keystroke');
+      idleKeystrokes++;
     }
   }
 
@@ -1388,6 +1403,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     steerStaging = [];
     lastKey = null;
     lastKeyTime = 0;
+    idleKeystrokes = 0;
     // Wrap the input editor so keystrokes stage for billing: during a run they
     // feed a steer/followUp burst (committed on submit via `input`); between
     // turns the FIRST keystroke engages an idle window at its onset. Extends

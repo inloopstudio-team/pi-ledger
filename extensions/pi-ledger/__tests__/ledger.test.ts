@@ -1415,6 +1415,51 @@ describe('extension integration', () => {
     expect(close!.extensions).toBe(0);
   });
 
+  it('records the idle keystroke count on the human-close event (composition-density analytics)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    // engage via keystroke, then type 4 more distinct keys (no held-key collapse)
+    fixture.sendEditorKey('h'); // engage (count 1)
+    fixture.sendEditorKey('e');
+    fixture.sendEditorKey('l');
+    fixture.sendEditorKey('o');
+    fixture.sendEditorKey('!');
+    await vi.advanceTimersByTimeAsync(10_000);
+    fixture.run('agent_start', { type: 'agent_start' }); // commit
+
+    const close = fixture.lastSidecarEvent('human-close');
+    expect(close!.keystrokes).toBe(5); // all five idle keystrokes counted
+    expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('keystroke');
+  });
+
+  it('records 0 idle keystrokes when the window engaged via extension (no typing)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.setCustomResult('extend');
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pop → extend engages (no keystroke)
+    await vi.advanceTimersByTimeAsync(0); // flush the extend → openIdleWindow('extension')
+    await vi.advanceTimersByTimeAsync(10_000); // idle, no typing
+    fixture.run('agent_start', { type: 'agent_start' }); // commit
+
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open!.engagedVia).toBe('extension');
+    expect(fixture.lastSidecarEvent('human-close')!.keystrokes).toBe(0); // no typing
+  });
+
+  it('collapses a held key in the idle keystroke count (no auto-repeat inflation)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    await vi.advanceTimersByTimeAsync(0); // flush dismissed wizard
+    // hold one key for ~1s: auto-repeat fires the same data every 10ms
+    for (let i = 0; i < 100; i++) {
+      fixture.sendEditorKey('a');
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    await vi.advanceTimersByTimeAsync(1000);
+    fixture.run('agent_start', { type: 'agent_start' }); // commit
+
+    // 100 auto-repeats collapse to one keystroke — the count stays meaningful
+    expect(fixture.lastSidecarEvent('human-close')!.keystrokes).toBe(1);
+  });
+
   it('does not open a second initial window when rehydrate restores an open one (crashed prior process)', async () => {
     const openedAt = 5_000_000;
     fixture.seedSidecar([
