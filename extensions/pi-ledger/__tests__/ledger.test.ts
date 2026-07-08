@@ -19,9 +19,11 @@ import {
   extractTpsEntries,
   fmtHours,
   fmtMoney,
-  rehydrateFromEntries,
+  rehydrateFromSidecar,
+  sidecarPathFor,
   type LedgerSettings,
   type ReceiptData,
+  type SidecarEvent,
 } from '../index';
 
 // Stub the browser opener so /ledger-receipt never launches anything during tests.
@@ -38,16 +40,20 @@ const DEFAULTS: LedgerSettings = {
   autoWizard: true,
 };
 
+const KIND_BY_CUSTOM_TYPE: Record<string, SidecarEvent['kind']> = {
+  'ledger-agent': 'agent',
+  'ledger-human': 'human-close',
+};
+
 function lastEntry(fixture: TestFixture, customType: string): any {
-  const calls = fixture.appendEntrySpy.mock.calls;
-  for (let i = calls.length - 1; i >= 0; i--) {
-    if (calls[i][0] === customType) return calls[i][1];
-  }
-  return undefined;
+  return fixture.lastSidecarEvent(
+    KIND_BY_CUSTOM_TYPE[customType] ?? (customType as SidecarEvent['kind'])
+  );
 }
 
 function entryCount(fixture: TestFixture, customType: string): number {
-  return fixture.appendEntrySpy.mock.calls.filter((c) => c[0] === customType).length;
+  const kind = KIND_BY_CUSTOM_TYPE[customType] ?? (customType as SidecarEvent['kind']);
+  return fixture.readSidecarEvents().filter((e) => e.kind === kind).length;
 }
 
 // ─── Pure helpers ───────────────────────────────────────────────────────────
@@ -135,96 +141,121 @@ describe('applySettingValue', () => {
   });
 });
 
-describe('rehydrateFromEntries', () => {
-  it('replays agent + human segments and restores last settings', () => {
-    const entries = [
+describe('rehydrateFromSidecar', () => {
+  it('replays agent + human events and restores last settings', () => {
+    const events: SidecarEvent[] = [
+      { kind: 'settings', settings: { ...DEFAULTS, agentRatePerHour: 100 }, timestamp: 0 },
       {
-        type: 'custom',
-        customType: 'ledger-settings',
-        data: { ...DEFAULTS, agentRatePerHour: 100 },
+        kind: 'agent',
+        id: 'a1',
+        turnIndex: 0,
+        agentMs: 3_600_000,
+        generationMs: 3_000_000,
+        stallMs: 0,
+        toolMs: 600_000,
+        tokens: { input: 100, output: 50, total: 150 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'tps',
+        timestamp: 1000,
       },
       {
-        type: 'custom',
-        customType: 'ledger-agent',
-        data: {
-          kind: 'agent',
-          turnIndex: 0,
-          agentMs: 3_600_000,
-          generationMs: 3_000_000,
-          stallMs: 0,
-          toolMs: 600_000,
-          tokens: { input: 100, output: 50, total: 150 },
-          model: { provider: 'openai', modelId: 'gpt-4' },
-          timestamp: 1000,
-        },
-      },
-      {
-        type: 'custom',
-        customType: 'ledger-human',
-        data: {
-          kind: 'human',
-          billedMs: 1_800_000,
-          idleMs: 1_800_000,
-          grantedBudgetMs: 60_000,
-          extensions: 0,
-          openedAt: 0,
-          closedAt: 1_800_000,
-          timestamp: 2000,
-        },
+        kind: 'human-close',
+        openedAt: 0,
+        closedAt: 1_800_000,
+        billedMs: 1_800_000,
+        idleMs: 1_800_000,
+        grantedBudgetMs: 60_000,
+        extensions: 0,
+        timestamp: 2000,
       },
     ];
-    const r = rehydrateFromEntries(entries);
+    const r = rehydrateFromSidecar(events);
     expect(r.settings.agentRatePerHour).toBe(100);
     expect(r.totals.agentMs).toBe(3_600_000);
     expect(r.totals.humanMs).toBe(1_800_000);
     expect(r.totals.agentTurns).toBe(1);
     expect(r.totals.humanWindows).toBe(1);
     expect(r.totals.agentTokens.total).toBe(150);
+    expect(r.humanWindow).toBeNull();
   });
   it('defaults settings when none persisted', () => {
-    const r = rehydrateFromEntries([]);
+    const r = rehydrateFromSidecar([]);
     expect(r.settings).toEqual(DEFAULTS);
     expect(r.totals.agentMs).toBe(0);
+    expect(r.humanWindow).toBeNull();
   });
-  it('dedups agent segments by turnIndex, keeping the last (tps over fallback)', () => {
-    const entries = [
+  it('supersedes a fallback agent event with the later tps event for the same turn (no double-count)', () => {
+    const events: SidecarEvent[] = [
       {
-        type: 'custom',
-        customType: 'ledger-agent',
-        data: {
-          kind: 'agent',
-          turnIndex: 0,
-          agentMs: 800,
-          generationMs: 800,
-          stallMs: 0,
-          toolMs: 0,
-          tokens: { input: 0, output: 0, total: 0 },
-          model: { provider: 'openai', modelId: 'gpt-4' },
-          source: 'fallback',
-          timestamp: 1,
-        },
+        kind: 'agent',
+        id: 'fb',
+        turnIndex: 0,
+        agentMs: 800,
+        generationMs: 800,
+        stallMs: 0,
+        toolMs: 0,
+        tokens: { input: 0, output: 0, total: 0 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'fallback',
+        timestamp: 1,
       },
       {
-        type: 'custom',
-        customType: 'ledger-agent',
-        data: {
-          kind: 'agent',
-          turnIndex: 0,
-          agentMs: 1500,
-          generationMs: 2000,
-          stallMs: 500,
-          toolMs: 0,
-          tokens: { input: 10, output: 5, total: 15 },
-          model: { provider: 'openai', modelId: 'gpt-4' },
-          source: 'tps',
-          timestamp: 2,
-        },
+        kind: 'agent',
+        id: 'tps',
+        turnIndex: 0,
+        agentMs: 1500,
+        generationMs: 2000,
+        stallMs: 500,
+        toolMs: 0,
+        tokens: { input: 10, output: 5, total: 15 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'tps',
+        supersedes: 'fb',
+        timestamp: 2,
       },
     ];
-    const r = rehydrateFromEntries(entries);
+    const r = rehydrateFromSidecar(events);
     expect(r.totals.agentMs).toBe(1500);
     expect(r.totals.agentTurns).toBe(1);
     expect(r.totals.agentTokens.total).toBe(15);
+  });
+  it('reconstructs the open human window from the last unclosed human-open', () => {
+    const events: SidecarEvent[] = [
+      {
+        kind: 'human-open',
+        openedAt: 5000,
+        grantedBudgetMs: 60_000,
+        extensions: 0,
+        timestamp: 5000,
+      },
+    ];
+    const r = rehydrateFromSidecar(events);
+    expect(r.humanWindow).toEqual({ openedAt: 5000, grantedBudgetMs: 60_000, extensions: 0 });
+  });
+  it('does not reconstruct a human window that was closed', () => {
+    const events: SidecarEvent[] = [
+      {
+        kind: 'human-open',
+        openedAt: 5000,
+        grantedBudgetMs: 60_000,
+        extensions: 0,
+        timestamp: 5000,
+      },
+      {
+        kind: 'human-close',
+        openedAt: 5000,
+        closedAt: 9000,
+        billedMs: 4000,
+        idleMs: 4000,
+        grantedBudgetMs: 60_000,
+        extensions: 0,
+        timestamp: 9000,
+      },
+    ];
+    const r = rehydrateFromSidecar(events);
+    expect(r.humanWindow).toBeNull();
+    expect(r.totals.humanMs).toBe(4000);
+    expect(r.totals.humanWindows).toBe(1);
   });
 });
 
@@ -345,14 +376,19 @@ describe('buildReceiptHtml', () => {
 describe('extension integration', () => {
   let fixture: TestFixture;
 
+  let cacheDir: string;
   beforeEach(async () => {
     vi.useFakeTimers();
+    cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
+    process.env.XDG_CACHE_HOME = cacheDir;
     fixture = createTestFixture();
     await activateExtension(fixture);
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    delete process.env.XDG_CACHE_HOME;
+    fs.rmSync(cacheDir, { recursive: true, force: true });
   });
 
   it('registers the four commands', () => {
@@ -495,10 +531,8 @@ describe('extension integration', () => {
     expect(seg.agentMs).toBe(1500); // (2000 - 500) + 0
     expect(entryCount(fixture, 'ledger-agent')).toBe(2); // fallback + tps entries kept
     // rehydrate dedups → keeps tps
-    const appended = fixture.appendEntrySpy.mock.calls
-      .filter((c) => c[0] === 'ledger-agent')
-      .map((c) => ({ type: 'custom', customType: 'ledger-agent', data: c[1] }));
-    const r = rehydrateFromEntries(appended);
+    // rehydrate from the sidecar: the fallback is superseded → only tps counts
+    const r = rehydrateFromSidecar(fixture.readSidecarEvents());
     expect(r.totals.agentMs).toBe(1500);
     expect(r.totals.agentTurns).toBe(1);
   });
@@ -514,7 +548,7 @@ describe('extension integration', () => {
     fixture.run('message_end', { type: 'message_end', message: msg });
     fixture.run('turn_end', { type: 'turn_end', turnIndex: 1, message: msg, toolResults: [] });
     // turn 1 had no tps:telemetry (skipped); tpsEverSeen is true → no fallback
-    const agentEntries = fixture.appendEntrySpy.mock.calls.filter((c) => c[0] === 'ledger-agent');
+    const agentEntries = fixture.readSidecarEvents().filter((e) => e.kind === 'agent');
     expect(agentEntries).toHaveLength(1); // only the turn-0 tps entry
   });
 
@@ -557,11 +591,9 @@ describe('extension integration', () => {
   });
 
   it('/ledger-extend opens the wizard; confirming extends by the given minutes', async () => {
-    fixture.mockEntries.push({
-      type: 'custom',
-      customType: 'ledger-settings',
-      data: { ...DEFAULTS, autoWizard: false },
-    });
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, autoWizard: false }, timestamp: 0 },
+    ]);
     fixture.setCustomResult('extend');
     fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // apply autoWizard: false
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens window; autoWizard off → no auto-pop
@@ -588,48 +620,42 @@ describe('extension integration', () => {
   });
 
   it('rehydrates totals + settings on session_start and /ledger reports them', async () => {
-    fixture.mockEntries.push(
+    fixture.seedSidecar([
       {
-        type: 'custom',
-        customType: 'ledger-settings',
-        data: {
+        kind: 'settings',
+        settings: {
           ...DEFAULTS,
           agentRatePerHour: 100,
           humanRatePerHour: 50,
           project: 'app',
           author: 'tom',
         },
+        timestamp: 0,
       },
       {
-        type: 'custom',
-        customType: 'ledger-agent',
-        data: {
-          kind: 'agent',
-          turnIndex: 0,
-          agentMs: 3_600_000,
-          generationMs: 3_000_000,
-          stallMs: 0,
-          toolMs: 600_000,
-          tokens: { input: 0, output: 0, total: 0 },
-          model: { provider: 'openai', modelId: 'gpt-4' },
-          timestamp: 1000,
-        },
+        kind: 'agent',
+        id: 'a1',
+        turnIndex: 0,
+        agentMs: 3_600_000,
+        generationMs: 3_000_000,
+        stallMs: 0,
+        toolMs: 600_000,
+        tokens: { input: 0, output: 0, total: 0 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'tps',
+        timestamp: 1000,
       },
       {
-        type: 'custom',
-        customType: 'ledger-human',
-        data: {
-          kind: 'human',
-          billedMs: 1_800_000,
-          idleMs: 1_800_000,
-          grantedBudgetMs: 60_000,
-          extensions: 0,
-          openedAt: 0,
-          closedAt: 1_800_000,
-          timestamp: 2000,
-        },
-      }
-    );
+        kind: 'human-close',
+        openedAt: 0,
+        closedAt: 1_800_000,
+        billedMs: 1_800_000,
+        idleMs: 1_800_000,
+        grantedBudgetMs: 60_000,
+        extensions: 0,
+        timestamp: 2000,
+      },
+    ]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
 
@@ -645,11 +671,13 @@ describe('extension integration', () => {
   });
 
   it('derives the footer + /ledger hours from pi-tps markers for a tps-only session', async () => {
-    fixture.mockEntries.push({
-      type: 'custom',
-      customType: 'ledger-settings',
-      data: { ...DEFAULTS, agentRatePerHour: 120, humanRatePerHour: 60 },
-    });
+    fixture.seedSidecar([
+      {
+        kind: 'settings',
+        settings: { ...DEFAULTS, agentRatePerHour: 120, humanRatePerHour: 60 },
+        timestamp: 0,
+      },
+    ]);
     fixture.mockEntries.push({
       type: 'custom',
       customType: 'tps',
@@ -689,11 +717,10 @@ describe('extension integration', () => {
 
   it('defaults agent and human rates to $60/h', async () => {
     // no settings entry → the extension defaults ($60/h) apply
-    fixture.mockEntries.push({
-      type: 'custom',
-      customType: 'ledger-agent',
-      data: {
+    fixture.seedSidecar([
+      {
         kind: 'agent',
+        id: 'a1',
         turnIndex: 0,
         agentMs: 3_600_000,
         generationMs: 3_600_000,
@@ -704,7 +731,7 @@ describe('extension integration', () => {
         source: 'tps',
         timestamp: 1000,
       },
-    });
+    ]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
@@ -741,22 +768,21 @@ describe('extension integration', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
     process.env.XDG_CACHE_HOME = tmp;
     try {
-      fixture.mockEntries.push({
-        type: 'custom',
-        customType: 'ledger-settings',
-        data: {
-          ...DEFAULTS,
-          agentRatePerHour: 100,
-          humanRatePerHour: 50,
-          project: 'app.inloop.studio',
-          author: 'tom',
+      fixture.seedSidecar([
+        {
+          kind: 'settings',
+          settings: {
+            ...DEFAULTS,
+            agentRatePerHour: 100,
+            humanRatePerHour: 50,
+            project: 'app.inloop.studio',
+            author: 'tom',
+          },
+          timestamp: 0,
         },
-      });
-      fixture.mockEntries.push({
-        type: 'custom',
-        customType: 'ledger-agent',
-        data: {
+        {
           kind: 'agent',
+          id: 'a1',
           turnIndex: 0,
           agentMs: 3_600_000,
           generationMs: 3_600_000,
@@ -764,15 +790,16 @@ describe('extension integration', () => {
           toolMs: 0,
           tokens: { input: 0, output: 0, total: 1500 },
           model: { provider: 'openai', modelId: 'gpt-4' },
+          source: 'tps',
           timestamp: 1000,
         },
-      });
+      ]);
       fixture.run('session_start', { type: 'session_start', reason: 'resume' });
 
       await fixture.commands['ledger-receipt'].handler('', fixture.mockCtx);
 
       const dir = path.join(tmp, 'pi-ledger');
-      const files = fs.readdirSync(dir);
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.html'));
       expect(files).toHaveLength(1);
       const html = fs.readFileSync(path.join(dir, files[0]!), 'utf8');
       expect(html).toContain('pi-ledger');
@@ -797,11 +824,13 @@ describe('extension integration', () => {
     process.env.XDG_CACHE_HOME = tmp;
     try {
       // A session with only pi-tps markers — pi-ledger wasn't tracking.
-      fixture.mockEntries.push({
-        type: 'custom',
-        customType: 'ledger-settings',
-        data: { ...DEFAULTS, agentRatePerHour: 100, humanRatePerHour: 50, project: 'demo' },
-      });
+      fixture.seedSidecar([
+        {
+          kind: 'settings',
+          settings: { ...DEFAULTS, agentRatePerHour: 100, humanRatePerHour: 50, project: 'demo' },
+          timestamp: 0,
+        },
+      ]);
       fixture.mockEntries.push({
         type: 'custom',
         customType: 'tps',
@@ -817,7 +846,7 @@ describe('extension integration', () => {
       await fixture.commands['ledger-receipt'].handler('', fixture.mockCtx);
 
       const dir = path.join(tmp, 'pi-ledger');
-      const files = fs.readdirSync(dir);
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.html'));
       expect(files).toHaveLength(1);
       const html = fs.readFileSync(path.join(dir, files[0]!), 'utf8');
       // 1h agent @ $100 = $100; trailing idle (→ now) adds up to a grace minute of human time
@@ -832,5 +861,44 @@ describe('extension integration', () => {
       delete process.env.XDG_CACHE_HOME;
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  it('session_shutdown closes the open window and persists its idle (exit recorded)', async () => {
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens a window (wizard pops, ignored)
+    await vi.advanceTimersByTimeAsync(30_000); // 30s idle
+    fixture.run('session_shutdown', { type: 'session_shutdown' }); // exit → close + record
+    const close = fixture.lastSidecarEvent('human-close') as { billedMs: number } | undefined;
+    expect(close).toBeDefined();
+    expect(close!.billedMs).toBe(30_000); // 30s retained, capped at the 1m grace
+    // re-entering (rehydrate) retains the closed window's idle — not lost on exit
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
+    expect(msg).toContain('human 0.01h (1 windows)');
+  });
+
+  it('rehydrates from the sidecar, so compaction (empty JSONL) does not reset totals', async () => {
+    // The session JSONL is empty (as if compaction dropped it); the sidecar holds the history.
+    fixture.mockEntries.length = 0;
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, agentRatePerHour: 60 }, timestamp: 0 },
+      {
+        kind: 'agent',
+        id: 'a1',
+        turnIndex: 0,
+        agentMs: 3_600_000,
+        generationMs: 3_600_000,
+        stallMs: 0,
+        toolMs: 0,
+        tokens: { input: 0, output: 0, total: 0 },
+        model: { provider: 'openai', modelId: 'gpt-4' },
+        source: 'tps',
+        timestamp: 1000,
+      },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
+    expect(msg).toContain('agent 1.00h (1 turns)'); // totals survive from the sidecar
   });
 });

@@ -1,5 +1,10 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { vi } from 'vitest';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { sidecarPathFor, type SidecarEvent } from '../index';
+
+const TEST_SESSION_ID = '019fabcd-aaaa-bbbb-cccc-dddddddddddd';
 
 export interface TestFixture {
   mockPi: Partial<ExtensionAPI>;
@@ -24,6 +29,12 @@ export interface TestFixture {
   setCustomResult: (value: unknown) => void;
   mockEntries: Array<{ type?: string; customType?: string; data?: unknown }>;
   mockCtx: ExtensionContext;
+  /** Overwrite the per-session sidecar event log with `events` (simulates a resumed session). */
+  seedSidecar: (events: SidecarEvent[]) => void;
+  /** Read the session's sidecar event log. */
+  readSidecarEvents: () => SidecarEvent[];
+  /** Last sidecar event of a given kind (or undefined). */
+  lastSidecarEvent: (kind: SidecarEvent['kind']) => SidecarEvent | undefined;
 }
 
 export function makeTpsTelemetry(
@@ -140,6 +151,28 @@ export function createTestFixture(): TestFixture {
   // (avoids needing a terminal). Tests can set a result to simulate a choice.
   customSpy.mockImplementation(() => Promise.resolve(customResult));
 
+  const sidecarFile = () => sidecarPathFor(TEST_SESSION_ID);
+  const seedSidecar = (events: SidecarEvent[]) => {
+    fs.mkdirSync(path.dirname(sidecarFile()), { recursive: true });
+    fs.writeFileSync(sidecarFile(), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  };
+  const readSidecarEvents = (): SidecarEvent[] => {
+    try {
+      return fs
+        .readFileSync(sidecarFile(), 'utf8')
+        .split('\n')
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l) as SidecarEvent);
+    } catch {
+      return [];
+    }
+  };
+  const lastSidecarEvent = (kind: SidecarEvent['kind']): SidecarEvent | undefined => {
+    const events = readSidecarEvents();
+    for (let i = events.length - 1; i >= 0; i--) if (events[i]!.kind === kind) return events[i]!;
+    return undefined;
+  };
+
   return {
     mockPi,
     handlers,
@@ -154,6 +187,9 @@ export function createTestFixture(): TestFixture {
     setCustomResult,
     mockEntries,
     mockCtx,
+    seedSidecar,
+    readSidecarEvents,
+    lastSidecarEvent,
   };
 }
 

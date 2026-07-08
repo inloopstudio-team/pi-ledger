@@ -23,7 +23,8 @@
  */
 
 import { execSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -62,10 +63,6 @@ const STALL_THRESHOLD_MS = 500;
 const MS_PER_HOUR = 3_600_000;
 const MS_PER_MINUTE = 60_000;
 
-const SETTINGS_CUSTOM_TYPE = 'ledger-settings';
-const AGENT_CUSTOM_TYPE = 'ledger-agent';
-const HUMAN_CUSTOM_TYPE = 'ledger-human';
-
 const CURRENCY_SYMBOL: Record<string, string> = {
   USD: '$',
   EUR: '€',
@@ -102,8 +99,12 @@ export interface LedgerSettings {
 }
 
 /** Persisted per agent turn (replayed on rehydrate). */
-export interface AgentSegment {
+/** A billable agent turn, appended to the sidecar event log. A 'tps' event may
+ *  `supersede` an earlier 'fallback' event for the same turn (extension load
+ *  order) so the turn isn't double-counted on replay. */
+export interface AgentEvent {
   kind: 'agent';
+  id: string;
   turnIndex: number;
   agentMs: number;
   generationMs: number;
@@ -111,22 +112,41 @@ export interface AgentSegment {
   toolMs: number;
   tokens: { input: number; output: number; total: number };
   model: { provider: string; modelId: string };
-  /** 'tps' = high-fidelity, from pi-tps's event; 'fallback' = self-measured. */
   source: 'tps' | 'fallback';
+  supersedes?: string;
   timestamp: number;
 }
 
-/** Persisted per closed human idle window (replayed on rehydrate). */
-export interface HumanSegment {
-  kind: 'human';
+/** Opens (and re-records, on each wizard extend) a human idle window. */
+export interface HumanOpenEvent {
+  kind: 'human-open';
+  openedAt: number;
+  grantedBudgetMs: number;
+  extensions: number;
+  timestamp: number;
+}
+
+/** Closes a human idle window (at the next agent_start, or at session exit). */
+export interface HumanCloseEvent {
+  kind: 'human-close';
+  openedAt: number;
+  closedAt: number;
   billedMs: number;
   idleMs: number;
   grantedBudgetMs: number;
   extensions: number;
-  openedAt: number;
-  closedAt: number;
   timestamp: number;
 }
+
+/** A settings snapshot (rates, grace, project, …). Last one wins on replay. */
+export interface SettingsEvent {
+  kind: 'settings';
+  settings: LedgerSettings;
+  timestamp: number;
+}
+
+/** The sidecar event log: per-session, append-only, survives compaction. */
+export type SidecarEvent = SettingsEvent | AgentEvent | HumanOpenEvent | HumanCloseEvent;
 
 /** The slice of pi-tps's `tps:telemetry` payload that we read. */
 interface TpsTelemetry {
@@ -283,43 +303,64 @@ export function applySettingValue(
  * Replay persisted ledger entries into settings + totals. Pure.
  * @internal Exported for testing only.
  */
-export function rehydrateFromEntries(
-  entries: Array<{ type?: string; customType?: string; data?: unknown }>
-): { settings: LedgerSettings; totals: Totals } {
+/** Rebuild settings + totals + the open human window from the sidecar event
+ *  log. Pure: the sidecar is the source of truth (stateless); in-memory state
+ *  is a cache rebuilt from this. Agent events supersede earlier ones (by id)
+ *  so a fallback→tps correction for the same turn isn't double-counted; every
+ *  non-superseded event counts, so totals span ALL branches of the session.
+ *  @internal Exported for testing only. */
+export function rehydrateFromSidecar(events: SidecarEvent[]): {
+  settings: LedgerSettings;
+  totals: Totals;
+  humanWindow: { openedAt: number; grantedBudgetMs: number; extensions: number } | null;
+} {
   let settings: LedgerSettings | null = null;
-  // Last agent segment per turnIndex wins: a 'fallback' entry may be followed
-  // by a higher-fidelity 'tps' correction for the same turn (extension load
-  // order), so we keep the later one and never double-count.
-  const agentByTurn = new Map<number, AgentSegment>();
+  const superseded = new Set<string>();
+  for (const e of events) if (e.kind === 'agent' && e.supersedes) superseded.add(e.supersedes);
+  let agentMs = 0;
+  let agentTurns = 0;
+  const agentTokens = { input: 0, output: 0, total: 0 };
   let humanMs = 0;
   let humanWindows = 0;
-  for (const e of entries) {
-    if (e.type !== 'custom') continue;
-    if (e.customType === SETTINGS_CUSTOM_TYPE) {
-      const d = e.data as Partial<LedgerSettings> | null;
-      if (d) settings = { ...DEFAULT_SETTINGS, ...d };
-    } else if (e.customType === AGENT_CUSTOM_TYPE) {
-      const d = e.data as AgentSegment | null;
-      if (d && typeof d.turnIndex === 'number') agentByTurn.set(d.turnIndex, d);
-    } else if (e.customType === HUMAN_CUSTOM_TYPE) {
-      const d = e.data as HumanSegment | null;
-      if (!d) continue;
-      humanMs += d.billedMs;
+  const closedOpenedAts = new Set<number>();
+  for (const e of events) {
+    if (e.kind === 'settings') {
+      settings = { ...DEFAULT_SETTINGS, ...e.settings };
+    } else if (e.kind === 'agent') {
+      if (superseded.has(e.id)) continue;
+      agentMs += e.agentMs;
+      agentTurns += 1;
+      agentTokens.input += e.tokens.input;
+      agentTokens.output += e.tokens.output;
+      agentTokens.total += e.tokens.total;
+    } else if (e.kind === 'human-close') {
+      closedOpenedAts.add(e.openedAt);
+      humanMs += e.billedMs;
       humanWindows += 1;
     }
   }
-  let agentMs = 0;
-  const agentTokens = { input: 0, output: 0, total: 0 };
-  for (const d of agentByTurn.values()) {
-    agentMs += d.agentMs;
-    agentTokens.input += d.tokens.input;
-    agentTokens.output += d.tokens.output;
-    agentTokens.total += d.tokens.total;
+  // Last unclosed human-open (by append order) is the in-progress window.
+  let humanWindow: { openedAt: number; grantedBudgetMs: number; extensions: number } | null = null;
+  for (const e of events) {
+    if (e.kind === 'human-open' && !closedOpenedAts.has(e.openedAt)) {
+      humanWindow = {
+        openedAt: e.openedAt,
+        grantedBudgetMs: e.grantedBudgetMs,
+        extensions: e.extensions,
+      };
+    }
   }
   return {
     settings: settings ?? { ...DEFAULT_SETTINGS },
-    totals: { agentMs, humanMs, agentTurns: agentByTurn.size, humanWindows, agentTokens },
+    totals: { agentMs, humanMs, agentTurns, humanWindows, agentTokens },
+    humanWindow,
   };
+}
+
+/** Path to a session's sidecar event log. Exported for tests to seed the log. */
+export function sidecarPathFor(sessionId: string): string {
+  const base = process.env.XDG_CACHE_HOME || join(homedir(), '.cache');
+  return join(base, 'pi-ledger', 'sessions', `${sessionId}.jsonl`);
 }
 
 /** A pi-tps `tps` entry as it appears in the session JSONL. */
@@ -617,11 +658,44 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // extension stands alone.
   let tpsEverSeen = false;
   let lastFallback: {
+    id: string;
     turnIndex: number;
     agentMs: number;
     tokens: { input: number; output: number; total: number };
   } | null = null;
   let fallbackNotified = false;
+
+  // Per-session sidecar event log — the source of truth (stateless). Survives
+  // compaction (it's outside the session JSONL) and accumulates across all
+  // branches of the session. In-memory `settings`/`totals`/`humanWindow` are a
+  // cache rebuilt from this on every rehydrate.
+  let sessionId = 'unknown';
+  function sidecarPath(): string {
+    return sidecarPathFor(sessionId);
+  }
+  function appendSidecar(event: SidecarEvent): void {
+    if (sessionId === 'unknown' && lastCtx) {
+      const id = lastCtx.sessionManager.getSessionId?.();
+      if (typeof id === 'string') sessionId = id;
+    }
+    try {
+      const p = sidecarPath();
+      mkdirSync(join(p, '..'), { recursive: true });
+      appendFileSync(p, JSON.stringify(event) + '\n');
+    } catch {
+      // ignore — best-effort persistence
+    }
+  }
+  function readSidecar(): SidecarEvent[] {
+    try {
+      return readFileSync(sidecarPath(), 'utf8')
+        .split('\n')
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l) as SidecarEvent);
+    } catch {
+      return [];
+    }
+  }
 
   // Fallback per-turn measurement (used iff pi-tps is absent for a turn).
   const fb = {
@@ -640,7 +714,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // ── Settings persistence ───────────────────────────────────────────────
 
   function persistSettings() {
-    pi.appendEntry(SETTINGS_CUSTOM_TYPE, settings);
+    appendSidecar({ kind: 'settings', settings: { ...settings }, timestamp: Date.now() });
   }
 
   function effectiveAuthor(): string {
@@ -711,25 +785,26 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // ── Human idle window ──────────────────────────────────────────────────
 
-  function closeHumanWindow(ctx: ExtensionContext) {
+  function closeHumanWindow(ctx: ExtensionContext | null) {
     disarmWizard();
     const w = humanWindow;
     humanWindow = null;
     if (!w) return;
     const closedAt = Date.now();
     const { idleMs, billedMs } = closeWindowBudget(w.openedAt, closedAt, w.grantedBudgetMs);
+    // Always record the close (even 0-billed) so the open window is marked
+    // closed on replay — never restored as a stale in-progress window.
+    appendSidecar({
+      kind: 'human-close',
+      openedAt: w.openedAt,
+      closedAt,
+      billedMs,
+      idleMs,
+      grantedBudgetMs: w.grantedBudgetMs,
+      extensions: w.extensions,
+      timestamp: closedAt,
+    });
     if (billedMs > 0) {
-      const seg: HumanSegment = {
-        kind: 'human',
-        billedMs,
-        idleMs,
-        grantedBudgetMs: w.grantedBudgetMs,
-        extensions: w.extensions,
-        openedAt: w.openedAt,
-        closedAt,
-        timestamp: closedAt,
-      };
-      pi.appendEntry(HUMAN_CUSTOM_TYPE, seg);
       totals.humanMs += billedMs;
       totals.humanWindows += 1;
     }
@@ -821,6 +896,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         if (!humanWindow || choice !== 'extend') return;
         humanWindow.grantedBudgetMs += pomodoro * MS_PER_MINUTE;
         humanWindow.extensions += 1;
+        appendSidecar({
+          kind: 'human-open',
+          openedAt: humanWindow.openedAt,
+          grantedBudgetMs: humanWindow.grantedBudgetMs,
+          extensions: humanWindow.extensions,
+          timestamp: Date.now(),
+        });
         armWizardForBoundary(ctx);
         updateStatus(ctx);
         notify(ctx, `Extended billable human time by ${pomodoro}m.`, 'info');
@@ -838,14 +920,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // ── Rehydration ────────────────────────────────────────────────────────
 
   function rehydrate(ctx: ExtensionContext) {
-    const entries = ctx.sessionManager.getBranch();
-    const r = rehydrateFromEntries(entries);
+    sessionId = ctx.sessionManager.getSessionId?.() ?? 'unknown';
+    const r = rehydrateFromSidecar(readSidecar());
     settings = r.settings;
     totals.agentMs = r.totals.agentMs;
     totals.humanMs = r.totals.humanMs;
     totals.agentTurns = r.totals.agentTurns;
     totals.humanWindows = r.totals.humanWindows;
     totals.agentTokens = r.totals.agentTokens;
+    humanWindow = r.humanWindow;
     updateStatus(ctx);
   }
 
@@ -860,7 +943,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   });
 
   pi.on('session_shutdown', () => {
-    disarmWizard();
+    // Record the exit: close any open human window so its accrued idle (up to
+    // the granted budget) is persisted — not lost when the process exits.
+    closeHumanWindow(lastCtx);
   });
 
   // ── Agent timing (tool execution) ─────────────────────────────────────
@@ -962,8 +1047,19 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const toolMs = toolMsThisTurn;
     const agentMs = computeAgentMs(generationMs, stallMs, toolMs);
     if (agentMs <= 0) return;
-    const seg: AgentSegment = {
+    const supersedes =
+      lastFallback && lastFallback.turnIndex === currentTurnIndex ? lastFallback.id : undefined;
+    if (supersedes) {
+      totals.agentMs -= lastFallback!.agentMs;
+      totals.agentTurns -= 1;
+      totals.agentTokens.input -= lastFallback!.tokens.input;
+      totals.agentTokens.output -= lastFallback!.tokens.output;
+      totals.agentTokens.total -= lastFallback!.tokens.total;
+      lastFallback = null;
+    }
+    appendSidecar({
       kind: 'agent',
+      id: randomUUID(),
       turnIndex: currentTurnIndex,
       agentMs,
       generationMs,
@@ -976,22 +1072,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       },
       model: t.model,
       source: 'tps',
+      supersedes,
       timestamp: Date.now(),
-    };
-    if (lastFallback && lastFallback.turnIndex === currentTurnIndex) {
-      totals.agentMs -= lastFallback.agentMs;
-      totals.agentTurns -= 1;
-      totals.agentTokens.input -= lastFallback.tokens.input;
-      totals.agentTokens.output -= lastFallback.tokens.output;
-      totals.agentTokens.total -= lastFallback.tokens.total;
-      lastFallback = null;
-    }
-    pi.appendEntry(AGENT_CUSTOM_TYPE, seg);
+    });
     totals.agentMs += agentMs;
     totals.agentTurns += 1;
-    totals.agentTokens.input += seg.tokens.input;
-    totals.agentTokens.output += seg.tokens.output;
-    totals.agentTokens.total += seg.tokens.total;
+    totals.agentTokens.input += t.tokens.input || 0;
+    totals.agentTokens.output += t.tokens.output || 0;
+    totals.agentTokens.total += t.tokens.total || 0;
     updateStatus(lastCtx);
   });
 
@@ -1003,8 +1091,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const toolMs = toolMsThisTurn;
     const agentMs = computeAgentMs(fb.totalGenerationMs, fb.stallMs, toolMs);
     if (agentMs <= 0) return;
-    const seg: AgentSegment = {
+    const id = randomUUID();
+    appendSidecar({
       kind: 'agent',
+      id,
       turnIndex: event.turnIndex,
       agentMs,
       generationMs: fb.totalGenerationMs,
@@ -1014,14 +1104,18 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       model: fb.model,
       source: 'fallback',
       timestamp: Date.now(),
-    };
-    pi.appendEntry(AGENT_CUSTOM_TYPE, seg);
+    });
     totals.agentMs += agentMs;
     totals.agentTurns += 1;
-    totals.agentTokens.input += seg.tokens.input;
-    totals.agentTokens.output += seg.tokens.output;
-    totals.agentTokens.total += seg.tokens.total;
-    lastFallback = { turnIndex: event.turnIndex, agentMs, tokens: { ...seg.tokens } };
+    totals.agentTokens.input += fb.tokens.input;
+    totals.agentTokens.output += fb.tokens.output;
+    totals.agentTokens.total += fb.tokens.total;
+    lastFallback = {
+      id,
+      turnIndex: event.turnIndex,
+      agentMs,
+      tokens: { input: fb.tokens.input, output: fb.tokens.output, total: fb.tokens.total },
+    };
     updateStatus(ctx);
   });
 
@@ -1040,6 +1134,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       grantedBudgetMs: settings.graceMinutes * MS_PER_MINUTE,
       extensions: 0,
     };
+    appendSidecar({
+      kind: 'human-open',
+      openedAt: humanWindow.openedAt,
+      grantedBudgetMs: humanWindow.grantedBudgetMs,
+      extensions: 0,
+      timestamp: humanWindow.openedAt,
+    });
     if (!tpsEverSeen && !fallbackNotified) {
       fallbackNotified = true;
       notify(
@@ -1162,7 +1263,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       const t = computeDisplayTotals(ctx);
       const b = computeBilling(t.agentMs, t.humanMs, settings);
 
-      let startedAt = earliestLedgerTimestamp(ctx);
+      let startedAt = earliestSidecarTimestamp();
       if (startedAt === 0) {
         const tps = extractTpsEntries(ctx.sessionManager.getBranch());
         if (tps.length > 0) startedAt = tps[0]!.timestamp;
@@ -1324,17 +1425,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     };
   }
 
-  function earliestLedgerTimestamp(ctx: ExtensionContext): number {
+  function earliestSidecarTimestamp(): number {
     let earliest = 0;
-    try {
-      for (const e of ctx.sessionManager.getBranch()) {
-        if (e.type !== 'custom') continue;
-        if (e.customType !== AGENT_CUSTOM_TYPE && e.customType !== HUMAN_CUSTOM_TYPE) continue;
-        const ts = (e.data as { timestamp?: number } | null)?.timestamp;
-        if (typeof ts === 'number' && (earliest === 0 || ts < earliest)) earliest = ts;
-      }
-    } catch {
-      // ignore — fall back to generatedAt
+    for (const e of readSidecar()) {
+      if (e.kind === 'settings') continue;
+      if (earliest === 0 || e.timestamp < earliest) earliest = e.timestamp;
     }
     return earliest;
   }

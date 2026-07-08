@@ -24,8 +24,9 @@ grace minute of human time is billable, and a wizard pops immediately at
 > agent time itself when [`@monotykamary/pi-tps`](https://github.com/monotykamary/pi-tps)
 > isn't installed. When pi-tps **is** present, it emits the `tps:telemetry` event
 > after every turn and pi-ledger consumes its refined generation/stall numbers
-> (and adds tool-execution time of its own). Both extensions' data coexist in
-> the session JSONL. Installing pi-tps is purely an upgrade in fidelity.
+> (and adds tool-execution time of its own). pi-tps writes `tps` markers to the
+> session JSONL; pi-ledger keeps its own event log in a per-session sidecar.
+> Installing pi-tps is purely an upgrade in fidelity.
 
 ## Quick start
 
@@ -101,8 +102,8 @@ _deciding_ in the wizard are correctly unbilled if you decline.
 
 `/ledger-settings` opens a pi-core-style bordered, searchable list. Rate and
 text fields open an inline input on `Enter`; currency and the auto-wizard
-toggle cycle through presets. Settings persist as a `ledger-settings` entry in
-the session and rehydrate on resume and `/tree` navigation.
+toggle cycle through presets. Settings persist to the per-session sidecar (see [Data model](#data-model))
+and rehydrate on resume and `/tree` navigation.
 
 | Setting          | Default  | Notes                                                   |
 | ---------------- | -------- | ------------------------------------------------------- |
@@ -132,16 +133,20 @@ and prints cleanly to PDF (`⌘P`) — the cursor hides for print.
 
 ## Data model
 
-pi-ledger appends custom entries to the session JSONL alongside pi-tps's `tps`
-entries:
+pi-ledger keeps a **per-session sidecar event log** at
+`~/.cache/pi-ledger/sessions/<sessionId>.jsonl` — the source of truth, outside
+the session JSONL so it survives **compaction** (which discards old custom
+entries) and accumulates across **all branches** of the session. Events:
 
-- `ledger-settings` — the settings snapshot (last write wins on rehydrate).
-- `ledger-agent` — one per turn: `{ agentMs, generationMs, stallMs, toolMs, tokens, model, source, turnIndex, timestamp }` (`source` is `'tps'` or `'fallback'`).
-- `ledger-human` — one per closed idle window: `{ billedMs, idleMs, grantedBudgetMs, extensions, openedAt, closedAt, timestamp }`.
+- `settings` — a settings snapshot (last one wins on replay).
+- `agent` — one per turn: `{ id, turnIndex, agentMs, generationMs, stallMs, toolMs, tokens, model, source, supersedes?, timestamp }`. A `'tps'` turn may `supersede` an earlier `'fallback'` for the same turn (load-order race) so it isn't double-counted.
+- `human-open` — on `agent_end` (and re-recorded on each wizard extend): `{ openedAt, grantedBudgetMs, extensions, timestamp }`.
+- `human-close` — on the next `agent_start` **or on `session_shutdown`** (exit): `{ openedAt, closedAt, billedMs, idleMs, grantedBudgetMs, extensions, timestamp }`.
 
-On `session_start` and `/tree`, pi-ledger replays these entries to rebuild
-running totals and restore settings. (An idle window open at reload is not
-resumed — billing resumes on the next `agent_end`.)
+On `session_start` and `/tree`, pi-ledger replays the sidecar to rebuild
+totals, settings, and the in-progress human window (the last unclosed
+`human-open`). Recording the exit close means accrued idle is **retained**
+across exit/re-enter — not lost — and totals are **global across branches**.
 
 ## Architecture
 
@@ -158,6 +163,7 @@ agent_end             → open human window (grace budget), pop wizard immediate
                         └ extend → +pomodoro, re-arm at the next boundary
                             └ dismiss/ignore → cap at the grace minute
 agent_start           → close window: billed = min(idle, budget)
+session_shutdown      → close any open window (record the exit: idle is retained)
 ```
 
 Agent timing prefers pi-tps's `tps:telemetry` (`generationMs`, `stallMs`);
@@ -165,10 +171,12 @@ when pi-tps is absent, pi-ledger measures generation + a basic stall gap gate
 itself at `turn_end`. Tool-execution time is always measured locally and paired
 with the turn. The wizard is driven entirely by the extension (the agent is
 unaware), auto-fires immediately at `agent_end`, and is disarmed on the next
-`agent_start` or `session_shutdown`. Rehydration dedups `ledger-agent` by
-`turnIndex`, keeping the last (so a `fallback` → `tps` correction never
-double-counts). The status and receipt compute the whole session up to the
-current moment, including the in-progress open human window.
+`agent_start` or `session_shutdown`. State is **stateless**: everything is
+rebuilt from the per-session sidecar on `session_start`/`/tree` — a `'tps'`
+agent event `supersedes` the `'fallback'` it replaces, so the same turn isn't
+double-counted. The status and receipt compute the whole session up to the
+current moment, including the in-progress open human window, from the sidecar
+— so they survive compaction and branching.
 
 ## Testing
 
