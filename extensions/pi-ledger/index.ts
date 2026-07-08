@@ -152,7 +152,6 @@ export interface Billing {
   humanCost: number;
   total: number;
   totalHours: number;
-  blendedRate: number;
 }
 
 export interface ReceiptData {
@@ -167,7 +166,6 @@ export interface ReceiptData {
   agentCost: number;
   humanCost: number;
   total: number;
-  blendedRate: number;
   agentTurns: number;
   humanWindows: number;
   agentTokens: { input: number; output: number; total: number };
@@ -205,8 +203,7 @@ export function computeBilling(
   const humanCost = humanHours * settings.humanRatePerHour;
   const total = agentCost + humanCost;
   const totalHours = agentHours + humanHours;
-  const blendedRate = totalHours > 0 ? total / totalHours : 0;
-  return { agentHours, humanHours, agentCost, humanCost, total, totalHours, blendedRate };
+  return { agentHours, humanHours, agentCost, humanCost, total, totalHours };
 }
 
 export function fmtHours(ms: number): string {
@@ -434,10 +431,8 @@ function reveal(text: string): string {
  */
 export function buildReceiptHtml(d: ReceiptData): string {
   const cur = d.currency;
-  const totalHours = d.agentHours + d.humanHours;
   const agentHrs = d.agentHours.toFixed(2);
   const humanHrs = d.agentTurns === 0 && d.humanWindows === 0 ? '0.00' : d.humanHours.toFixed(2);
-  const blended = totalHours > 0 ? fmtMoney(d.blendedRate, cur) + '/h' : '—';
   const dateLine =
     d.startedAt > 0 && d.startedAt !== d.generatedAt
       ? `${fmtDate(d.startedAt)} → ${fmtDate(d.generatedAt)}`
@@ -501,7 +496,6 @@ export function buildReceiptHtml(d: ReceiptData): string {
   .line .right { text-align: right; }
   .line .rate { font-size: 11px; color: #9a9a9a; margin-left: 6px; }
   .line .amt { font-weight: 600; margin-top: 2px; }
-  .blended { display: flex; justify-content: space-between; font-size: 12px; color: #555; padding: 10px 0 4px; }
   .total { display: flex; justify-content: space-between; align-items: baseline; margin-top: 8px; padding-top: 14px; border-top: 1px solid #ececec; font-size: 17px; }
   .total .amt { font-weight: 700; }
   .foot { margin-top: 22px; font-size: 10px; color: #c2c2c2; text-align: center; }
@@ -527,7 +521,6 @@ export function buildReceiptHtml(d: ReceiptData): string {
     <hr class="rule r-block r-hidden" />
 ${rowHtml}
     <hr class="rule r-block r-hidden" />
-    <div class="blended r-block r-hidden"><span${reveal('Blended rate')}</span><span${reveal(blended)}</span></div>
     <div class="total r-block r-hidden"><span${reveal('Total')}</span><span class="amt"${reveal(fmtMoney(d.total, cur))}</span></div>
     <div class="foot r-block r-hidden"><span${reveal('generated ' + fmtDate(d.generatedAt) + ' · pi-ledger')}</span></div>
     <span class="cursor" id="cursor"></span>
@@ -535,7 +528,11 @@ ${rowHtml}
 <script>
 (function () {
   // Reveal the receipt block-by-block: each line unhides (card grows), then
-  // its values type in autoregressively; the cursor tracks the active span.
+  // its values type in autoregressively; the cursor tracks the active value.
+  // The cursor is appended INSIDE the active element (after a text node) so it
+  // never becomes a flex sibling — that keeps right-aligned values pinned to
+  // the right edge instead of reflowing to the middle as they type.
+  var TPS = 300;
   var blocks = document.querySelectorAll('.r-block');
   var cursor = document.getElementById('cursor');
   var bi = 0;
@@ -544,24 +541,28 @@ ${rowHtml}
     var block = blocks[bi++];
     block.classList.remove('r-hidden');
     var spans = block.querySelectorAll('[data-reveal]');
-    if (spans.length === 0) { setTimeout(nextBlock, 140); return; }
+    if (spans.length === 0) { requestAnimationFrame(nextBlock); return; }
     var si = 0;
     function nextSpan() {
-      if (si >= spans.length) { setTimeout(nextBlock, 90); return; }
+      if (si >= spans.length) { requestAnimationFrame(nextBlock); return; }
       var el = spans[si++];
       var final = el.getAttribute('data-reveal') || '';
       el.textContent = '';
-      if (cursor) { try { el.after(cursor); } catch (e) {} }
-      var c = 0;
-      function step() {
-        if (c <= final.length) { el.textContent = final.slice(0, c); c++; setTimeout(step, 16); }
-        else { setTimeout(nextSpan, 60); }
+      var tn = document.createTextNode('');
+      el.appendChild(tn);
+      if (cursor) el.appendChild(cursor);
+      var start = null;
+      function step(now) {
+        if (start === null) start = now;
+        var n = Math.floor(((now - start) * TPS) / 1000);
+        if (n < final.length) { tn.nodeValue = final.slice(0, n); requestAnimationFrame(step); }
+        else { tn.nodeValue = final; requestAnimationFrame(nextSpan); }
       }
-      step();
+      requestAnimationFrame(step);
     }
     nextSpan();
   }
-  window.addEventListener('load', nextBlock);
+  window.addEventListener('load', function () { requestAnimationFrame(nextBlock); });
 })();
 </script>
 </body>
@@ -1058,14 +1059,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // ── Commands ──────────────────────────────────────────────────────────
 
   pi.registerCommand('ledger', {
-    description: 'Show running billable totals (agent + human hours, blended rate, total).',
+    description: 'Show running billable totals (agent + human hours, total).',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       const t = effectiveTotals();
       const b = computeBilling(t.agentMs, t.humanMs, settings);
       const msg =
         `agent ${fmtHours(t.agentMs)} (${t.agentTurns} turns) @ ${fmtMoney(settings.agentRatePerHour, settings.currency)}/h = ${fmtMoney(b.agentCost, settings.currency)}` +
         ` · human ${fmtHours(t.humanMs)} (${t.humanWindows} windows) @ ${fmtMoney(settings.humanRatePerHour, settings.currency)}/h = ${fmtMoney(b.humanCost, settings.currency)}` +
-        ` · blended ${b.totalHours > 0 ? fmtMoney(b.blendedRate, settings.currency) + '/h' : '—'}` +
         ` · total ${fmtMoney(b.total, settings.currency)}`;
       ctx.ui.notify(msg, 'info');
       if (totals.agentTurns === 0 && derivedDisplay) {
@@ -1152,8 +1152,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('ledger-receipt', {
-    description:
-      'Export an HTML receipt for this session (billable agent + human hours, blended rate, total).',
+    description: 'Export an HTML receipt for this session (billable agent + human hours, total).',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       let agentMs = totals.agentMs;
       let humanMs = totals.humanMs;
@@ -1197,7 +1196,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         agentCost: b.agentCost,
         humanCost: b.humanCost,
         total: b.total,
-        blendedRate: b.blendedRate,
         agentTurns,
         humanWindows,
         agentTokens,

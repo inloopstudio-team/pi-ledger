@@ -88,10 +88,6 @@ describe('computeBilling', () => {
     expect(b.humanCost).toBe(25);
     expect(b.total).toBe(125);
     expect(b.totalHours).toBe(1.5);
-    expect(b.blendedRate).toBeCloseTo(83.33, 1);
-  });
-  it('blended rate is 0 when no hours', () => {
-    expect(computeBilling(0, 0, DEFAULTS).blendedRate).toBe(0);
   });
 });
 
@@ -308,7 +304,6 @@ describe('buildReceiptHtml', () => {
     agentCost: 120,
     humanCost: 25,
     total: 145,
-    blendedRate: 145 / 1.7,
     agentTurns: 3,
     humanWindows: 2,
     agentTokens: { input: 1000, output: 500, total: 1500 },
@@ -335,11 +330,6 @@ describe('buildReceiptHtml', () => {
     expect(html).toContain('$120.00');
     expect(html).toContain('$25.00');
     expect(html).toContain('$145.00');
-  });
-  it('shows the blended rate', () => {
-    const html = buildReceiptHtml(data);
-    expect(html).toContain('Blended rate');
-    expect(html).toContain('$85.29/h');
   });
   it('marks values as autoregressively revealable', () => {
     const html = buildReceiptHtml(data);

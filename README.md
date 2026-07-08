@@ -51,7 +51,7 @@ enough to demo the output.
 
 | Command              | What it does                                                                                              |
 | -------------------- | --------------------------------------------------------------------------------------------------------- |
-| `/ledger`            | Show running totals: agent/human hours, costs, blended rate, total.                                       |
+| `/ledger`            | Show running totals: agent/human hours, costs, total.                                                     |
 | `/ledger-settings`   | Bordered, searchable settings TUI (rates, grace, pomodoro, project, author, currency, auto-wizard).       |
 | `/ledger-extend [m]` | Extend the current human-time billing window by `m` minutes (default: pomodoro length). Works while idle. |
 | `/ledger-receipt`    | Export a self-contained HTML receipt for the session and open it.                                         |
@@ -118,9 +118,8 @@ the session and rehydrate on resume and `/tree` navigation.
 - **Geist Mono** throughout.
 - Values **stream in autoregressively** — each field types out character-by-character
   like an LLM token stream, with a blinking cursor tracking the active field.
-- Shows billable **agent** and **human** hours, per-category costs, the **blended
-  rate** (`total / total_hours`), and the **total** — plus project, author,
-  session, and date range.
+- Shows billable **agent** and **human** hours, per-category costs, and the
+  **total** — plus project, author, session, and date range.
 
 The HTML is fully self-contained (inline CSS + JS, Geist Mono via Google Fonts)
 and prints cleanly to PDF (`⌘P`) — the cursor hides for print.
