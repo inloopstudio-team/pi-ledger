@@ -81,8 +81,17 @@ capped at the grace budget) but enough to demo the output.
 | **Agent** | `agent_start` → `agent_end` (sum of turns)     | Agent time |
 | **Human** | `agent_end` → next `agent_start` (idle window) | Human time |
 
-**Agent time per turn** = `normalizedGenerationMs + toolExecutionMs`, where
-`normalizedGenerationMs = outputTokens / referenceTps × 1000`.
+**Agent time** is the billable agent work per turn — generation normalized to a
+reference TPS plus real tool-execution time — summed across turns and priced at
+the agent rate:
+
+```
+agent_ms_per_turn = (output_tokens / reference_tps × 1000) + tool_ms
+agent_hours       = Σ agent_ms_per_turn / 3_600_000
+agent_cost        = agent_hours × agent_rate_per_hour
+```
+
+(`× 1000` carries token-seconds to ms; `3_600_000` ms = 1 hour.)
 
 - **Generation** is billed by **output tokens at a reference TPS** (frontier-model average, default 75), so model speed can't change the bill — a fast model and a slow one producing the same output tokens bill the same, and the faster model no longer punishes the contractor. `referenceTps` is configurable in `/ledger-settings`.
 - **Tool execution** is the agent doing the work (running bash, reading files, …) — billable, measured as the union wall-clock of tool calls within the turn (parallel tools don't double-count). It isn't token-bound, so it's billed as real time.
