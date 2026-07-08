@@ -1,0 +1,57 @@
+{
+  "name": "@monotykamary/pi-ledger",
+  "version": "0.1.0",
+  "description": "Timesheet maker for pi — billable agent + human time, a pomodoro human-time wizard, and an exportable receipt. Billed like serverless.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "lint:dead": "knip --no-gitignore",
+    "postinstall": "simple-git-hooks 2>/dev/null || true"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "simple-git-hooks": {
+    "pre-commit": "npx lint-staged",
+    "pre-push": "npm run typecheck && npm run test",
+    "commit-msg": "npx commitlint --edit ${1}"
+  },
+  "lint-staged": {
+    "*.{ts,js,json,md}": [
+      "prettier --write"
+    ]
+  },
+  "devDependencies": {
+    "@commitlint/cli": "21.0.1",
+    "@commitlint/config-conventional": "21.0.1",
+    "@earendil-works/pi-coding-agent": "0.80.3",
+    "@earendil-works/pi-tui": "0.80.3",
+    "@types/node": "25.9.1",
+    "@vitest/coverage-v8": "4.1.7",
+    "knip": "6.14.1",
+    "lint-staged": "17.0.5",
+    "prettier": "3.8.3",
+    "simple-git-hooks": "2.13.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.7"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.0",
+    "@earendil-works/pi-tui": ">=0.80.0"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.6",
+    "fast-xml-builder": "1.2.0",
+    "protobufjs": "8.4.0",
+    "ws": "8.20.1"
+  },
+  "packageManager": "pnpm@11.6.0"
+}
