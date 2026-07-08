@@ -901,4 +901,21 @@ describe('extension integration', () => {
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
     expect(msg).toContain('agent 1.00h (1 turns)'); // totals survive from the sidecar
   });
+
+  it('session_tree (/tree go-back) keeps the live totals — does not reset to $0', async () => {
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
+    fixture.emitEvent('tps:telemetry', makeTpsTelemetry({ generationMs: 3_600_000, stallMs: 0 }));
+    // branching (/tree → "go back to an earlier message") fires session_tree
+    fixture.run('session_tree', { type: 'session_tree' });
+    // the live in-memory total is kept — not reset to $0
+    expect(fixture.setStatusSpy.mock.calls.at(-1)![1]).toContain('agent 1.00h');
+  });
+
+  it('session_start keeps live totals if the sidecar read is empty (no reset to $0)', async () => {
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
+    fixture.emitEvent('tps:telemetry', makeTpsTelemetry({ generationMs: 3_600_000, stallMs: 0 }));
+    fixture.clearSidecar(); // simulate a missing/failed sidecar read
+    fixture.run('session_start', { type: 'session_start', reason: 'reload' });
+    expect(fixture.setStatusSpy.mock.calls.at(-1)![1]).toContain('agent 1.00h');
+  });
 });

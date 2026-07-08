@@ -143,9 +143,11 @@ entries) and accumulates across **all branches** of the session. Events:
 - `human-open` — on `agent_end` (and re-recorded on each wizard extend): `{ openedAt, grantedBudgetMs, extensions, timestamp }`.
 - `human-close` — on the next `agent_start` **or on `session_shutdown`** (exit): `{ openedAt, closedAt, billedMs, idleMs, grantedBudgetMs, extensions, timestamp }`.
 
-On `session_start` and `/tree`, pi-ledger replays the sidecar to rebuild
+On `session_start` (fresh load/reload), pi-ledger replays the sidecar to rebuild
 totals, settings, and the in-progress human window (the last unclosed
-`human-open`). Recording the exit close means accrued idle is **retained**
+`human-open`). `/tree` branching stays in the same session, so the live
+in-memory totals are kept as-is (not re-read — never reset to $0). Recording
+the exit close means accrued idle is **retained**
 across exit/re-enter — not lost — and totals are **global across branches**.
 
 ## Architecture
@@ -172,7 +174,9 @@ itself at `turn_end`. Tool-execution time is always measured locally and paired
 with the turn. The wizard is driven entirely by the extension (the agent is
 unaware), auto-fires immediately at `agent_end`, and is disarmed on the next
 `agent_start` or `session_shutdown`. State is **stateless**: everything is
-rebuilt from the per-session sidecar on `session_start`/`/tree` — a `'tps'`
+rebuilt from the per-session sidecar on `session_start` (fresh load/reload);
+`/tree` keeps the live in-memory totals (branching stays in the same session,
+so the status never resets to $0). A `'tps'`
 agent event `supersedes` the `'fallback'` it replaces, so the same turn isn't
 double-counted. The status and receipt compute the whole session up to the
 current moment, including the in-progress open human window, from the sidecar

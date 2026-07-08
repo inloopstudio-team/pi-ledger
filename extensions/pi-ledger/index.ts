@@ -688,10 +688,17 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   }
   function readSidecar(): SidecarEvent[] {
     try {
-      return readFileSync(sidecarPath(), 'utf8')
-        .split('\n')
-        .filter((l) => l.trim())
-        .map((l) => JSON.parse(l) as SidecarEvent);
+      const out: SidecarEvent[] = [];
+      for (const l of readFileSync(sidecarPath(), 'utf8').split('\n')) {
+        const t = l.trim();
+        if (!t) continue;
+        try {
+          out.push(JSON.parse(t) as SidecarEvent);
+        } catch {
+          // skip a malformed line rather than dropping the whole log
+        }
+      }
+      return out;
     } catch {
       return [];
     }
@@ -921,14 +928,20 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   function rehydrate(ctx: ExtensionContext) {
     sessionId = ctx.sessionManager.getSessionId?.() ?? 'unknown';
-    const r = rehydrateFromSidecar(readSidecar());
-    settings = r.settings;
-    totals.agentMs = r.totals.agentMs;
-    totals.humanMs = r.totals.humanMs;
-    totals.agentTurns = r.totals.agentTurns;
-    totals.humanWindows = r.totals.humanWindows;
-    totals.agentTokens = r.totals.agentTokens;
-    humanWindow = r.humanWindow;
+    const events = readSidecar();
+    // Restore from the sidecar only if it has events. During a live session the
+    // in-memory totals are already current (every event updates them); never
+    // overwrite them with an empty read (which would reset the status to $0).
+    if (events.length > 0) {
+      const r = rehydrateFromSidecar(events);
+      settings = r.settings;
+      totals.agentMs = r.totals.agentMs;
+      totals.humanMs = r.totals.humanMs;
+      totals.agentTurns = r.totals.agentTurns;
+      totals.humanWindows = r.totals.humanWindows;
+      totals.agentTokens = r.totals.agentTokens;
+      humanWindow = r.humanWindow;
+    }
     updateStatus(ctx);
   }
 
@@ -939,7 +952,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   pi.on('session_tree', (_event, ctx) => {
     lastCtx = ctx;
-    rehydrate(ctx);
+    // Branching (/tree → "go back") changes the leaf but stays in the same
+    // session, so the live in-memory totals are still current. Don't re-read
+    // the sidecar here — that would reset the status to $0 if the read came
+    // back empty. Just re-render the status; restore only happens on
+    // session_start (fresh load / reload).
+    updateStatus(ctx);
   });
 
   pi.on('session_shutdown', () => {

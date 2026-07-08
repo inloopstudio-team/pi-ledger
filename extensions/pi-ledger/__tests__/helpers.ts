@@ -35,6 +35,8 @@ export interface TestFixture {
   readSidecarEvents: () => SidecarEvent[];
   /** Last sidecar event of a given kind (or undefined). */
   lastSidecarEvent: (kind: SidecarEvent['kind']) => SidecarEvent | undefined;
+  /** Delete the session's sidecar file (simulate a missing/failed read). */
+  clearSidecar: () => void;
 }
 
 export function makeTpsTelemetry(
@@ -172,6 +174,13 @@ export function createTestFixture(): TestFixture {
     for (let i = events.length - 1; i >= 0; i--) if (events[i]!.kind === kind) return events[i]!;
     return undefined;
   };
+  const clearSidecar = () => {
+    try {
+      fs.rmSync(sidecarFile(), { force: true });
+    } catch {
+      // ignore
+    }
+  };
 
   return {
     mockPi,
@@ -190,6 +199,7 @@ export function createTestFixture(): TestFixture {
     seedSidecar,
     readSidecarEvents,
     lastSidecarEvent,
+    clearSidecar,
   };
 }
 
