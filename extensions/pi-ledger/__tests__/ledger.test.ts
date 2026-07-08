@@ -693,6 +693,74 @@ describe('buildReceiptHtml', () => {
     expect(html).toContain('nextBlock'); // block-by-block typewriter engine
     expect(html).toContain('r-block r-hidden'); // starts blank, grows line by line
   });
+  it('renders the itemized invoice: sub-items, $0 nuances, subtotals, footer', () => {
+    const MS = 3_600_000;
+    const h = (n: number) => n * MS;
+    const full: ReceiptData = {
+      ...data,
+      agentRate: 20,
+      humanRate: 60,
+      agentHours: 1.23,
+      humanHours: 0.97,
+      agentCost: 24.6,
+      humanCost: 58.2,
+      total: 82.8,
+      agentTurns: 42,
+      humanWindows: 3 + 9 + 5,
+      agentTokens: { input: 4100, output: 14300, total: 18400 },
+      graceMinutes: 1,
+      agentGenMs: h(0.95),
+      agentToolMs: h(0.28),
+      stallMs: h(0.3),
+      toolTurns: 14,
+      stalledTurns: 3,
+      humanIdleMs: h(0.85),
+      humanSteerMs: h(0.1),
+      humanQueueMs: h(0.02),
+      idleWindows: 3,
+      steerCount: 9,
+      queueCount: 5,
+      idleKeystrokes: 412,
+      steerKeystrokes: 88,
+      queueKeystrokes: 24,
+      abandonedWindows: 2,
+      abandonedMs: h(0.15),
+      extensionsGranted: 3,
+      extensionCreditMs: 3 * 20 * 60_000,
+      extensionConsumedMs: 50 * 60_000,
+      startedAt: 1_700_000_000_000,
+      generatedAt: 1_700_000_000_000 + h(3.4),
+    };
+    const html = buildReceiptHtml(full);
+    // group headers carry the hourly rate (corroborating the pricing)
+    expect(html).toContain('data-reveal="Agent"');
+    expect(html).toContain('data-reveal="@ $20.00/h"');
+    expect(html).toContain('data-reveal="@ $60.00/h"');
+    // agent sub-items at the agent rate, summing to the subtotal
+    expect(html).toContain('data-reveal="Compute (generation)"');
+    expect(html).toContain('data-reveal="Tool execution"');
+    expect(html).toContain('data-reveal="$19.00"'); // 0.95h × $20
+    expect(html).toContain('data-reveal="$5.60"'); // 0.28h × $20
+    // human sub-items at the human rate
+    expect(html).toContain('data-reveal="Review / think"');
+    expect(html).toContain('data-reveal="Steering"');
+    expect(html).toContain('data-reveal="Queuing"');
+    expect(html).toContain('data-reveal="$51.00"'); // 0.85h × $60
+    expect(html).toContain('data-reveal="$6.00"'); // 0.10h × $60
+    expect(html).toContain('data-reveal="$1.20"'); // 0.02h × $60
+    // $0 nuance lines prove what we DON'T bill
+    expect(html).toContain('data-reveal="Stalls"');
+    expect(html).toContain('data-reveal="Idle abandoned"');
+    expect(html).toContain('data-reveal="$0.00"');
+    expect(html).toContain('data-reveal="not billed"');
+    // subtotals + grand total reconcile
+    expect(html).toContain('data-reveal="$24.60"'); // agent subtotal
+    expect(html).toContain('data-reveal="$58.20"'); // human subtotal
+    expect(html).toContain('data-reveal="$82.80"'); // total
+    // footer: provisioned capacity + session span
+    expect(html).toContain('Extensions: 3 granted · 60m total · 50m used · 10m remaining');
+    expect(html).toContain('Session span 3.40 h · billed 2.20 h');
+  });
 });
 
 // ─── Integration (fake timers) ──────────────────────────────────────────────

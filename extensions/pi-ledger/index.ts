@@ -320,6 +320,31 @@ export interface ReceiptData {
   agentTokens: { input: number; output: number; total: number };
   startedAt: number;
   generatedAt: number;
+  // Itemized sub-totals for the grouped invoice. All optional: when absent
+  // (e.g. a legacy/test ReceiptData) the builder falls back to the bundled
+  // hours so the group still itemizes as a single line at its hourly rate.
+  // The billable sub-items sum to their group total; stallMs/abandonedMs are
+  // the UNbilled audit spans shown as $0 lines.
+  graceMinutes?: number;
+  agentGenMs?: number;
+  agentToolMs?: number;
+  stallMs?: number;
+  toolTurns?: number;
+  stalledTurns?: number;
+  humanIdleMs?: number;
+  humanSteerMs?: number;
+  humanQueueMs?: number;
+  idleWindows?: number;
+  steerCount?: number;
+  queueCount?: number;
+  idleKeystrokes?: number;
+  steerKeystrokes?: number;
+  queueKeystrokes?: number;
+  abandonedWindows?: number;
+  abandonedMs?: number;
+  extensionsGranted?: number;
+  extensionCreditMs?: number;
+  extensionConsumedMs?: number;
 }
 
 // ─── Pure helpers (exported for testing) ────────────────────────────────────
@@ -836,43 +861,119 @@ function reveal(text: string): string {
  */
 export function buildReceiptHtml(d: ReceiptData): string {
   const cur = d.currency;
-  const agentHrs = d.agentHours.toFixed(2);
-  const humanHrs = d.agentTurns === 0 && d.humanWindows === 0 ? '0.00' : d.humanHours.toFixed(2);
   const dateLine =
     d.startedAt > 0 && d.startedAt !== d.generatedAt
       ? `${fmtDate(d.startedAt)} → ${fmtDate(d.generatedAt)}`
       : fmtDate(d.generatedAt);
 
-  const rows = [
-    {
-      label: 'Agent',
-      hrs: agentHrs + ' h',
-      rate: '@ ' + fmtMoney(d.agentRate, cur) + '/h',
-      amt: fmtMoney(d.agentCost, cur),
-      detail: `${d.agentTurns} turns · ${fmtNumber(d.agentTokens.total)} tokens`,
-    },
-    {
-      label: 'Human',
-      hrs: humanHrs + ' h',
-      rate: '@ ' + fmtMoney(d.humanRate, cur) + '/h',
-      amt: fmtMoney(d.humanCost, cur),
-      detail: `${d.humanWindows} windows`,
-    },
-  ];
+  // Sub-totals with a legacy fallback: when the itemized fields are absent
+  // (a hand-built/test ReceiptData) the whole group bills as a single line —
+  // generation / review — at its hourly rate, so the invoice still reconciles.
+  const hrs = (ms: number) => `${(ms / MS_PER_HOUR).toFixed(2)} h`;
+  const money = (n: number) => fmtMoney(n, cur);
+  const bill = (ms: number, rate: number) => (ms / MS_PER_HOUR) * rate;
+  const agentGenMs = d.agentGenMs ?? d.agentHours * MS_PER_HOUR;
+  const agentToolMs = d.agentToolMs ?? 0;
+  const stallMs = d.stallMs ?? 0;
+  const humanIdleMs = d.humanIdleMs ?? d.humanHours * MS_PER_HOUR;
+  const humanSteerMs = d.humanSteerMs ?? 0;
+  const humanQueueMs = d.humanQueueMs ?? 0;
+  const abandonedMs = d.abandonedMs ?? 0;
+  const toolTurns = d.toolTurns ?? 0;
+  const stalledTurns = d.stalledTurns ?? 0;
+  const idleWindows = d.idleWindows ?? d.humanWindows;
+  const steerCount = d.steerCount ?? 0;
+  const queueCount = d.queueCount ?? 0;
+  const idleKeystrokes = d.idleKeystrokes ?? 0;
+  const steerKeystrokes = d.steerKeystrokes ?? 0;
+  const queueKeystrokes = d.queueKeystrokes ?? 0;
+  const abandonedWindows = d.abandonedWindows ?? 0;
+  const extensionsGranted = d.extensionsGranted ?? 0;
+  const extensionCreditMs = d.extensionCreditMs ?? 0;
+  const extensionConsumedMs = d.extensionConsumedMs ?? 0;
+  const remainingMs = extensionCreditMs - extensionConsumedMs;
+  const graceMin = d.graceMinutes ?? 0;
 
-  const rowHtml = rows
-    .map(
-      (r) => `      <div class="line r-block r-hidden">
-        <div class="left">
-          <span class="label"${reveal(r.label)}</span>
-          <span class="detail"${reveal(r.detail)}</span>
-        </div>
-        <div class="right">
-          <div><span class="hrs"${reveal(r.hrs)}</span> <span class="rate"${reveal(r.rate)}</span></div>
-          <div class="amt"${reveal(r.amt)}</div>
-        </div>
-      </div>`
+  const agentSubtotalMs = agentGenMs + agentToolMs;
+  const humanSubtotalMs = humanIdleMs + humanSteerMs + humanQueueMs;
+  const agentSubtotalCost = bill(agentSubtotalMs, d.agentRate);
+  const humanSubtotalCost = bill(humanSubtotalMs, d.humanRate);
+  const grandTotal = agentSubtotalCost + humanSubtotalCost;
+  const tok = d.agentTokens;
+
+  // Row builders — each is an autoregressively-revealed block.
+  const group = (label: string, rate: number) =>
+    `<div class="group r-block r-hidden"><span class="label"${reveal(label)}</span><span class="rate"${reveal(`@ ${fmtMoney(rate, cur)}/h`)}</span></div>`;
+  const item = (label: string, detail: string, ms: number, rate: number) =>
+    `<div class="sub r-block r-hidden"><div class="left"><span class="label"${reveal(label)}</span><span class="detail"${reveal(detail)}</span></div><div class="right"><span class="hrs"${reveal(hrs(ms))}</span><span class="amt"${reveal(money(bill(ms, rate)))}</span></div></div>`;
+  const nuance = (label: string, detail: string, ms: number) =>
+    `<div class="sub nuance r-block r-hidden"><div class="left"><span class="label"${reveal(label)}</span><span class="detail"${reveal(detail)}</span></div><div class="right"><span class="hrs"${reveal(hrs(ms))}</span><span class="amt"${reveal(money(0))}</span><span class="nb"${reveal('not billed')}</span></div></div>`;
+  const subtotalRow = (ms: number, rate: number) =>
+    `<div class="subtotal r-block r-hidden"><span class="label"${reveal('Subtotal')}</span><div class="right"><span class="hrs"${reveal(hrs(ms))}</span><span class="amt"${reveal(money(bill(ms, rate)))}</span></div></div>`;
+
+  const rows: string[] = [];
+  rows.push(group('Agent', d.agentRate));
+  rows.push(
+    item(
+      'Compute (generation)',
+      `${d.agentTurns} turns · ${fmtNumber(tok.total)} tok (${fmtNumber(tok.input)} in / ${fmtNumber(tok.output)} out)`,
+      agentGenMs,
+      d.agentRate
     )
+  );
+  if (agentToolMs > 0)
+    rows.push(item('Tool execution', `${toolTurns} turns with tools`, agentToolMs, d.agentRate));
+  if (stallMs > 0) rows.push(nuance('Stalls', `${stalledTurns} stalled turns`, stallMs));
+  rows.push(subtotalRow(agentSubtotalMs, d.agentRate));
+  rows.push(group('Human', d.humanRate));
+  rows.push(
+    item(
+      'Review / think',
+      `${idleWindows} windows · ${idleKeystrokes} keystrokes` +
+        (graceMin ? ` · grace ${graceMin}m/win` : ''),
+      humanIdleMs,
+      d.humanRate
+    )
+  );
+  if (humanSteerMs > 0)
+    rows.push(
+      item(
+        'Steering',
+        `${steerCount} steers · ${steerKeystrokes} keystrokes`,
+        humanSteerMs,
+        d.humanRate
+      )
+    );
+  if (humanQueueMs > 0)
+    rows.push(
+      item(
+        'Queuing',
+        `${queueCount} queued · ${queueKeystrokes} keystrokes`,
+        humanQueueMs,
+        d.humanRate
+      )
+    );
+  if (abandonedWindows > 0)
+    rows.push(nuance('Idle abandoned', `${abandonedWindows} windows · no submit`, abandonedMs));
+  rows.push(subtotalRow(humanSubtotalMs, d.humanRate));
+  const rowHtml = rows.map((r) => '    ' + r).join('\n');
+
+  // Context footer: provisioned capacity, then session span, then generated.
+  const footer: string[] = [];
+  if (extensionsGranted > 0) {
+    const min = (ms: number) => Math.round(ms / 60_000);
+    footer.push(
+      `Extensions: ${extensionsGranted} granted · ${min(extensionCreditMs)}m total · ${min(extensionConsumedMs)}m used · ${min(remainingMs)}m remaining`
+    );
+  }
+  if (d.startedAt > 0) {
+    const spanMs = Math.max(0, d.generatedAt - d.startedAt);
+    const billedMs = agentSubtotalMs + humanSubtotalMs;
+    footer.push(`Session span ${hrs(spanMs)} · billed ${hrs(billedMs)}`);
+  }
+  footer.push(`generated ${fmtDate(d.generatedAt)} · pi-ledger`);
+  const footerHtml = footer
+    .map((f) => `    <div class="foot r-block r-hidden"><span${reveal(f)}</span></div>`)
     .join('\n');
 
   return `<!doctype html>
@@ -893,14 +994,23 @@ export function buildReceiptHtml(d: ReceiptData): string {
   .rule { border: 0; border-top: 1px solid #f0f0f0; margin: 18px 0; }
   .meta .mrow { display: flex; justify-content: space-between; padding: 3px 0; font-size: 11px; color: #555; }
   .meta .k { color: #9a9a9a; }
-  .line { display: flex; justify-content: space-between; align-items: flex-start; padding: 12px 0; font-size: 13px; }
-  .line + .line { border-top: 1px dashed #f2f2f2; }
-  .line .left { display: flex; flex-direction: column; }
-  .line .label { font-weight: 600; }
-  .line .detail { font-size: 10px; color: #b0b0b0; font-weight: 400; margin-top: 3px; }
-  .line .right { text-align: right; }
-  .line .rate { font-size: 11px; color: #9a9a9a; margin-left: 6px; }
-  .line .amt { font-weight: 600; margin-top: 2px; }
+  .group { display: flex; justify-content: space-between; align-items: baseline; padding: 16px 0 2px; font-size: 13px; font-weight: 700; letter-spacing: 0.06em; }
+  .group .rate { font-size: 11px; color: #9a9a9a; font-weight: 400; letter-spacing: 0; }
+  .sub { display: flex; justify-content: space-between; align-items: flex-start; padding: 9px 0 9px 14px; font-size: 13px; }
+  .sub + .sub { border-top: 1px dashed #f3f3f3; }
+  .sub .left { display: flex; flex-direction: column; }
+  .sub .label { font-weight: 500; }
+  .sub .detail { font-size: 10px; color: #b8b8b8; font-weight: 400; margin-top: 3px; }
+  .sub .right { text-align: right; white-space: nowrap; }
+  .sub .hrs { display: block; font-size: 11px; color: #777; }
+  .sub .amt { font-weight: 600; }
+  .nuance .label, .nuance .hrs, .nuance .amt { color: #c2c2c2; font-weight: 400; }
+  .nuance .nb { display: block; font-size: 9px; color: #c8c8c8; font-style: italic; }
+  .subtotal { display: flex; justify-content: space-between; align-items: baseline; padding: 10px 0 4px 14px; font-size: 13px; border-top: 1px solid #f0f0f0; }
+  .subtotal .label { font-weight: 600; color: #666; letter-spacing: 0.04em; }
+  .subtotal .right { text-align: right; white-space: nowrap; }
+  .subtotal .hrs { font-size: 11px; color: #777; margin-right: 8px; }
+  .subtotal .amt { font-weight: 700; }
   .total { display: flex; justify-content: space-between; align-items: baseline; margin-top: 8px; padding-top: 14px; border-top: 1px solid #ececec; font-size: 17px; }
   .total .amt { font-weight: 700; }
   .foot { margin-top: 22px; font-size: 10px; color: #c2c2c2; text-align: center; }
@@ -925,8 +1035,8 @@ export function buildReceiptHtml(d: ReceiptData): string {
     </div>
     <hr class="rule r-block r-hidden" />
 ${rowHtml}
-    <div class="total r-block r-hidden"><span${reveal('Total')}</span><span class="amt"${reveal(fmtMoney(d.total, cur))}</span></div>
-    <div class="foot r-block r-hidden"><span${reveal('generated ' + fmtDate(d.generatedAt) + ' · pi-ledger')}</span></div>
+    <div class="total r-block r-hidden"><span${reveal('Total')}</span><span class="amt"${reveal(fmtMoney(grandTotal, cur))}</span></div>
+${footerHtml}
     <span class="cursor" id="cursor"></span>
   </div>
 <script>
@@ -2013,7 +2123,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('ledger-receipt', {
-    description: 'Export an HTML receipt for this session (billable agent + human hours, total).',
+    description:
+      'Export an itemized HTML invoice for this session (agent + human line items at their hourly rates, with a total).',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       // Entire-session totals: live ledger data + the in-progress open human
       // window, or — if pi-ledger tracked nothing — derived from pi-tps markers
@@ -2055,6 +2166,28 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         agentTokens: { ...t.agentTokens },
         startedAt,
         generatedAt: Date.now(),
+        // Itemized sub-totals (computeDisplayTotals spreads the live cache +
+        // the in-progress window/steer; remaining credit = granted − consumed).
+        graceMinutes: settings.graceMinutes,
+        agentGenMs: t.agentGenMs,
+        agentToolMs: t.agentToolMs,
+        stallMs: t.stallMs,
+        toolTurns: t.toolTurns,
+        stalledTurns: t.stalledTurns,
+        humanIdleMs: t.humanIdleMs,
+        humanSteerMs: t.humanSteerMs,
+        humanQueueMs: t.humanQueueMs,
+        idleWindows: t.idleWindows,
+        steerCount: t.steerCount,
+        queueCount: t.queueCount,
+        idleKeystrokes: t.idleKeystrokes,
+        steerKeystrokes: t.steerKeystrokes,
+        queueKeystrokes: t.queueKeystrokes,
+        abandonedWindows: t.abandonedWindows,
+        abandonedMs: t.abandonedMs,
+        extensionsGranted: t.extensionsGranted,
+        extensionCreditMs: t.extensionCreditMs,
+        extensionConsumedMs: t.extensionConsumedMs,
       };
       const html = buildReceiptHtml(data);
 

@@ -206,7 +206,7 @@ and rehydrate on resume and `/tree` navigation.
 | Currency         | `USD`    | Symbol for amounts                                          |
 | Auto-wizard      | `on`     | Auto-popup at `agent_end` (no credit) and on `/resume`      |
 
-## Receipt
+## Receipt / invoice
 
 `/ledger-receipt` writes a self-contained HTML file to
 `~/.cache/pi-ledger/receipt-<session>-<timestamp>.html` and opens it.
@@ -215,8 +215,19 @@ and rehydrate on resume and `/tree` navigation.
 - **Geist Mono** throughout.
 - Values **stream in autoregressively** — each field types out character-by-character
   like an LLM token stream, with a blinking cursor tracking the active field.
-- Shows billable **agent** and **human** hours, per-category costs, and the
-  **total** — plus project, author, session, and date range.
+- **A grouped invoice**, not a flat receipt. Two groups — **Agent** and
+  **Human** — each at its hourly rate, with itemized sub-lines that roll up to
+  the group subtotal and corroborate the pricing (every sub-line is its hours
+  at the group rate, summing to the group total):
+  - **Agent** → _Compute_ (generation, token-normalized) + _Tool execution_
+    (wall-clock) + _Stalls_ ($0, not billed), then a **Subtotal**.
+  - **Human** → _Review / think_ (committed idle) + _Steering_ + _Queuing_
+    (followUp) + _Idle abandoned_ ($0, not billed), then a **Subtotal**.
+  - A **Total** sums the two subtotals, followed by a footer with the
+    **provisioned capacity** (extensions granted · used · remaining) and the
+    **session span** vs. billed hours.
+- The `$0` lines are the audit story made visible: time the extension captured
+  but the commit pattern excluded (walked away → no submit → no bill; stalls).
 
 The HTML is fully self-contained (inline CSS + JS, Geist Mono via Google Fonts)
 and prints cleanly to PDF (`⌘P`) — the cursor hides for print.
@@ -321,7 +332,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (111 tests)
+pnpm test            # vitest run (113 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```
