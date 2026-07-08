@@ -997,15 +997,18 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   }
 
   function numberSubmenu(theme: Theme, placeholder: string) {
-    return (currentValue: string, done: (selectedValue?: string) => void) => {
+    return (_currentValue: string, done: (selectedValue?: string) => void) => {
       const input = new Input();
       input.focused = true;
-      input.setValue(currentValue);
       input.onSubmit = (v) => done(v);
       input.onEscape = () => done();
       const box = new Container();
       box.addChild(
-        new Text(theme.fg('muted', placeholder + ' — enter to save · esc to cancel'), 1, 0)
+        new Text(
+          theme.fg('muted', placeholder + ' — type a value · enter saves · esc cancels'),
+          1,
+          0
+        )
       );
       box.addChild(input);
       return {
@@ -1017,15 +1020,18 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   }
 
   function textSubmenu(theme: Theme, placeholder: string) {
-    return (currentValue: string, done: (selectedValue?: string) => void) => {
+    return (_currentValue: string, done: (selectedValue?: string) => void) => {
       const input = new Input();
       input.focused = true;
-      input.setValue(currentValue);
       input.onSubmit = (v) => done(v);
       input.onEscape = () => done();
       const box = new Container();
       box.addChild(
-        new Text(theme.fg('muted', placeholder + ' — enter to save · esc to cancel'), 1, 0)
+        new Text(
+          theme.fg('muted', placeholder + ' — type a value · enter saves · esc cancels'),
+          1,
+          0
+        )
       );
       box.addChild(input);
       return {
