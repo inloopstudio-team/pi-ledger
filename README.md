@@ -17,8 +17,8 @@ pi-ledger turns a pi session into a billable timesheet. Agent work and human
 work are metered separately and billed like serverless: **per-invocation,
 duration-based, scale-to-zero idle**. The agent is the on-demand function; the
 human prompt is the invocation. Idle costs nothing by default — only the first
-grace minute of human time is billable, and a non-blocking wizard pops
-immediately at `agent_end` to offer pomodoro-style extensions.
+grace minute of human time is billable, and a wizard pops immediately at
+`agent_end` (inline, pi-core settings style) to offer pomodoro-style extensions.
 
 > **Standalone, but pi-tps-aware.** pi-ledger works on its own — it measures
 > agent time itself when [`@monotykamary/pi-tps`](https://github.com/monotykamary/pi-tps)
@@ -83,10 +83,10 @@ granted_budget = grace_minutes + Σ extensions (each + pomodoro_minutes)
 ```
 
 - The first **grace minute** (configurable) is always billable.
-- **Immediately at `agent_end`**, a **non-blocking wizard** pops as a
-  bottom-left, full-width panel (pi-core settings style): _Extend +pomodoro?_
-  — `Enter` adds a block and re-arms at the next boundary; `Esc`/dismiss (or
-  ignoring it) caps billing at the grace minute.
+- **Immediately at `agent_end`**, a **wizard** pops inline (the same pi-core
+  settings style as `/ledger-settings`, so the status bar stays visible):
+  _Extend +pomodoro?_ — `Enter` adds a block and re-arms at the next boundary;
+  `Esc`/dismiss (or ignoring it) caps billing at the grace minute.
 - `/ledger-extend [m]` opens the wizard manually (any time the window is
   open) offering to extend by `m` minutes — confirm in the dialog, or stop.
 - The status bar and receipt total the **entire session up to now** — they

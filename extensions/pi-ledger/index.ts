@@ -44,7 +44,6 @@ import {
   SelectList,
   SettingsList,
   Text,
-  type OverlayHandle,
   type SelectItem,
   type SettingItem,
 } from '@earendil-works/pi-tui';
@@ -608,7 +607,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   let humanWindow: { openedAt: number; grantedBudgetMs: number; extensions: number } | null = null;
 
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
-  let wizardHandle: OverlayHandle | null = null;
 
   // Latest ctx (event-bus listeners for tps:telemetry don't receive one).
   let lastCtx: ExtensionContext | null = null;
@@ -747,20 +745,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     }
   }
 
-  function closeWizardOverlay() {
-    if (wizardHandle) {
-      try {
-        wizardHandle.hide();
-      } catch {
-        // already removed
-      }
-      wizardHandle = null;
-    }
-  }
-
   function disarmWizard() {
     clearWizardTimer();
-    closeWizardOverlay();
   }
 
   function armWizardForBoundary(ctx: ExtensionContext) {
@@ -789,63 +775,49 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const pomodoro = extendMins;
 
     ctx.ui
-      .custom<string>(
-        (tui, theme, _kb, done) => {
-          const container = new Container();
-          container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
-          container.addChild(
-            new Text(theme.fg('accent', theme.bold('⏱  Extend billable human time?')), 1, 0)
-          );
-          container.addChild(
-            new Text(
-              theme.fg('muted', `Idle after the agent. Add a ${pomodoro}m pomodoro block?`),
-              1,
-              0
-            )
-          );
-          const items: SelectItem[] = [
-            {
-              value: 'extend',
-              label: `Extend +${pomodoro}m`,
-              description: 'Add a pomodoro to billable human time',
-            },
-            {
-              value: 'stop',
-              label: 'Stop billing',
-              description: 'Cap human time at the current budget',
-            },
-          ];
-          const list = new SelectList(items, 5, getSelectListTheme());
-          list.onSelect = (item) => done(item.value);
-          list.onCancel = () => done('stop');
-          container.addChild(list);
-          container.addChild(
-            new Text(theme.fg('dim', '↑↓ navigate · enter select · esc dismiss'), 1, 0)
-          );
-          container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
-          return {
-            render: (w: number) => container.render(w),
-            invalidate: () => container.invalidate(),
-            handleInput: (data: string) => {
-              list.handleInput(data);
-              tui.requestRender();
-            },
-          };
-        },
-        {
-          overlay: true,
-          overlayOptions: {
-            anchor: 'bottom-left',
-            width: '100%',
-            margin: { left: 0, right: 0, bottom: 0 },
+      .custom<string>((tui, theme, _kb, done) => {
+        const container = new Container();
+        container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
+        container.addChild(
+          new Text(theme.fg('accent', theme.bold('⏱  Extend billable human time?')), 1, 0)
+        );
+        container.addChild(
+          new Text(
+            theme.fg('muted', `Idle after the agent. Add a ${pomodoro}m pomodoro block?`),
+            1,
+            0
+          )
+        );
+        const items: SelectItem[] = [
+          {
+            value: 'extend',
+            label: `Extend +${pomodoro}m`,
+            description: 'Add a pomodoro to billable human time',
           },
-          onHandle: (handle) => {
-            wizardHandle = handle;
+          {
+            value: 'stop',
+            label: 'Stop billing',
+            description: 'Cap human time at the current budget',
           },
-        }
-      )
+        ];
+        const list = new SelectList(items, 5, getSelectListTheme());
+        list.onSelect = (item) => done(item.value);
+        list.onCancel = () => done('stop');
+        container.addChild(list);
+        container.addChild(
+          new Text(theme.fg('dim', '↑↓ navigate · enter select · esc dismiss'), 1, 0)
+        );
+        container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
+        return {
+          render: (w: number) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            list.handleInput(data);
+            tui.requestRender();
+          },
+        };
+      })
       .then((choice) => {
-        wizardHandle = null;
         if (!humanWindow || choice !== 'extend') return;
         humanWindow.grantedBudgetMs += pomodoro * MS_PER_MINUTE;
         humanWindow.extensions += 1;
