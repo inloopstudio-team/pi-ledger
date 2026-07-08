@@ -44,6 +44,7 @@ import {
   Input,
   SelectList,
   SettingsList,
+  Spacer,
   Text,
   type SelectItem,
   type SettingItem,
@@ -860,9 +861,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       .custom<string>((tui, theme, _kb, done) => {
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
+        container.addChild(new Spacer(1));
         container.addChild(
           new Text(theme.fg('accent', theme.bold('⏱  Extend billable human time?')), 1, 0)
         );
+        container.addChild(new Spacer(1));
         container.addChild(
           new Text(
             theme.fg('muted', `Idle after the agent. Add a ${pomodoro}m pomodoro block?`),
@@ -870,6 +873,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
             0
           )
         );
+        container.addChild(new Spacer(1));
         const items: SelectItem[] = [
           {
             value: 'extend',
@@ -886,9 +890,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         list.onSelect = (item) => done(item.value);
         list.onCancel = () => done('stop');
         container.addChild(list);
+        container.addChild(new Spacer(1));
         container.addChild(
           new Text(theme.fg('dim', '↑↓ navigate · enter select · esc dismiss'), 1, 0)
         );
+        container.addChild(new Spacer(1));
         container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
         return {
           render: (w: number) => container.render(w),
@@ -1235,10 +1241,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       await ctx.ui.custom((_tui, theme, _kb, done) => {
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
+        container.addChild(new Spacer(1));
         container.addChild(
           new Text(theme.fg('accent', theme.bold('pi-ledger · billing settings')), 1, 0)
         );
+        container.addChild(new Spacer(1));
         container.addChild(new Text(theme.fg('muted', 'billed like serverless'), 1, 0));
+        container.addChild(new Spacer(1));
 
         let list: SettingsList;
         const items = buildSettingItems(theme, ctx);
@@ -1257,9 +1266,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
           { enableSearch: true }
         );
         container.addChild(list);
+        container.addChild(new Spacer(1));
         container.addChild(
           new Text(theme.fg('dim', '↑↓ navigate · / search · enter edit · esc close'), 1, 0)
         );
+        container.addChild(new Spacer(1));
         container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
         return {
           render: (w: number) => container.render(w),
