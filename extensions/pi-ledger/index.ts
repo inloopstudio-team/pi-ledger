@@ -942,42 +942,42 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         label: 'Agent rate',
         currentValue: fmtRate(settings.agentRatePerHour),
         description: 'Hourly rate billed for agent work',
-        submenu: numberSubmenu(theme, String(settings.agentRatePerHour), 'Agent $/hour'),
+        submenu: numberSubmenu(theme, 'Agent $/hour'),
       },
       {
         id: 'humanRatePerHour',
         label: 'Human rate',
         currentValue: fmtRate(settings.humanRatePerHour),
         description: 'Hourly rate billed for human work',
-        submenu: numberSubmenu(theme, String(settings.humanRatePerHour), 'Human $/hour'),
+        submenu: numberSubmenu(theme, 'Human $/hour'),
       },
       {
         id: 'graceMinutes',
         label: 'Grace minutes',
         currentValue: String(settings.graceMinutes),
         description: 'First N minutes of idle billed before the wizard offers an extension',
-        submenu: numberSubmenu(theme, String(settings.graceMinutes), 'Grace minutes'),
+        submenu: numberSubmenu(theme, 'Grace minutes'),
       },
       {
         id: 'pomodoroMinutes',
         label: 'Pomodoro minutes',
         currentValue: String(settings.pomodoroMinutes),
         description: 'Minutes added per extension (wizard · /ledger-extend)',
-        submenu: numberSubmenu(theme, String(settings.pomodoroMinutes), 'Pomodoro minutes'),
+        submenu: numberSubmenu(theme, 'Pomodoro minutes'),
       },
       {
         id: 'project',
         label: 'Project',
         currentValue: settings.project || basename(ctx.cwd),
         description: 'Project name shown on the receipt',
-        submenu: textSubmenu(theme, settings.project, 'Project name'),
+        submenu: textSubmenu(theme, 'Project name'),
       },
       {
         id: 'author',
         label: 'Author',
         currentValue: settings.author || defaultAuthor(),
         description: 'Author / operator shown on the receipt',
-        submenu: textSubmenu(theme, settings.author, 'Author name'),
+        submenu: textSubmenu(theme, 'Author name'),
       },
       {
         id: 'currency',
@@ -996,11 +996,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     ];
   }
 
-  function numberSubmenu(theme: Theme, current: string, placeholder: string) {
-    return (_currentValue: string, done: (selectedValue?: string) => void) => {
+  function numberSubmenu(theme: Theme, placeholder: string) {
+    return (currentValue: string, done: (selectedValue?: string) => void) => {
       const input = new Input();
       input.focused = true;
-      input.setValue(current);
+      input.setValue(currentValue);
       input.onSubmit = (v) => done(v);
       input.onEscape = () => done();
       const box = new Container();
@@ -1016,11 +1016,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     };
   }
 
-  function textSubmenu(theme: Theme, current: string, placeholder: string) {
-    return (_currentValue: string, done: (selectedValue?: string) => void) => {
+  function textSubmenu(theme: Theme, placeholder: string) {
+    return (currentValue: string, done: (selectedValue?: string) => void) => {
       const input = new Input();
       input.focused = true;
-      input.setValue(current);
+      input.setValue(currentValue);
       input.onSubmit = (v) => done(v);
       input.onEscape = () => done();
       const box = new Container();
