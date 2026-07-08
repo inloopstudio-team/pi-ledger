@@ -911,6 +911,14 @@ describe('extension integration', () => {
     expect(fixture.setStatusSpy.mock.calls.at(-1)![1]).toContain('agent 1.00h');
   });
 
+  it('session_tree keeps the open human window idle (the growing-idle case)', async () => {
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens a window; idle grows
+    await vi.advanceTimersByTimeAsync(30_000); // 30s idle
+    fixture.run('session_tree', { type: 'session_tree' }); // /tree → "go back"
+    // status keeps the open window's idle — not reset to $0
+    expect(fixture.setStatusSpy.mock.calls.at(-1)![1]).toContain('human 0.01h');
+  });
+
   it('session_start keeps live totals if the sidecar read is empty (no reset to $0)', async () => {
     fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
     fixture.emitEvent('tps:telemetry', makeTpsTelemetry({ generationMs: 3_600_000, stallMs: 0 }));
