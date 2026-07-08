@@ -520,7 +520,6 @@ export function buildReceiptHtml(d: ReceiptData): string {
     </div>
     <hr class="rule r-block r-hidden" />
 ${rowHtml}
-    <hr class="rule r-block r-hidden" />
     <div class="total r-block r-hidden"><span${reveal('Total')}</span><span class="amt"${reveal(fmtMoney(d.total, cur))}</span></div>
     <div class="foot r-block r-hidden"><span${reveal('generated ' + fmtDate(d.generatedAt) + ' · pi-ledger')}</span></div>
     <span class="cursor" id="cursor"></span>
@@ -532,7 +531,7 @@ ${rowHtml}
   // The cursor is appended INSIDE the active element (after a text node) so it
   // never becomes a flex sibling — that keeps right-aligned values pinned to
   // the right edge instead of reflowing to the middle as they type.
-  var TPS = 300;
+  var TPS = 100;
   var blocks = document.querySelectorAll('.r-block');
   var cursor = document.getElementById('cursor');
   var bi = 0;
