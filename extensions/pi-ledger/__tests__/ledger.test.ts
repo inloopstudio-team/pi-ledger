@@ -37,7 +37,6 @@ vi.mock('node:child_process', () => ({ execSync: vi.fn() }));
 const DEFAULTS: LedgerSettings = {
   agentRatePerHour: 60,
   humanRatePerHour: 60,
-  graceMinutes: 1,
   pomodoroMinutes: 20,
   referenceTps: 75,
   project: '',
@@ -96,73 +95,67 @@ describe('closeWindowBudget', () => {
 });
 
 describe('consumeExtensionBudget', () => {
-  const grace = 60_000;
-  it('consumes nothing while billed stays within the per-window grace', () => {
-    expect(consumeExtensionBudget(30_000, grace, 20 * 60_000)).toBe(0);
-    expect(consumeExtensionBudget(60_000, grace, 20 * 60_000)).toBe(0); // exactly grace → free
-  });
-  it('consumes the billed time beyond grace, up to the provisioned budget', () => {
-    // billed 5m, grace 1m → 4m beyond grace, 20m provisioned → consume 4m
-    expect(consumeExtensionBudget(5 * 60_000, grace, 20 * 60_000)).toBe(4 * 60_000);
+  it('consumes the billed time up to the provisioned budget', () => {
+    expect(consumeExtensionBudget(30_000, 20 * 60_000)).toBe(30_000); // 30s billed → 30s consumed
+    expect(consumeExtensionBudget(5 * 60_000, 20 * 60_000)).toBe(5 * 60_000); // 5m → 5m
   });
   it('caps consumption at the remaining provisioned budget', () => {
-    // billed 10m, grace 1m → 9m beyond grace, but only 2m provisioned → consume 2m
-    expect(consumeExtensionBudget(10 * 60_000, grace, 2 * 60_000)).toBe(2 * 60_000);
+    // billed 10m, only 2m provisioned → consume 2m
+    expect(consumeExtensionBudget(10 * 60_000, 2 * 60_000)).toBe(2 * 60_000);
   });
   it('clamps zero/empty budgets', () => {
-    expect(consumeExtensionBudget(5 * 60_000, grace, 0)).toBe(0);
-    expect(consumeExtensionBudget(0, grace, 20 * 60_000)).toBe(0);
+    expect(consumeExtensionBudget(5 * 60_000, 0)).toBe(0);
+    expect(consumeExtensionBudget(0, 20 * 60_000)).toBe(0);
   });
 });
 
 describe('resolveExtensionBudget', () => {
-  const grace = 60_000;
   it('reads the recorded field when present (open + close)', () => {
     const open = {
       kind: 'human-open',
       openedAt: 0,
-      grantedBudgetMs: 21 * 60_000,
+      grantedBudgetMs: 20 * 60_000,
       extensions: 1,
       extensionBudgetMs: 20 * 60_000,
       timestamp: 0,
     } as SidecarEvent;
-    expect(resolveExtensionBudget(open, grace)).toBe(20 * 60_000);
+    expect(resolveExtensionBudget(open)).toBe(20 * 60_000);
     const close = {
       kind: 'human-close',
       openedAt: 0,
       closedAt: 1000,
       billedMs: 1000,
       idleMs: 1000,
-      grantedBudgetMs: 21 * 60_000,
+      grantedBudgetMs: 20 * 60_000,
       extensions: 1,
       extensionBudgetMs: 19 * 60_000,
       timestamp: 1,
     } as SidecarEvent;
-    expect(resolveExtensionBudget(close, grace)).toBe(19 * 60_000);
+    expect(resolveExtensionBudget(close)).toBe(19 * 60_000);
   });
-  it('backfills an open legacy event as cap − grace (the extension portion)', () => {
+  it('backfills an open legacy event as the recorded cap (no field)', () => {
     const open = {
       kind: 'human-open',
       openedAt: 0,
-      grantedBudgetMs: 21 * 60_000,
+      grantedBudgetMs: 20 * 60_000,
       extensions: 1,
       timestamp: 0,
     } as SidecarEvent;
-    expect(resolveExtensionBudget(open, grace)).toBe(20 * 60_000);
+    expect(resolveExtensionBudget(open)).toBe(20 * 60_000);
   });
-  it('backfills a close legacy event as cap − max(billed, grace)', () => {
-    // billed 5m, grace 1m, cap 21m → remaining = 21m − 5m = 16m
+  it('backfills a close legacy event as cap − billed', () => {
+    // billed 5m, cap 20m → remaining = 20m − 5m = 15m
     const close = {
       kind: 'human-close',
       openedAt: 0,
       closedAt: 5 * 60_000,
       billedMs: 5 * 60_000,
       idleMs: 5 * 60_000,
-      grantedBudgetMs: 21 * 60_000,
+      grantedBudgetMs: 20 * 60_000,
       extensions: 1,
       timestamp: 1,
     } as SidecarEvent;
-    expect(resolveExtensionBudget(close, grace)).toBe(16 * 60_000);
+    expect(resolveExtensionBudget(close)).toBe(15 * 60_000);
   });
 });
 
@@ -233,8 +226,7 @@ describe('applySettingValue', () => {
     ).toBe(50); // reject negative → keeps old
     expect(applySettingValue(DEFAULTS, 'humanRatePerHour', '12.5').humanRatePerHour).toBe(12.5);
   });
-  it('clamps grace/pomodoro to sane integers', () => {
-    expect(applySettingValue(DEFAULTS, 'graceMinutes', '0').graceMinutes).toBe(0);
+  it('clamps pomodoro to a sane integer (min 1)', () => {
     expect(applySettingValue(DEFAULTS, 'pomodoroMinutes', '0').pomodoroMinutes).toBe(1); // min 1
     expect(applySettingValue(DEFAULTS, 'pomodoroMinutes', '15.7').pomodoroMinutes).toBe(16);
   });
@@ -335,13 +327,13 @@ describe('rehydrateFromSidecar', () => {
       {
         kind: 'human-open',
         openedAt: 10_000,
-        grantedBudgetMs: 1_260_000,
+        grantedBudgetMs: 1_200_000,
         extensions: 1,
         engagedVia: 'extension',
         extensionBudgetMs: 1_200_000,
         timestamp: 10_000,
       },
-      // committed idle: bills 120s = 60s grace + 60s credit (consumes 60s)
+      // committed idle: bills 120s (consumes 120s of the 20m credit)
       {
         kind: 'human-close',
         openedAt: 10_000,
@@ -350,12 +342,12 @@ describe('rehydrateFromSidecar', () => {
         idleMs: 120_000,
         keystrokes: 50,
         committed: true,
-        grantedBudgetMs: 1_260_000,
+        grantedBudgetMs: 1_200_000,
         extensions: 1,
-        extensionBudgetMs: 1_140_000,
+        extensionBudgetMs: 1_080_000,
         timestamp: 130_000,
       },
-      // a steer (30s, under grace → no credit consumed) and a followUp (10s)
+      // a steer (30s, consumes 30s) and a followUp (10s, consumes 10s)
       {
         kind: 'steer',
         startedAt: 200_000,
@@ -364,8 +356,8 @@ describe('rehydrateFromSidecar', () => {
         billedMs: 30_000,
         keystrokes: 20,
         behavior: 'steer',
-        grantedBudgetMs: 1_200_000,
-        extensionBudgetMs: 1_140_000,
+        grantedBudgetMs: 1_080_000,
+        extensionBudgetMs: 1_050_000,
         timestamp: 230_000,
       },
       {
@@ -376,18 +368,18 @@ describe('rehydrateFromSidecar', () => {
         billedMs: 10_000,
         keystrokes: 5,
         behavior: 'followUp',
-        grantedBudgetMs: 1_200_000,
-        extensionBudgetMs: 1_140_000,
+        grantedBudgetMs: 1_050_000,
+        extensionBudgetMs: 1_040_000,
         timestamp: 310_000,
       },
-      // an abandoned window (walked away; no submit → 0 billed)
+      // an abandoned window (walked away; no submit → 0 billed, consumes nothing)
       {
         kind: 'human-open',
         openedAt: 400_000,
-        grantedBudgetMs: 1_200_000,
+        grantedBudgetMs: 1_040_000,
         extensions: 0,
         engagedVia: 'keystroke',
-        extensionBudgetMs: 1_140_000,
+        extensionBudgetMs: 1_040_000,
         timestamp: 400_000,
       },
       {
@@ -397,9 +389,9 @@ describe('rehydrateFromSidecar', () => {
         billedMs: 0,
         idleMs: 200_000,
         committed: false,
-        grantedBudgetMs: 1_200_000,
+        grantedBudgetMs: 1_040_000,
         extensions: 0,
-        extensionBudgetMs: 1_140_000,
+        extensionBudgetMs: 1_040_000,
         timestamp: 600_000,
       },
     ];
@@ -426,11 +418,11 @@ describe('rehydrateFromSidecar', () => {
     expect(r.totals.queueKeystrokes).toBe(5);
     expect(r.totals.abandonedWindows).toBe(1);
     expect(r.totals.abandonedMs).toBe(200_000);
-    // extensions: 1 block granted (1_200_000), 60s consumed, 1_140_000 remaining
+    // extensions: 1 block granted (1_200_000), 160s consumed (120+30+10), 1_040_000 remaining
     expect(r.totals.extensionsGranted).toBe(1);
     expect(r.totals.extensionCreditMs).toBe(1_200_000);
-    expect(r.totals.extensionConsumedMs).toBe(60_000);
-    expect(r.extensionBudgetMs).toBe(1_140_000);
+    expect(r.totals.extensionConsumedMs).toBe(160_000);
+    expect(r.extensionBudgetMs).toBe(1_040_000);
     expect(r.totals.extensionCreditMs - r.totals.extensionConsumedMs).toBe(r.extensionBudgetMs);
   });
   it('defaults settings when none persisted', () => {
@@ -566,13 +558,13 @@ describe('rehydrateFromSidecar', () => {
     expect(r.extensionBudgetMs).toBe(18 * 60_000);
   });
   it('backfills the rolling budget for legacy events missing the field', () => {
-    // open with cap 21m (grace 1m + 20m ext), no extensionBudgetMs field
+    // open with cap 20m (20m ext), no extensionBudgetMs field
     const events: SidecarEvent[] = [
       { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
       {
         kind: 'human-open',
         openedAt: 1000,
-        grantedBudgetMs: 21 * 60_000,
+        grantedBudgetMs: 20 * 60_000,
         extensions: 1,
         timestamp: 1000,
       },
@@ -603,7 +595,7 @@ describe('extractTpsEntries + convertTpsEntries', () => {
     expect(tps[0]!.timestamp).toBe(10);
   });
 
-  it('converts markers to agent + estimated human time (gaps capped at grace)', () => {
+  it('converts markers to agent time (no human estimate — markers carry no credit/commit info)', () => {
     const c = convertTpsEntries(
       [
         {
@@ -625,21 +617,20 @@ describe('extractTpsEntries + convertTpsEntries', () => {
           timestamp: 90000,
         },
       ],
-      60_000,
       75
     );
     // agent = (50 + 100 + 25) output tokens ÷ 75 TPS = 667 + 1333 + 333 = 2333
     expect(c.agentMs).toBe(2333);
     expect(c.agentTurns).toBe(3);
     expect(c.agentTokens.total).toBe(525);
-    // gap0 = (70000-4000) - 0 = 66000 -> capped at 60000; gap1 = (90000-1500) - 70000 = 18500
-    expect(c.humanMs).toBe(60000 + 18500);
-    expect(c.humanWindows).toBe(2);
+    // idle bills only against credit; markers carry none → 0 human time
+    expect(c.humanMs).toBe(0);
+    expect(c.humanWindows).toBe(0);
     expect(c.startedAt).toBe(0);
   });
 
   it('returns zeros for no markers', () => {
-    const c = convertTpsEntries([], 60_000, 75);
+    const c = convertTpsEntries([], 75);
     expect(c.agentMs).toBe(0);
     expect(c.humanMs).toBe(0);
     expect(c.startedAt).toBe(0);
@@ -708,7 +699,6 @@ describe('buildReceiptHtml', () => {
       agentTurns: 42,
       humanWindows: 3 + 9 + 5,
       agentTokens: { input: 4100, output: 14300, total: 18400 },
-      graceMinutes: 1,
       agentGenMs: h(0.95),
       agentToolMs: h(0.28),
       stallMs: h(0.3),
@@ -971,19 +961,19 @@ describe('extension integration', () => {
     expect(agentEntries).toHaveLength(1); // only the turn-0 tps entry
   });
 
-  it('pops the wizard at agent_end (no credit) and bills engaged idle under grace when committed', async () => {
+  it('pops the wizard at agent_end (no credit); engaging without extending bills 0', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // install the editor (no pop)
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → wizard pops (engagement prompt)
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard promise
-    fixture.sendEditorKey('k'); // ENGAGE the idle window at onset (now)
-    await vi.advanceTimersByTimeAsync(5000); // 5s idle from onset, under 1m grace
-    fixture.run('agent_start', { type: 'agent_start' }); // COMMIT → bills 5s
+    fixture.sendEditorKey('k'); // ENGAGE the idle window at onset (no credit → cap 0)
+    await vi.advanceTimersByTimeAsync(5000); // 5s idle, but cap is 0
+    fixture.run('agent_start', { type: 'agent_start' }); // COMMIT → bills 0 (no credit provisioned)
 
     const seg = lastEntry(fixture, 'ledger-human');
     expect(seg).toBeDefined();
-    expect(seg.billedMs).toBe(5000);
-    expect(seg.grantedBudgetMs).toBe(60_000);
+    expect(seg.billedMs).toBe(0);
+    expect(seg.grantedBudgetMs).toBe(0);
     expect(seg.extensions).toBe(0);
     expect(seg.committed).toBe(true);
     expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('keystroke');
@@ -1000,7 +990,7 @@ describe('extension integration', () => {
     expect(fixture.customSpy).not.toHaveBeenCalled();
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
     // the retry's backoff sleep is NOT billed: agent_start has no window to close
-    await vi.advanceTimersByTimeAsync(60_000); // a full grace minute of backoff
+    await vi.advanceTimersByTimeAsync(60_000); // a full minute of backoff
     fixture.run('agent_start', { type: 'agent_start' });
     expect(fixture.lastSidecarEvent('human-close')).toBeUndefined();
   });
@@ -1072,30 +1062,30 @@ describe('extension integration', () => {
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
   });
 
-  it('caps engaged idle at the grace minute when the wizard is dismissed', async () => {
+  it('bills 0 for engaged idle after the wizard is dismissed (no credit)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('stop');
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops, dismissed ('stop' → no engagement)
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard
-    fixture.sendEditorKey('k'); // engage the idle window at onset (wizard dismissed → engage via keystroke)
-    await vi.advanceTimersByTimeAsync(90_000); // 90s engaged idle, no extension
+    fixture.sendEditorKey('k'); // engage the idle window at onset (no credit → cap 0)
+    await vi.advanceTimersByTimeAsync(90_000); // 90s engaged idle, no credit
     fixture.run('agent_start', { type: 'agent_start' }); // commit
 
     const seg = lastEntry(fixture, 'ledger-human');
-    expect(seg.billedMs).toBe(60_000); // capped at grace
+    expect(seg.billedMs).toBe(0); // no credit → bills 0
     expect(seg.extensions).toBe(0);
   });
 
   it('extends the budget when the wizard is accepted', async () => {
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately, accepted → +20m, re-armed at 21m
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately, accepted → +20m, engages, re-armed at 20m
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(360_000); // 6m idle, under 21m budget → re-armed wizard not fired
+    await vi.advanceTimersByTimeAsync(360_000); // 6m idle, under 20m budget → re-armed wizard not fired
     fixture.run('agent_start', { type: 'agent_start' });
 
     const seg = lastEntry(fixture, 'ledger-human');
-    expect(seg.grantedBudgetMs).toBe(60_000 + 20 * 60_000);
+    expect(seg.grantedBudgetMs).toBe(20 * 60_000);
     expect(seg.extensions).toBe(1);
     expect(seg.billedMs).toBe(360_000); // 6 min
   });
@@ -1104,30 +1094,30 @@ describe('extension integration', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend'); // every wizard pop → extend (engages + grants capacity)
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → 1st pop → engage + +20m
-    await vi.advanceTimersByTimeAsync(0); // flush the 1st extend → openIdleWindow('extension', 20m), cap 21m
-    // idle to the first exhaustion (grace 1m + 20m) → 2nd pop → +20m (cap 41m)
-    await vi.advanceTimersByTimeAsync(21 * 60_000);
-    // idle to the next exhaustion (another 20m) → 3rd pop → +20m (cap 61m)
+    await vi.advanceTimersByTimeAsync(0); // flush the 1st extend → openIdleWindow('extension', 20m), cap 20m
+    // idle to the first exhaustion (20m credit) → 2nd pop → +20m (cap 40m)
     await vi.advanceTimersByTimeAsync(20 * 60_000);
-    // 10m more thinking (under the 61m cap), then type and go (submit → agent_start commits)
+    // idle to the next exhaustion (another 20m) → 3rd pop → +20m (cap 60m)
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    // 10m more thinking (under the 60m cap), then type and go (submit → agent_start commits)
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     fixture.run('agent_start', { type: 'agent_start' });
 
     const seg = lastEntry(fixture, 'ledger-human');
     expect(seg).toBeDefined();
     expect(seg.extensions).toBe(3); // three pomodoro blocks granted
-    expect(seg.billedMs).toBe(51 * 60_000); // the whole thinking span (21 + 20 + 10) min, under the 61m cap
+    expect(seg.billedMs).toBe(50 * 60_000); // the whole thinking span (20 + 20 + 10) min, under the 60m cap
     expect(seg.committed).toBe(true); // committed by the submit (agent action), not abandoned
     expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('extension'); // engaged via the first extend
 
     // live accumulation round-trips through rehydrate: 3 blocks granted (60m),
-    // 51m billed (50m beyond grace consumed), 10m credit remaining.
+    // 50m billed (all consumed against credit), 10m credit remaining.
     const r = rehydrateFromSidecar(fixture.readSidecarEvents());
     expect(r.totals.extensionsGranted).toBe(3);
     expect(r.totals.extensionCreditMs).toBe(3 * 20 * 60_000);
     expect(r.totals.extensionConsumedMs).toBe(50 * 60_000);
     expect(r.extensionBudgetMs).toBe(10 * 60_000);
-    expect(r.totals.humanIdleMs).toBe(51 * 60_000);
+    expect(r.totals.humanIdleMs).toBe(50 * 60_000);
     expect(r.totals.idleWindows).toBe(1);
     expect(r.totals.humanSteerMs).toBe(0);
     expect(r.totals.abandonedWindows).toBe(0);
@@ -1138,22 +1128,22 @@ describe('extension integration', () => {
     fixture.setCustomResult('extend');
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pops → +20m, engages via extension
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(120_000); // 2m idle (under 21m cap); flushes the extend
-    fixture.run('agent_start', { type: 'agent_start' }); // commit: 2m billed, 1m ext consumed → 19m left
+    await vi.advanceTimersByTimeAsync(120_000); // 2m idle (under 20m cap); flushes the extend
+    fixture.run('agent_start', { type: 'agent_start' }); // commit: 2m billed, 2m ext consumed → 18m left
 
     const seg1 = lastEntry(fixture, 'ledger-human');
     expect(seg1.billedMs).toBe(120_000);
-    expect(seg1.extensionBudgetMs).toBe(19 * 60_000);
+    expect(seg1.extensionBudgetMs).toBe(18 * 60_000);
 
-    // next agent_end: 19m credit remains → wizard is NOT shown (no pop, no auto-open)
+    // next agent_end: 18m credit remains → wizard is NOT shown (no pop, no auto-open)
     fixture.customSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     expect(fixture.customSpy).not.toHaveBeenCalled();
-    // the idle window opens only on engagement; engage via keystroke → cap = grace + 19m
+    // the idle window opens only on engagement; engage via keystroke → cap = 18m credit
     fixture.sendEditorKey('k');
     const open = fixture.lastSidecarEvent('human-open');
-    expect(open!.grantedBudgetMs).toBe(20 * 60_000); // per-window grace (1m) + 19m rolling credit
-    expect(open!.extensionBudgetMs).toBe(19 * 60_000);
+    expect(open!.grantedBudgetMs).toBe(18 * 60_000); // 18m rolling credit
+    expect(open!.extensionBudgetMs).toBe(18 * 60_000);
   });
 
   it('rolls unused extension credit across multiple agent turns', async () => {
@@ -1161,18 +1151,18 @@ describe('extension integration', () => {
     fixture.setCustomResult('extend');
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pops → +20m, engages via extension
     await vi.advanceTimersByTimeAsync(120_000); // 2m idle (flushes the extend)
-    fixture.run('agent_start', { type: 'agent_start' }); // commit → 2m billed, 1m ext consumed → 19m left
+    fixture.run('agent_start', { type: 'agent_start' }); // commit → 2m billed, 2m consumed → 18m left
 
-    // turn 2: 19m credit remains → no pop at agent_end; engage via keystroke
+    // turn 2: 18m credit remains → no pop at agent_end; engage via keystroke
     fixture.customSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     expect(fixture.customSpy).not.toHaveBeenCalled();
-    fixture.sendEditorKey('k'); // engage the new window (cap = grace + 19m)
+    fixture.sendEditorKey('k'); // engage the new window (cap = 18m credit)
     await vi.advanceTimersByTimeAsync(120_000); // 2m idle
-    fixture.run('agent_start', { type: 'agent_start' }); // commit → 1m ext consumed → 18m left
-    expect(lastEntry(fixture, 'ledger-human').extensionBudgetMs).toBe(18 * 60_000);
+    fixture.run('agent_start', { type: 'agent_start' }); // commit → 2m consumed → 16m left
+    expect(lastEntry(fixture, 'ledger-human').extensionBudgetMs).toBe(16 * 60_000);
 
-    // turn 3: still 18m credit → still suppressed
+    // turn 3: still 16m credit → still suppressed
     fixture.customSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     expect(fixture.customSpy).not.toHaveBeenCalled();
@@ -1198,13 +1188,13 @@ describe('extension integration', () => {
   });
 
   it('suppresses the wizard at agent_end when rolling credit is rehydrated', async () => {
-    // A prior idle window left 19m of rolling pomodoro credit on the sidecar.
+    // A prior idle window left 18m of rolling pomodoro credit on the sidecar.
     fixture.seedSidecar([
       { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
       {
         kind: 'human-open',
         openedAt: 0,
-        grantedBudgetMs: 21 * 60_000,
+        grantedBudgetMs: 20 * 60_000,
         extensions: 1,
         extensionBudgetMs: 20 * 60_000,
         timestamp: 1000,
@@ -1215,19 +1205,19 @@ describe('extension integration', () => {
         closedAt: 2 * 60_000,
         billedMs: 2 * 60_000,
         idleMs: 2 * 60_000,
-        grantedBudgetMs: 21 * 60_000,
+        grantedBudgetMs: 20 * 60_000,
         extensions: 1,
-        extensionBudgetMs: 19 * 60_000,
+        extensionBudgetMs: 18 * 60_000,
         timestamp: 2000,
       },
     ]);
-    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate 19m credit; no pop
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate 18m credit; no pop
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
-    expect(fixture.customSpy).not.toHaveBeenCalled(); // 19m credit → suppressed
-    fixture.sendEditorKey('k'); // engage → open window with cap = grace + 19m
+    expect(fixture.customSpy).not.toHaveBeenCalled(); // 18m credit → suppressed
+    fixture.sendEditorKey('k'); // engage → open window with cap = 18m credit
     const open = fixture.lastSidecarEvent('human-open');
-    expect(open!.grantedBudgetMs).toBe(20 * 60_000); // grace 1m + 19m credit
-    expect(open!.extensionBudgetMs).toBe(19 * 60_000);
+    expect(open!.grantedBudgetMs).toBe(18 * 60_000); // 18m credit
+    expect(open!.extensionBudgetMs).toBe(18 * 60_000);
   });
 
   it('/ledger-extend opens the wizard; confirming extends by the given minutes', async () => {
@@ -1242,11 +1232,11 @@ describe('extension integration', () => {
     await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // opens the wizard → confirm → +5m
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(100_000); // 100s idle, under 6m budget
+    await vi.advanceTimersByTimeAsync(100_000); // 100s idle, under 5m budget
     fixture.run('agent_start', { type: 'agent_start' });
 
     const seg = lastEntry(fixture, 'ledger-human');
-    expect(seg.grantedBudgetMs).toBe(60_000 + 5 * 60_000);
+    expect(seg.grantedBudgetMs).toBe(5 * 60_000);
     expect(seg.extensions).toBe(1);
     expect(seg.billedMs).toBe(100_000);
   });
@@ -1260,7 +1250,7 @@ describe('extension integration', () => {
     const open = fixture.lastSidecarEvent('human-open');
     expect(open).toBeDefined();
     expect(open!.engagedVia).toBe('extension');
-    expect(open!.grantedBudgetMs).toBe(60_000 + 5 * 60_000); // grace + 5m
+    expect(open!.grantedBudgetMs).toBe(5 * 60_000); // 5m credit
   });
 
   it('rehydrates totals + settings on session_start and /ledger reports them', async () => {
@@ -1354,13 +1344,13 @@ describe('extension integration', () => {
 
   it('counts the in-progress open human window in /ledger (entire session up to now)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops (no credit)
-    await vi.advanceTimersByTimeAsync(0); // flush dismissed wizard
-    fixture.sendEditorKey('k'); // ENGAGE the idle window at onset
+    fixture.setCustomResult('extend');
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → wizard → extend +20m (engages)
+    await vi.advanceTimersByTimeAsync(0); // flush the extend → open window, cap 20m
     await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window still open (uncommitted)
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
-    // the open window's 30s idle is counted now (capped at the 1m grace), not deferred to close
+    // the open window's 30s idle is counted now (against the 20m credit), not deferred to close
     expect(msg).toContain('human 0.01h (1 windows)');
   });
 
@@ -1498,7 +1488,7 @@ describe('extension integration', () => {
       const files = fs.readdirSync(dir).filter((f) => f.endsWith('.html'));
       expect(files).toHaveLength(1);
       const html = fs.readFileSync(path.join(dir, files[0]!), 'utf8');
-      // 1h agent @ $100 = $100; trailing idle (→ now) adds up to a grace minute of human time
+      // 1h agent @ $100 = $100; markers carry no credit/commit info → 0 human time
       expect(html).toContain('$100.00');
       expect(html).toContain('demo');
       expect(
@@ -1570,10 +1560,10 @@ describe('extension integration', () => {
 
   it('session_tree keeps the open human window idle (the growing-idle case)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops; no window yet
-    await vi.advanceTimersByTimeAsync(0);
-    fixture.sendEditorKey('k'); // engage the idle window; idle grows
-    await vi.advanceTimersByTimeAsync(30_000); // 30s idle
+    fixture.setCustomResult('extend');
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → wizard → extend +20m (engages)
+    await vi.advanceTimersByTimeAsync(0); // flush the extend → open window, cap 20m
+    await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window open
     fixture.run('session_tree', { type: 'session_tree' }); // /tree → "go back"
     // status keeps the open window's idle — not reset to $0
     expect(fixture.setStatusSpy.mock.calls.at(-1)![1]).toContain('human 0.01h');
@@ -1592,7 +1582,7 @@ describe('extension integration', () => {
 
   // ── Initial human window (first-prompt composition) ────────────────────
 
-  it('engages an initial human window on first keystroke and bills first-prompt composition (no wizard at startup)', async () => {
+  it('engages an initial human window on first keystroke; with no credit it bills 0 (no wizard at startup)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     // no window opens at session_start — engagement is gated on the first keystroke
     expect(fixture.customSpy).not.toHaveBeenCalled();
@@ -1600,7 +1590,7 @@ describe('extension integration', () => {
     fixture.sendEditorKey('k'); // first keystroke ENGAGES the initial window at onset
     const open = fixture.lastSidecarEvent('human-open');
     expect(open).toBeDefined();
-    expect(open!.grantedBudgetMs).toBe(60_000); // grace 1m; no credit provisioned yet
+    expect(open!.grantedBudgetMs).toBe(0); // no credit provisioned → cap 0
     expect(open!.engagedVia).toBe('keystroke');
     expect(open!.extensionBudgetMs).toBe(0);
 
@@ -1609,20 +1599,20 @@ describe('extension integration', () => {
 
     const close = fixture.lastSidecarEvent('human-close');
     expect(close).toBeDefined();
-    expect(close!.billedMs).toBe(30_000); // under the 1m grace → billed in full
+    expect(close!.billedMs).toBe(0); // no credit → bills 0
     expect(close!.committed).toBe(true);
     expect(close!.extensions).toBe(0);
   });
 
-  it('caps the initial window at the grace minute — engaged idle beyond grace bills only grace (abuse guard)', async () => {
+  it('a long engaged idle with no credit bills 0', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.sendEditorKey('k'); // engage the initial window at onset
-    await vi.advanceTimersByTimeAsync(5 * 60_000); // 5m idle after engagement (no extension)
+    fixture.sendEditorKey('k'); // engage the initial window at onset (no credit → cap 0)
+    await vi.advanceTimersByTimeAsync(5 * 60_000); // 5m idle after engagement (no credit)
     fixture.run('agent_start', { type: 'agent_start' }); // commit
 
     const close = fixture.lastSidecarEvent('human-close');
-    expect(close!.billedMs).toBe(60_000); // capped at the 1m grace; the rest is unbilled
-    expect(close!.idleMs).toBe(5 * 60_000);
+    expect(close!.billedMs).toBe(0); // no credit provisioned → bills 0
+    expect(close!.idleMs).toBe(5 * 60_000); // the 5m span is recorded for audit, unbilled
     expect(close!.extensions).toBe(0);
   });
 
@@ -1696,14 +1686,14 @@ describe('extension integration', () => {
     expect(abandon!.committed).toBe(false);
   });
 
-  it('carries rehydrated rolling credit into the initial window (cap = grace + credit), wizard silent', async () => {
-    // A prior idle window left 19m of rolling pomodoro credit on the sidecar.
+  it('carries rehydrated rolling credit into the initial window (cap = credit), wizard silent', async () => {
+    // A prior idle window left 18m of rolling pomodoro credit on the sidecar.
     fixture.seedSidecar([
       { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
       {
         kind: 'human-open',
         openedAt: 0,
-        grantedBudgetMs: 21 * 60_000,
+        grantedBudgetMs: 20 * 60_000,
         extensions: 1,
         extensionBudgetMs: 20 * 60_000,
         timestamp: 1000,
@@ -1714,18 +1704,18 @@ describe('extension integration', () => {
         closedAt: 2 * 60_000,
         billedMs: 2 * 60_000,
         idleMs: 2 * 60_000,
-        grantedBudgetMs: 21 * 60_000,
+        grantedBudgetMs: 20 * 60_000,
         extensions: 1,
-        extensionBudgetMs: 19 * 60_000,
+        extensionBudgetMs: 18 * 60_000,
         timestamp: 2000,
       },
     ]);
-    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate 19m credit; no pop
-    // engaging inherits the 19m rolling credit: cap = grace 1m + 19m
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate 18m credit; no pop
+    // engaging inherits the 18m rolling credit: cap = 18m
     fixture.sendEditorKey('k');
     const open = fixture.lastSidecarEvent('human-open');
-    expect(open!.grantedBudgetMs).toBe(20 * 60_000);
-    expect(open!.extensionBudgetMs).toBe(19 * 60_000);
+    expect(open!.grantedBudgetMs).toBe(18 * 60_000);
+    expect(open!.extensionBudgetMs).toBe(18 * 60_000);
     // silent — the wizard never auto-pops at startup
     expect(fixture.customSpy).not.toHaveBeenCalled();
   });
@@ -1736,13 +1726,13 @@ describe('extension integration', () => {
     fixture.setCustomResult('extend');
     await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // manually provision +5m
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(4 * 60_000); // 4m composing (under grace 1m + 5m = 6m)
+    await vi.advanceTimersByTimeAsync(4 * 60_000); // 4m composing (under the 5m cap)
     fixture.run('agent_start', { type: 'agent_start' });
 
     const close = fixture.lastSidecarEvent('human-close');
-    expect(close!.grantedBudgetMs).toBe(60_000 + 5 * 60_000);
+    expect(close!.grantedBudgetMs).toBe(5 * 60_000);
     expect(close!.extensions).toBe(1);
-    expect(close!.billedMs).toBe(4 * 60_000); // 4m, under the 6m cap
+    expect(close!.billedMs).toBe(4 * 60_000); // 4m, under the 5m cap
   });
 
   it('the silent initial window does not suppress the wizard at the following agent_end', async () => {
@@ -1774,6 +1764,35 @@ async function typeBurst(fixture: TestFixture, durationMs: number, gapMs = 1000)
     fixture.sendEditorKey('k');
     if (i < steps) await vi.advanceTimersByTimeAsync(gapMs);
   }
+}
+
+/** Seed `ms` of rolling extension credit from a prior (0-billed) idle window,
+ *  so a fresh session rehydrates with billable credit already provisioned.
+ *  Steering/idle bill against credit, so billing tests provision credit first. */
+function seedCredit(fixture: TestFixture, ms: number) {
+  fixture.seedSidecar([
+    { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+    {
+      kind: 'human-open',
+      openedAt: 0,
+      grantedBudgetMs: ms,
+      extensions: 1,
+      extensionBudgetMs: ms,
+      timestamp: 1000,
+    },
+    {
+      kind: 'human-close',
+      openedAt: 0,
+      closedAt: 1000,
+      billedMs: 0,
+      idleMs: 0,
+      committed: true,
+      grantedBudgetMs: ms,
+      extensions: 1,
+      extensionBudgetMs: ms,
+      timestamp: 2000,
+    },
+  ]);
 }
 
 describe('computeBurstMs', () => {
@@ -1827,7 +1846,7 @@ describe('steering composition (human types while the agent runs)', () => {
     expect(fixture.setEditorComponentSpy).not.toHaveBeenCalled();
   });
 
-  it('bills a steer composed during the run under the grace minute', async () => {
+  it('bills nothing for a steer with no credit provisioned', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' }); // run begins; closes the initial window
     await typeBurst(fixture, 30_000); // 30s of sustained typing mid-stream
@@ -1835,50 +1854,30 @@ describe('steering composition (human types while the agent runs)', () => {
 
     const steer = lastSteer(fixture);
     expect(steer).toBeDefined();
-    expect(steer!.billedMs).toBe(30_000); // active-typing burst, under 1m grace → billed in full
+    expect(steer!.billedMs).toBe(0); // no credit → bills 0
     expect(steer!.durationMs).toBe(30_000); // wall-clock span == burst (no idle gap)
     expect(steer!.keystrokes).toBe(31); // 30s at 1s intervals = 31 keys
     expect(steer!.behavior).toBe('steer');
-    expect(steer!.grantedBudgetMs).toBe(60_000); // grace 1m, no credit
+    expect(steer!.grantedBudgetMs).toBe(0); // no credit
     expect(steer!.extensionBudgetMs).toBe(0);
   });
 
-  it('consumes rolling credit for a steer composed beyond the grace minute', async () => {
-    // Rehydrate 19m of rolling pomodoro credit from a prior idle window.
-    fixture.seedSidecar([
-      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
-      {
-        kind: 'human-open',
-        openedAt: 0,
-        grantedBudgetMs: 21 * 60_000,
-        extensions: 1,
-        extensionBudgetMs: 20 * 60_000,
-        timestamp: 1000,
-      },
-      {
-        kind: 'human-close',
-        openedAt: 0,
-        closedAt: 2 * 60_000,
-        billedMs: 2 * 60_000,
-        idleMs: 2 * 60_000,
-        grantedBudgetMs: 21 * 60_000,
-        extensions: 1,
-        extensionBudgetMs: 19 * 60_000,
-        timestamp: 2000,
-      },
-    ]);
+  it('consumes rolling credit for a steer (all billed time consumes credit)', async () => {
+    // Rehydrate 18m of rolling pomodoro credit from a prior idle window.
+    seedCredit(fixture, 18 * 60_000);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     fixture.run('agent_start', { type: 'agent_start' }); // close the initial window; start the run
     await typeBurst(fixture, 3 * 60_000); // 3m of sustained typing
     fixture.run('input', steerInput('steer'));
 
     const steer = lastSteer(fixture);
-    expect(steer!.billedMs).toBe(3 * 60_000); // under the 20m cap (grace 1m + 19m credit)
-    expect(steer!.grantedBudgetMs).toBe(20 * 60_000);
-    expect(steer!.extensionBudgetMs).toBe(17 * 60_000); // 19m − 2m consumed beyond grace
+    expect(steer!.billedMs).toBe(3 * 60_000); // under the 18m cap
+    expect(steer!.grantedBudgetMs).toBe(18 * 60_000);
+    expect(steer!.extensionBudgetMs).toBe(15 * 60_000); // 18m − 3m consumed
   });
 
-  it('bills a queued followUp the same as a mid-stream steer', async () => {
+  it('bills a queued followUp the same as a mid-stream steer (both against credit)', async () => {
+    seedCredit(fixture, 20 * 60_000);
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 45_000); // 45s of sustained typing
@@ -1916,6 +1915,7 @@ describe('steering composition (human types while the agent runs)', () => {
   });
 
   it('records multiple steers in one run, each from its own typing burst', async () => {
+    seedCredit(fixture, 20 * 60_000);
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 10_000);
@@ -2014,21 +2014,23 @@ describe('steering composition (human types while the agent runs)', () => {
   });
 
   it('discards an unsubmitted in-run composition (no backdate — it never reached the agent)', async () => {
+    seedCredit(fixture, 20 * 60_000);
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 20_000); // 20s of typing mid-run, NOT submitted
     // the agent finishes before the human submits — no `input` fires mid-stream
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // discard staging; no idle window opens
-    await vi.advanceTimersByTimeAsync(0); // flush the wizard's dismissed promise
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // discard staging; credit remains → no wizard pop
 
-    // No steer (never submitted) and no idle window (no engagement yet) — the
+    // No steer (never submitted) and no NEW idle window (no engagement yet) — the
     // mid-run typing never reached the agent, so it bills nothing and opens nothing.
     expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
-    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
+    const opensAfterDiscard = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
+    expect(opensAfterDiscard).toHaveLength(1); // only the seeded (closed) window; the discard opened none
+    expect(opensAfterDiscard[0]!.openedAt).toBe(0); // the seeded one, not a fresh engagement
 
     // The human engages AFTER the run (a fresh keystroke) and commits — only the
     // post-run idle bills; the discarded mid-run typing isn't folded in.
-    fixture.sendEditorKey('k'); // engage the idle window at onset (now, post-run)
+    fixture.sendEditorKey('k'); // engage the idle window at onset (now, post-run), cap 20m
     await vi.advanceTimersByTimeAsync(10_000); // 10s of post-run idle
     fixture.run('agent_start', { type: 'agent_start' }); // commit → bills 10s
 
@@ -2038,6 +2040,7 @@ describe('steering composition (human types while the agent runs)', () => {
   });
 
   it('bills a submitted steer from its burst; the post-turn idle bills only post-run idle', async () => {
+    seedCredit(fixture, 20 * 60_000);
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 15_000); // 15s typing burst mid-run
@@ -2045,13 +2048,13 @@ describe('steering composition (human types while the agent runs)', () => {
     const steer = lastSteer(fixture);
     expect(steer!.billedMs).toBe(15_000); // the typing burst
     await vi.advanceTimersByTimeAsync(25_000); // agent keeps working (no typing)
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no idle window opens (engagement-gated)
-    await vi.advanceTimersByTimeAsync(0); // flush the wizard's dismissed promise
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // credit remains → no wizard pop; no idle window opens (engagement-gated)
 
-    // No idle window yet — the human hasn't engaged post-run.
-    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
+    // No NEW idle window yet — the human hasn't engaged post-run (only the seeded, closed one exists).
+    const opensBeforeEngage = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
+    expect(opensBeforeEngage).toHaveLength(1); // the seeded (closed) window; no post-run engagement yet
 
-    fixture.sendEditorKey('k'); // engage the post-run idle window at onset
+    fixture.sendEditorKey('k'); // engage the post-run idle window at onset (cap = remaining credit)
     await vi.advanceTimersByTimeAsync(10_000); // 10s post-run idle
     fixture.run('agent_start', { type: 'agent_start' }); // commit → bills 10s
     const close = fixture.lastSidecarEvent('human-close');
@@ -2060,6 +2063,7 @@ describe('steering composition (human types while the agent runs)', () => {
   });
 
   it('shows in-progress steer typing in /ledger while the run is active', async () => {
+    seedCredit(fixture, 20 * 60_000);
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 30_000); // 30s of sustained typing (not yet submitted)
@@ -2070,6 +2074,7 @@ describe('steering composition (human types while the agent runs)', () => {
   });
 
   it('bills only active typing, not the idle wait before submit (billedMs < durationMs)', async () => {
+    seedCredit(fixture, 20 * 60_000);
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 30_000); // 30s of typing

@@ -4,7 +4,7 @@
  * Bills human + agent time like serverless: metered per-invocation,
  * scale-to-zero idle. Consumes pi-tps's `tps:telemetry` event for
  * per-turn agent timing and tracks tool-execution time itself; meters
- * human idle windows with a grace minute plus pomodoro extensions.
+ * human idle windows against rolling pomodoro extensions.
  *
  * Agent billable time per turn = normalizedGenerationMs + toolExecutionMs,
  * where normalizedGenerationMs = outputTokens / referenceTps × 1000. Generation
@@ -17,8 +17,8 @@
  * Human time = the idle window the human ENGAGES with (first keystroke or
  * extension) after agent_end, committed when their next submit produces agent
  * work (agent_start) — so idle with no engagement, or engagement with no
- * submit, bills nothing (idle with no output is wasted). Capped by a granted
- * budget (grace + rolling extension credit). A non-blocking wizard prompts
+ * submit, bills nothing (idle with no output is wasted). Capped by a
+ * budget (rolling extension credit). A non-blocking wizard prompts
  * engagement (agent_end with no credit, /resume) and offers +pomodoro
  * extensions; `/ledger-extend` does the same manually. Extensions are ROLLING
  * credit — provisioned pomodoro blocks survive across agent turns, so the
@@ -107,7 +107,6 @@ const CURRENCY_SYMBOL: Record<string, string> = {
 const DEFAULT_SETTINGS: LedgerSettings = {
   agentRatePerHour: 60,
   humanRatePerHour: 60,
-  graceMinutes: 1,
   pomodoroMinutes: 20,
   referenceTps: 75,
   project: '',
@@ -121,7 +120,6 @@ const DEFAULT_SETTINGS: LedgerSettings = {
 export interface LedgerSettings {
   agentRatePerHour: number;
   humanRatePerHour: number;
-  graceMinutes: number;
   pomodoroMinutes: number;
   /** Output tokens/sec generation is normalized to (frontier-model average ≈ 75).
    *  Higher → less normalized time → a lower bill for fast models. */
@@ -159,7 +157,7 @@ export interface AgentEvent {
 /** Opens (and re-records, on each wizard extend) a human idle window.
  *  `extensionBudgetMs` is the rolling billable-human-time budget carried INTO
  *  this window (provisioned pomodoro credit that survives across agent turns);
- *  `grantedBudgetMs` is this window's billing cap = grace + `extensionBudgetMs`. */
+ *  `grantedBudgetMs` is this window's billing cap = `extensionBudgetMs` (rolling credit). */
 export interface HumanOpenEvent {
   kind: 'human-open';
   openedAt: number;
@@ -171,7 +169,7 @@ export interface HumanOpenEvent {
    *  "keystroke" on replay. */
   engagedVia?: 'keystroke' | 'extension';
   /** Remaining rolling extension budget at the time of this event. Optional
-   *  on legacy events; backfilled from `grantedBudgetMs` − grace on replay. */
+   *  on legacy events; backfilled from `grantedBudgetMs` on replay. */
   extensionBudgetMs?: number;
   timestamp: number;
 }
@@ -205,7 +203,7 @@ export interface HumanCloseEvent {
 
 /** A steer/followUp the human composed and submitted WHILE the agent was
  *  running (a mid-stream interrupt or a message queued until the agent
- *  finishes). Billed as human time under the same grace + rolling-credit cap
+ *  finishes). Billed as human time under the same rolling-credit cap
  *  as an idle window. The editor hook stages every keystroke during the run;
  *  on submit, the active-typing burst sum (not the wall-clock span) is billed,
  *  so a single key or keys spread minutes apart bill nothing — only sustained
@@ -219,7 +217,7 @@ export interface SteerEvent {
   submittedAt: number;
   /** Wall-clock composition span (submittedAt − startedAt), kept for audit. */
   durationMs: number;
-  /** Billed active-typing time = min(burst sum, grace + rolling credit). May
+  /** Billed active-typing time = min(burst sum, rolling credit). May
    *  be less than `durationMs` — the burst sum excludes idle gaps before and
    *  between typing. */
   billedMs: number;
@@ -228,14 +226,14 @@ export interface SteerEvent {
   /** How the message was delivered: "steer" (mid-stream interrupt) or
    *  "followUp" (queued until the agent finishes). */
   behavior: 'steer' | 'followUp';
-  /** The window's billing cap = grace + rolling extension budget at submit. */
+  /** The window's billing cap = rolling extension budget at submit. */
   grantedBudgetMs: number;
   /** Remaining rolling extension budget after this steer (carried forward). */
   extensionBudgetMs: number;
   timestamp: number;
 }
 
-/** A settings snapshot (rates, grace, project, …). Last one wins on replay. */
+/** A settings snapshot (rates, project, …). Last one wins on replay. */
 export interface SettingsEvent {
   kind: 'settings';
   settings: LedgerSettings;
@@ -287,7 +285,7 @@ interface Totals {
   abandonedWindows: number;
   abandonedMs: number;
   // Extension (provisioned capacity) breakdown: blocks granted, total credit
-  // granted (ms), and credit consumed (billed beyond grace). Remaining =
+  // granted (ms), and credit consumed (billed against it). Remaining =
   // granted − consumed (the live rolling budget).
   extensionsGranted: number;
   extensionCreditMs: number;
@@ -325,7 +323,6 @@ export interface ReceiptData {
   // hours so the group still itemizes as a single line at its hourly rate.
   // The billable sub-items sum to their group total; stallMs/abandonedMs are
   // the UNbilled audit spans shown as $0 lines.
-  graceMinutes?: number;
   agentGenMs?: number;
   agentToolMs?: number;
   stallMs?: number;
@@ -399,28 +396,20 @@ export function computeBurstMs(timestamps: number[], gapMs: number): number {
 
 /** How much of the rolling extension budget a closing window consumes.
  *
- *  The first `graceMs` of every idle window is always billable (per-window,
- *  never rolls). Only the billed time BEYOND grace eats into the rolling
- *  extension credit, capped at what was provisioned. Pure. */
-export function consumeExtensionBudget(
-  billedMs: number,
-  graceMs: number,
-  extensionBudgetMs: number
-): number {
-  return Math.min(Math.max(0, billedMs - graceMs), Math.max(0, extensionBudgetMs));
+ *  Idle bills against rolling extension credit only: all
+ *  billed time eats into the credit, capped at what was provisioned. Pure. */
+export function consumeExtensionBudget(billedMs: number, extensionBudgetMs: number): number {
+  return Math.min(Math.max(0, billedMs), Math.max(0, extensionBudgetMs));
 }
 
 /** Resolve the rolling extension budget recorded on a human event, with a
  *  backfill for legacy sidecar entries that predate the field. Pure.
  *  @internal Exported for testing only. */
-export function resolveExtensionBudget(
-  e: HumanOpenEvent | HumanCloseEvent,
-  graceMs: number
-): number {
+export function resolveExtensionBudget(e: HumanOpenEvent | HumanCloseEvent): number {
   if (typeof e.extensionBudgetMs === 'number') return e.extensionBudgetMs;
-  if (e.kind === 'human-open') return Math.max(0, e.grantedBudgetMs - graceMs);
-  // human-close: remaining = cap − max(billed, grace) (grace is free per window)
-  return Math.max(0, e.grantedBudgetMs - Math.max(e.billedMs, graceMs));
+  if (e.kind === 'human-open') return Math.max(0, e.grantedBudgetMs);
+  // human-close legacy backfill: remaining = cap − billed (credit left after use)
+  return Math.max(0, e.grantedBudgetMs - e.billedMs);
 }
 
 export function computeBilling(
@@ -487,11 +476,6 @@ export function applySettingValue(
     case 'humanRatePerHour': {
       const n = parseNumber(value);
       if (n !== null && n >= 0) next.humanRatePerHour = n;
-      break;
-    }
-    case 'graceMinutes': {
-      const n = parseNumber(value);
-      if (n !== null) next.graceMinutes = Math.max(0, Math.round(n));
       break;
     }
     case 'pomodoroMinutes': {
@@ -573,11 +557,14 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
   // Rolling billable-human-time budget (provisioned pomodoro credit) carried
   // across agent turns. The last human-open/close event in the log holds the
   // current value: an open window records what was carried in (and extended);
-  // a close records what remains after that window's consumption.
+  // a close records what remains after that window's consumption. A rise = a
+  // grant (one block), a fall = a consumption (billed against credit). Mirrors
+  // the live grant/consume calls exactly, so rehydrate reconstructs the same
+  // totals.
   let extensionBudgetMs = 0;
   const closedOpenedAts = new Set<number>();
   // Apply a recorded rolling-budget value: a rise = a credit grant (one
-  // block), a fall = a consumption (billed beyond grace). Mirrors the live
+  // block), a fall = a consumption (billed against credit). Mirrors the live
   // grant/consume calls exactly, so rehydrate reconstructs the same totals.
   function applyBudgetDelta(next: number) {
     if (next > extensionBudgetMs) {
@@ -618,18 +605,14 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
         abandonedWindows += 1;
         abandonedMs += e.idleMs;
       }
-      applyBudgetDelta(
-        resolveExtensionBudget(e, (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE)
-      );
+      applyBudgetDelta(resolveExtensionBudget(e));
     } else if (e.kind === 'human-open') {
-      applyBudgetDelta(
-        resolveExtensionBudget(e, (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE)
-      );
+      applyBudgetDelta(resolveExtensionBudget(e));
     } else if (e.kind === 'steer') {
       // A steer/followUp composed during a run is human time, billed under the
-      // same grace + rolling-credit cap as an idle window. It consumes rolling
-      // credit beyond grace; its `extensionBudgetMs` is the credit remaining
-      // after the steer (carried forward, last wins on replay).
+      // same rolling-credit cap as an idle window. It consumes rolling credit;
+      // its `extensionBudgetMs` is the credit remaining after the steer
+      // (carried forward, last wins on replay).
       humanMs += e.billedMs;
       humanWindows += 1;
       if (e.billedMs > 0) {
@@ -727,16 +710,12 @@ export function extractTpsEntries(
  *
  * Agent time per marker = outputTokens / referenceTps (generation normalized
  * to the reference TPS; tool time is unavailable from pi-tps markers). Human
- * time is estimated from inter-turn gaps — each gap is capped at the grace
- * budget (no wizard ran, so no extensions) — which mirrors the scale-to-zero
- * billing rule. When `nowMs` is given, the trailing idle after the last marker
- * (up to now) is added as a final human window, capped at grace — the
- * in-progress "last idle" minute, for display only (never persisted). @internal */
+ * time is NOT estimated from markers: idle bills only against rolling
+ * extension credit, and markers carry no credit/commit info,
+ * so marker-only sessions bill 0 human time (mirrors scale-to-zero). @internal */
 export function convertTpsEntries(
   tps: TpsMarker[],
-  graceMs: number,
-  referenceTps: number,
-  nowMs?: number
+  referenceTps: number
 ): {
   agentMs: number;
   agentTurns: number;
@@ -769,12 +748,11 @@ export function convertTpsEntries(
 } {
   let agentMs = 0;
   const agentTokens = { input: 0, output: 0, total: 0 };
-  let humanMs = 0;
-  let humanWindows = 0;
+  const humanMs = 0;
+  const humanWindows = 0;
   let stallMs = 0;
   let stalledTurns = 0;
-  for (let i = 0; i < tps.length; i++) {
-    const e = tps[i]!;
+  for (const e of tps) {
     agentMs += computeAgentMs(e.tokens.output || 0, 0, referenceTps);
     agentTokens.input += e.tokens.input || 0;
     agentTokens.output += e.tokens.output || 0;
@@ -782,26 +760,6 @@ export function convertTpsEntries(
     const sm = e.timing.stallMs || 0;
     stallMs += sm;
     if (sm > 0) stalledTurns += 1;
-    if (i + 1 < tps.length) {
-      const next = tps[i + 1]!;
-      // next turn started ~ next.timestamp − next.totalMs; idle = that − this turn's end
-      const turnStartNext = (next.timestamp || 0) - (next.timing.totalMs || 0);
-      const gap = turnStartNext - (e.timestamp || 0);
-      if (gap > 0) {
-        humanMs += Math.min(gap, graceMs);
-        humanWindows += 1;
-      }
-    }
-  }
-  // Trailing idle after the last turn, up to `nowMs` (the in-progress "last
-  // idle" minute). Display-only; only added when nowMs is provided.
-  if (nowMs != null && tps.length > 0) {
-    const last = tps[tps.length - 1]!;
-    const trailing = Math.max(0, nowMs - (last.timestamp || 0));
-    if (trailing > 0) {
-      humanMs += Math.min(trailing, graceMs);
-      humanWindows += 1;
-    }
   }
   return {
     agentMs,
@@ -815,7 +773,7 @@ export function convertTpsEntries(
     stallMs,
     toolTurns: 0,
     stalledTurns,
-    humanIdleMs: humanMs, // estimated inter-turn idle (no steering from markers)
+    humanIdleMs: humanMs, // markers carry no credit/commit info → 0 human
     humanSteerMs: 0,
     humanQueueMs: 0,
     idleWindows: humanWindows,
@@ -892,7 +850,6 @@ export function buildReceiptHtml(d: ReceiptData): string {
   const extensionCreditMs = d.extensionCreditMs ?? 0;
   const extensionConsumedMs = d.extensionConsumedMs ?? 0;
   const remainingMs = extensionCreditMs - extensionConsumedMs;
-  const graceMin = d.graceMinutes ?? 0;
 
   const agentSubtotalMs = agentGenMs + agentToolMs;
   const humanSubtotalMs = humanIdleMs + humanSteerMs + humanQueueMs;
@@ -929,8 +886,7 @@ export function buildReceiptHtml(d: ReceiptData): string {
   rows.push(
     item(
       'Review / think',
-      `${idleWindows} windows · ${idleKeystrokes} keystrokes` +
-        (graceMin ? ` · grace ${graceMin}m/win` : ''),
+      `${idleWindows} windows · ${idleKeystrokes} keystrokes`,
       humanIdleMs,
       d.humanRate
     )
@@ -1135,8 +1091,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   let currentTurnIndex = 0;
 
   // Current human idle window (null while the agent is working). Its
-  // `grantedBudgetMs` is this window's billing cap = grace + the rolling
-  // extension budget carried into it.
+  // `grantedBudgetMs` is this window's billing cap = the rolling extension
+  // budget carried into it.
   let humanWindow: {
     openedAt: number;
     grantedBudgetMs: number;
@@ -1146,9 +1102,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // Rolling billable-human-time budget: provisioned pomodoro credit that
   // survives across agent turns (the serverless "provisioned capacity"
-  // analogy). The first grace minute of every idle window is always billable
-  // and never rolls; only time beyond grace consumes this budget. The wizard
-  // is suppressed at `agent_end` while this is > 0, and re-arms to fire when
+  // analogy). All billed idle/steering time consumes this budget (no free
+  // minute); the leftover rolls forward. The wizard is suppressed at
+  // `agent_end` while this is > 0, and re-arms to fire when
   // it's exhausted.
   let extensionBudgetMs = 0;
 
@@ -1299,10 +1255,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     } else if (agentRunning && steerStaging.length > 0) {
       // In-progress steer/followUp composition during the run — no idle window
       // is open while the agent works, so show the typing-burst sum so far
-      // (capped at grace + current rolling credit) like an open human window,
+      // (capped at current rolling credit) like an open human window,
       // until it's submitted (then it's recorded as a `steer` event). Shows
       // active typing only, so idle gaps during composition don't accrue.
-      const cap = settings.graceMinutes * MS_PER_MINUTE + extensionBudgetMs;
+      const cap = extensionBudgetMs;
       openSteerMs = Math.min(computeBurstMs(steerStaging, STEER_GAP_MS), cap);
       openSteerCount = 1;
       openSteerKeystrokes = steerStaging.length;
@@ -1317,12 +1273,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         tps = [];
       }
       if (tps.length > 0) {
-        const c = convertTpsEntries(
-          tps,
-          settings.graceMinutes * MS_PER_MINUTE,
-          settings.referenceTps,
-          now
-        );
+        const c = convertTpsEntries(tps, settings.referenceTps);
         return { ...c };
       }
     }
@@ -1356,7 +1307,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     humanWindow = null;
     if (!w) return;
     const closedAt = Date.now();
-    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
     // An idle window bills only when the human's submit produces agent work
     // (a prompt at `agent_start` = `committed`). Abandoned idle — the session
     // ended with no submit — bills nothing: idle time with no output is wasted.
@@ -1366,9 +1316,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       const r = closeWindowBudget(w.openedAt, closedAt, w.grantedBudgetMs);
       idleMs = r.idleMs;
       billedMs = r.billedMs;
-      // Only billed time beyond the per-window grace consumes the rolling
-      // extension budget; the leftover rolls forward to the next idle window.
-      const consumed = consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
+      // All billed idle consumes the rolling extension credit;
+      // the leftover rolls forward to the next idle window.
+      const consumed = consumeExtensionBudget(billedMs, extensionBudgetMs);
       extensionBudgetMs -= consumed;
       totals.humanIdleMs += billedMs;
       totals.idleWindows += 1;
@@ -1408,10 +1358,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *  which both grant capacity and engage). No engagement → no window → no bill:
    *  pure idle (no typing, no extension) until the end bills nothing. The
    *  window bills wall-clock from this onset (capturing thinking, not just
-   *  keystrokes), capped at `grace + credit`, but ONLY when committed by a
-   *  submitted prompt at `agent_start` — abandoned idle bills 0. `engagedVia`
-   *  records how the human signaled presence (audit). `extendMs` provisions a
-   *  pomodoro block on open (the engagement-via-extension case). */
+   *  keystrokes), capped at `extensionBudgetMs` (rolling credit), but ONLY when
+   *  committed by a submitted prompt at `agent_start` — abandoned idle bills 0.
+   *  `engagedVia` records how the human signaled presence (audit). `extendMs`
+   *  provisions a pomodoro block on open (the engagement-via-extension case). */
   function openIdleWindow(
     ctx: ExtensionContext,
     engagedVia: 'keystroke' | 'extension',
@@ -1419,13 +1369,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   ) {
     if (humanWindow) return; // safety: never open a second window
     idleKeystrokes = 0; // reset the composition-density count for the new window
-    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
     if (extendMs > 0) {
       extensionBudgetMs += extendMs;
       totals.extensionCreditMs += extendMs; // provisioned capacity (one block)
       totals.extensionsGranted += 1;
     }
-    const cap = graceMs + extensionBudgetMs;
+    const cap = extensionBudgetMs;
     const openedAt = Date.now();
     humanWindow = {
       openedAt,
@@ -1452,7 +1401,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // Steering composition: the human types a steer/followUp while the agent
   // runs. The editor hook (`noteKeystroke`) stages every keystroke; the
   // `input` event commits it on submit. Billed as the active-typing burst sum
-  // (not wall-clock) under the same grace + rolling-credit cap as an idle
+  // (not wall-clock) under the same rolling-credit cap as an idle
   // window — a single key or keys spread minutes apart bill nothing, so typing
   // is only billed when it's actually queued/steered to the agent.
   function noteKeystroke(data: string) {
@@ -1480,8 +1429,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   function recordSteer(ctx: ExtensionContext, behavior: 'steer' | 'followUp') {
     const submittedAt = Date.now();
-    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
-    const cap = graceMs + extensionBudgetMs;
+    const cap = extensionBudgetMs;
     // Bill active typing (burst sum), not the wall-clock span from the first
     // keystroke — so idle gaps before/between typing don't accrue, and a single
     // keystroke can't open a billable window.
@@ -1493,9 +1441,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     steerStaging = [];
     lastKey = null; // reset held-key tracking so the next burst starts fresh
     lastKeyTime = 0;
-    // Only billed time beyond the per-window grace consumes rolling credit;
-    // the leftover rolls forward (same rule as an idle window).
-    const consumed = consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
+    // All billed typing consumes rolling credit; the leftover
+    // rolls forward (same rule as an idle window).
+    const consumed = consumeExtensionBudget(billedMs, extensionBudgetMs);
     extensionBudgetMs -= consumed;
     totals.extensionConsumedMs += consumed;
     appendSidecar({
@@ -1542,6 +1490,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   function armWizardForBoundary(ctx: ExtensionContext) {
     clearWizardTimer();
     if (!humanWindow || !settings.autoWizard || !ctx.hasUI || ctx.mode !== 'tui') return;
+    // No credit provisioned → nothing to exhaust; the agent_end / resume prompt
+    // already offered engagement, so don't re-pop on the first keystroke (that
+    // would intercept typing). Only arm the exhaustion pop when there's credit.
+    if (humanWindow.grantedBudgetMs <= 0) return;
     const elapsed = Date.now() - humanWindow.openedAt;
     const delay = humanWindow.grantedBudgetMs - elapsed;
     if (delay <= 0) {
@@ -1568,10 +1520,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // Snapshot the rolling credit still provisioned (and unconsumed so far) so
     // the user knows extending ADDS to existing capacity, not replaces it.
     // Captured before the async custom() closure — state can change.
-    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
     const elapsedNow = humanWindow ? Math.max(0, Date.now() - humanWindow.openedAt) : 0;
     const remainingProvisioned = humanWindow
-      ? Math.max(0, extensionBudgetMs - Math.max(0, elapsedNow - graceMs))
+      ? Math.max(0, extensionBudgetMs - elapsedNow)
       : extensionBudgetMs;
 
     ctx.ui
@@ -1965,7 +1916,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     lastKey = null;
     lastKeyTime = 0;
     // A submitted prompt is the agent action that COMMITS the idle window —
-    // its idle (from the engagement onset) bills now, capped at grace + credit.
+    // its idle (from the engagement onset) bills now, capped at credit.
     // If the human never engaged (no keystroke, no extension), there's no
     // window to close and the turn handoff bills nothing.
     closeHumanWindow(ctx, true);
@@ -2077,7 +2028,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   pi.registerCommand('ledger-settings', {
     description:
-      'Configure billing: agent $/h, human $/h, grace minutes, pomodoro minutes, project, author, currency, auto-wizard.',
+      'Configure billing: agent $/h, human $/h, pomodoro minutes, project, author, currency, auto-wizard.',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       if (ctx.mode !== 'tui') {
         ctx.ui.notify('/ledger-settings requires TUI mode', 'error');
@@ -2169,7 +2120,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         generatedAt: Date.now(),
         // Itemized sub-totals (computeDisplayTotals spreads the live cache +
         // the in-progress window/steer; remaining credit = granted − consumed).
-        graceMinutes: settings.graceMinutes,
         agentGenMs: t.agentGenMs,
         agentToolMs: t.agentToolMs,
         stallMs: t.stallMs,
@@ -2228,13 +2178,6 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         submenu: numberSubmenu(theme, 'Human $/hour'),
       },
       {
-        id: 'graceMinutes',
-        label: 'Grace minutes',
-        currentValue: String(settings.graceMinutes),
-        description: 'First N minutes of idle billed before the wizard offers an extension',
-        submenu: numberSubmenu(theme, 'Grace minutes'),
-      },
-      {
         id: 'pomodoroMinutes',
         label: 'Pomodoro minutes',
         currentValue: String(settings.pomodoroMinutes),
@@ -2273,7 +2216,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         id: 'autoWizard',
         label: 'Auto-wizard',
         currentValue: settings.autoWizard ? 'on' : 'off',
-        description: 'Auto-popup at the end of the grace minute',
+        description: 'Auto-popup to prompt extending when billable credit runs out',
         values: ['on', 'off'],
       },
     ];

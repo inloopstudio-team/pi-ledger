@@ -26,26 +26,26 @@ runs on on-demand agents and bills the way serverless compute is billed:
 | Usage report / invoice | `/ledger-receipt` — an invoice-grade HTML receipt                  |
 
 The agent is the on-demand function; each turn is an invocation billed by
+
 duration, with stalls excluded (a slow or queued provider is a retry, not
 billable time). Human oversight — review, steering, the next prompt — is
-metered separately, like managed capacity, with a free grace tier and opt-in
-pomodoro extensions. Even the time spent writing the first prompt is metered:
-an initial window opens on your **first keystroke** and commits when you send
-the prompt (it produces agent work), billed under the same grace minute. So
-is steering: a steer or queued followUp you compose while the agent runs is
-metered by its typing bursts — and only when actually queued/steered to the
-agent — under the same cap. Idle costs nothing by default: an idle window
-opens only when you **engage** it (first keystroke or extension) after
-`agent_end`, and bills only when your next submit produces agent work
-(`agent_start`) — so pure idle, or idle you walk away from, bills nothing. The
-first grace minute of an engaged window is billable (per-window, never rolls);
-beyond that a wizard pops at `agent_end` (inline, pi-core settings style) and
-on `/resume` to offer pomodoro-style blocks.
-Extensions are **rolling credit** — provisioned pomodoro blocks survive across
-agent turns (like provisioned capacity) and are themselves an engagement
-signal, so the wizard stays silent while credit remains and only re-pops
-when it's exhausted. `/ledger-receipt` then
-emits the invoice — the cloud-provider usage report, for your own work.
+metered separately, like managed capacity: you **provision** billable human
+time via opt-in pomodoro extensions (rolling credit), and idle/steering bill
+against it. Even the time spent writing the first prompt is metered: an initial
+window opens on your **first keystroke** and commits when you send the prompt
+(it produces agent work), billed against your credit. So is steering: a steer
+or queued followUp you compose while the agent runs is metered by its typing
+bursts — and only when actually queued/steered to the agent — under the same
+cap. Idle costs nothing by default: an idle window opens only when you
+**engage** it (first keystroke or extension) after `agent_end`, and bills only
+when your next submit produces agent work (`agent_start`) — so pure idle, or
+idle you walk away from, bills nothing. A wizard pops at `agent_end` (inline,
+pi-core settings style) and on `/resume` to offer pomodoro-style blocks when no
+rolling credit remains. Extensions are **rolling credit** — provisioned pomodoro blocks
+survive across agent turns (like provisioned capacity) and are themselves an
+engagement signal, so the wizard stays silent while credit remains and only
+re-pops when it's exhausted. `/ledger-receipt` then emits the invoice — the
+cloud-provider usage report, for your own work.
 
 > **Standalone, but pi-tps-aware.** pi-ledger works on its own — it measures
 > agent time itself when [`@monotykamary/pi-tps`](https://github.com/monotykamary/pi-tps)
@@ -72,15 +72,15 @@ Didn't run a full pi-ledger session? `/ledger-receipt` also works on a session
 that only has pi-tps markers (e.g. resume an older pi-tps session, set rates
 with `/ledger-settings`, then `/ledger-receipt`). With no live ledger data it
 converts the `tps` entries into the receipt — lower fidelity (no tool time;
-human time estimated from inter-turn gaps plus the trailing idle up to now,
-capped at the grace budget) but enough to demo the output.
+no human time — markers carry no credit/commit info, so only agent time is
+billed) but enough to demo the output.
 
 ## Commands
 
 | Command              | What it does                                                                                                                                                |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/ledger`            | Show running totals: agent/human hours, costs, total.                                                                                                       |
-| `/ledger-settings`   | Bordered, searchable settings TUI (rates, grace, pomodoro, project, author, currency, auto-wizard).                                                         |
+| `/ledger-settings`   | Bordered, searchable settings TUI (rates, pomodoro, project, author, currency, auto-wizard).                                                                |
 | `/ledger-extend [m]` | Open the human-time wizard to extend the window by `m` minutes (default: pomodoro length); confirm or stop in the dialog. Engages a window if none is open. |
 | `/ledger-receipt`    | Export a self-contained HTML receipt for the session and open it.                                                                                           |
 
@@ -117,21 +117,21 @@ agent_cost        = agent_hours × agent_rate_per_hour
   for the same turn, and rehydration keeps the last per turn (no double-count).
 
 **Human time** is the idle window between when the agent hands control back
-(`agent_end`) and when the user takes it again (`agent_start`), capped by a
-granted budget. A turn that ends in a **provider error** (`stopReason` `error`)
+(`agent_end`) and when the user takes it again (`agent_start`), capped by the
+rolling extension credit you've provisioned. A turn that ends in a **provider error** (`stopReason` `error`)
 does **not** open a window — that's a retry/queue in flight (a retry extension
 sleeps with backoff then re-prompts, or pi-core compacts an overflow and
 retries), not a human handoff, so the backoff wait is never billed as human
 time (scale-to-zero: a slow/queued provider is a retry, not billable). The
 window reopens at the next non-error `agent_end`. The **first prompt** is
-special — nothing precedes it — so an **initial window** opens at
-`session_start` and closes at the first
+special — nothing precedes it — so an **initial window** opens on your
+**first keystroke** (not at `session_start`) and closes at the first
 `agent_start`, metering the time you spend composing (or reviewing a resumed
 session before your next prompt) under the same cap:
 
 ```
 billed_human  = min(engaged_idle, granted_budget)   # only when committed at agent_start
-granted_budget = grace_minutes + remaining_extension_credit
+granted_budget = remaining_extension_credit
 ```
 
 **Steering while the agent runs** is also human time. A thin input-editor
@@ -140,7 +140,7 @@ followUp (the `input` event's `streamingBehavior`), the composition is billed
 as the sum of its **typing bursts** — consecutive keystrokes within a gap
 threshold — not the wall-clock from the first keystroke. A single key, or keys
 spread minutes apart, bills nothing; only sustained typing that's actually
-queued/steered to the agent bills, under the same `grace + credit` cap as any
+queued/steered to the agent bills, under the same credit cap as any
 window. (This closes an earlier gap: only typing _between_ turns was metered,
 so composing a steer _during_ a run was unmetered.) Typing never submitted never
 reached the agent, so it's discarded — it bills nothing and can't inflate the
@@ -150,36 +150,37 @@ post-turn idle window.
 window opens only when you **engage** — the first keystroke you type, or the
 first extension (the wizard's extend / `/ledger-extend`, which both grant
 capacity and count as engagement). It bills **wall-clock from that onset**
-(capturing thinking, not just keystrokes), capped at `grace + credit` — but
+(capturing thinking, not just keystrokes), capped at your rolling credit — but
 only when your next submit produces agent work (`agent_start` commits it). Pure
 idle (no keystroke, no extension) opens no window and bills nothing; idle you
 walk away from (no submit) is abandoned at `session_shutdown` and bills 0.
 Idle with no output is wasted time.
 
-- The first **grace minute** (configurable) of an engaged window is billable —
-  per-window, it never rolls. (No engagement → no grace billing at all.)
+- Engaged idle bills against your rolling credit
+  only. No engagement → no window → no bill; no credit → bills 0 even when
+  committed (the wizard prompts you to extend first).
 - The **initial window** opens on your **first keystroke** (not at
   `session_start`) and commits at the first `agent_start`, metering first-prompt
-  composition under the same `grace + credit` cap. Review time _before_ the
+  composition under the same credit cap. Review time _before_ the
   first keystroke has no signal and bills nothing — so on `/resume` the wizard
   pops to let you extend (engaging) and bill that review.
 - Extensions are **rolling credit**: `remaining_extension_credit` is the
-  provisioned pomodoro balance carried across agent turns. Only billed time
-  **beyond** grace consumes it; the remainder rolls forward to the next idle
+  provisioned pomodoro balance carried across agent turns. All billed idle and
+  steering time consumes it; the remainder rolls forward to the next idle
   window (like provisioned capacity).
 - **At `agent_end`**, a **wizard** pops inline (the same pi-core settings style
   as `/ledger-settings`, so the status bar stays visible) **only when no
   rolling credit remains** — to prompt engagement (an extension both engages and
   grants capacity). With credit, it stays silent and arms to fire when the
-  engaged window's budget is exhausted; the exhaustion pop offers the next
+  engaged window's credit is exhausted; the exhaustion pop offers the next
   extension (the `extend + extend + extend` chain).
 - `/ledger-extend [m]` opens the wizard manually — with or without an open
   window (no window → extend engages one) — offering to extend by `m` minutes;
   confirm in the dialog, or stop.
 - The status bar and receipt total the **entire session up to now** — they
-  include the in-progress engaged window's idle (capped at its granted
-  budget) and, for a pi-tps-only session, the trailing idle after the last
-  marker. Unlike pi-tps (per-turn), this is the full session so far.
+  include the in-progress engaged window's idle (capped at its remaining
+  credit) and, for a pi-tps-only session, no human time (markers carry no
+  credit/commit info). Unlike pi-tps (per-turn), this is the full session so far.
 
 Because billing is `min(engaged_idle, budget)` and only commits on an agent
 action, the time you spend _deciding_ in the wizard is unbilled if you decline
@@ -198,7 +199,6 @@ and rehydrate on resume and `/tree` navigation.
 | ---------------- | -------- | ----------------------------------------------------------- |
 | Agent rate       | `60`     | $/hour billed for agent work                                |
 | Human rate       | `60`     | $/hour billed for human work                                |
-| Grace minutes    | `1`      | Engaged-idle minutes billed by default if not extended      |
 | Pomodoro minutes | `20`     | Minutes added per extension                                 |
 | Reference TPS    | `75`     | Output tokens/sec to normalize generation to (frontier avg) |
 | Project          | _(cwd)_  | Shown on the receipt; falls back to the cwd name            |
@@ -241,9 +241,9 @@ entries) and accumulates across **all branches** of the session. Events:
 
 - `settings` — a settings snapshot (last one wins on replay).
 - `agent` — one per turn: `{ id, turnIndex, agentMs, generationMs, stallMs, toolMs, tokens, model, source, supersedes?, timestamp }`. `agentMs` is the billable time (generation normalized to the reference TPS + tool time); `generationMs`/`stallMs` are the real wall-clock (audit). A `'tps'` turn may `supersede` an earlier `'fallback'` for the same turn (load-order race) so it isn't double-counted.
-- `human-open` — on **engagement** (the first keystroke you type after a turn, or the first extension — both open the window), and re-recorded on each wizard extend: `{ openedAt, engagedVia, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. `openedAt` is the engagement onset; `engagedVia` is `"keystroke"` or `"extension"` (audit); `grantedBudgetMs` is the window's cap = `grace + extensionBudgetMs`; `extensionBudgetMs` is the rolling credit carried into the window. No `human-open` is written at `session_start` or `agent_end` — the window is engagement-gated.
-- `human-close` — on the next `agent_start` (**committed** = your submit produced agent work) **or on `session_shutdown`** (**abandoned** = you left without submitting): `{ openedAt, closedAt, billedMs, idleMs, keystrokes, committed, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. Committed bills `min([onset, agent_start], grace + credit)`; abandoned bills 0 (idle with no output is wasted). `keystrokes` is the composition-density count while the window was open (after held-key collapse; idle bills wall-clock, so it's analytics, not a billing input). `committed` defaults to `true` on legacy events. Its `extensionBudgetMs` is the rolling credit remaining after this window's consumption (carried forward). Legacy events lacking `extensionBudgetMs` are backfilled on replay.
-- `steer` — a steer/followUp composed while the agent ran (editor keystrokes → `input` submit): `{ startedAt, submittedAt, durationMs, billedMs, keystrokes, behavior, grantedBudgetMs, extensionBudgetMs, timestamp }`. `billedMs` is `min` of the typing-burst sum and `grace + credit` (not the wall-clock span — `durationMs` is the span, kept for audit); `keystrokes` is the staged count; `behavior` is `"steer"` (mid-stream interrupt) or `"followUp"` (queued). Billed as human time, consuming rolling credit beyond grace (same rule as an idle window).
+- `human-open` — on **engagement** (the first keystroke you type after a turn, or the first extension — both open the window), and re-recorded on each wizard extend: `{ openedAt, engagedVia, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. `openedAt` is the engagement onset; `engagedVia` is `"keystroke"` or `"extension"` (audit); `grantedBudgetMs` is the window's cap = `extensionBudgetMs` (the rolling credit carried into the window). No `human-open` is written at `session_start` or `agent_end` — the window is engagement-gated.
+- `human-close` — on the next `agent_start` (**committed** = your submit produced agent work) **or on `session_shutdown`** (**abandoned** = you left without submitting): `{ openedAt, closedAt, billedMs, idleMs, keystrokes, committed, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. Committed bills `min([onset, agent_start], credit)`; abandoned bills 0 (idle with no output is wasted). `keystrokes` is the composition-density count while the window was open (after held-key collapse; idle bills wall-clock, so it's analytics, not a billing input). `committed` defaults to `true` on legacy events. Its `extensionBudgetMs` is the rolling credit remaining after this window's consumption (carried forward). Legacy events lacking `extensionBudgetMs` are backfilled on replay.
+- `steer` — a steer/followUp composed while the agent ran (editor keystrokes → `input` submit): `{ startedAt, submittedAt, durationMs, billedMs, keystrokes, behavior, grantedBudgetMs, extensionBudgetMs, timestamp }`. `billedMs` is `min` of the typing-burst sum and `credit` (not the wall-clock span — `durationMs` is the span, kept for audit); `keystrokes` is the staged count; `behavior` is `"steer"` (mid-stream interrupt) or `"followUp"` (queued). Billed as human time, consuming rolling credit (same rule as an idle window).
 
 On `session_start` (fresh load/reload), pi-ledger replays the sidecar to rebuild
 totals, settings, and the rolling extension credit. An unclosed window from a
@@ -287,15 +287,15 @@ agent_end             → discard any uncommitted in-run typing (a steer never
                           backoff, or pi-core's compaction-retry — not human
                           idle; nothing bills during the retry)
 engage (idle)         → first keystroke OR first extension opens the idle
-                        window at onset (grace + rolling credit); an extension
+                        window at onset (rolling credit); an extension
                         also grants capacity. Arms the wizard for exhaustion.
 agent_start           → COMMIT the engaged window: billed =
-                        min([onset, agent_start], grace + credit), committed;
-                        consume credit = max(0, billed − grace) (rolls the rest).
+                        min([onset, agent_start], credit), committed;
+                        consume credit = billed (rolls the rest).
                         No engagement → no window → bills nothing.
 input (steer/followUp)→ commit staged keystrokes as a `steer` event: billed =
-                        the typing-burst sum (not wall-clock), capped at grace +
-                        credit; consume credit beyond grace. Interactive sources
+                        the typing-burst sum (not wall-clock), capped at
+                        credit; consume credit. Interactive sources
                         only; pass-through (never transform the input). An
                         uncommitted buffer is discarded at agent_end — typing
                         never queued/steered bills nothing. Held keys
@@ -316,10 +316,9 @@ remains (and on `/resume`, to prompt engagement for review), and is disarmed on
 the next `agent_start` or `session_shutdown`. No window opens at `session_start`
 or `agent_end` — an idle window opens only on engagement (first keystroke or
 extension) and bills only when committed by a submitted prompt at `agent_start`;
-abandoned idle (shutdown without a submit) bills 0. The first grace minute of
-an engaged window is billable and never rolls; only billed time beyond grace
-consumes the rolling extension credit, whose remainder carries forward to the
-next idle window. State is **stateless**: everything is
+abandoned idle (shutdown without a submit) bills 0. All billed idle and
+steering time consumes the rolling extension credit; the
+remainder carries forward to the next idle window. State is **stateless**: everything is
 rebuilt from the per-session sidecar on `session_start` (fresh load/reload);
 `/tree` keeps the live in-memory totals (branching stays in the same session,
 so the status never resets to $0). A `'tps'`
@@ -332,7 +331,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (114 tests)
+pnpm test            # vitest run (113 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```
