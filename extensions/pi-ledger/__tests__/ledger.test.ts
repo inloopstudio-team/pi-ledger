@@ -14,6 +14,7 @@ import {
   buildReceiptHtml,
   closeWindowBudget,
   computeAgentMs,
+  computeBurstMs,
   computeBilling,
   consumeExtensionBudget,
   convertTpsEntries,
@@ -1419,6 +1420,39 @@ function steerInput(behavior: 'steer' | 'followUp', source = 'interactive', text
   return { type: 'input' as const, text, source, streamingBehavior: behavior };
 }
 
+/** Type a sustained burst: keys at `gapMs` intervals spanning ~`durationMs`, so
+ *  they cluster into one typing burst (gaps under STEER_GAP_MS). A single key,
+ *  or keys spread minutes apart, bill nothing — only a burst like this bills. */
+async function typeBurst(fixture: TestFixture, durationMs: number, gapMs = 1000) {
+  const steps = Math.round(durationMs / gapMs);
+  for (let i = 0; i <= steps; i++) {
+    fixture.sendEditorKey('k');
+    if (i < steps) await vi.advanceTimersByTimeAsync(gapMs);
+  }
+}
+
+describe('computeBurstMs', () => {
+  it('returns 0 for no keystrokes', () => {
+    expect(computeBurstMs([], 3000)).toBe(0);
+  });
+  it('a single keystroke is a zero-length burst (bills nothing)', () => {
+    expect(computeBurstMs([1000], 3000)).toBe(0);
+  });
+  it('sums one continuous burst as last − first', () => {
+    expect(computeBurstMs([1000, 2000, 3000, 4000], 3000)).toBe(3000);
+  });
+  it('splits at gaps over the threshold and sums each burst', () => {
+    // [1000..3000] = 2000, 5000 gap, [8000..9000] = 1000 → 3000
+    expect(computeBurstMs([1000, 2000, 3000, 8000, 9000], 3000)).toBe(3000);
+  });
+  it('isolated keystrokes (gaps over the threshold) bill nothing', () => {
+    expect(computeBurstMs([0, 60_000, 120_000, 180_000], 3000)).toBe(0);
+  });
+  it('clamps a descending/non-positive sum to 0', () => {
+    expect(computeBurstMs([5000, 1000], 3000)).toBe(0);
+  });
+});
+
 describe('steering composition (human types while the agent runs)', () => {
   let fixture: TestFixture;
   let cacheDir: string;
@@ -1451,14 +1485,14 @@ describe('steering composition (human types while the agent runs)', () => {
   it('bills a steer composed during the run under the grace minute', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' }); // run begins; closes the initial window
-    fixture.sendEditorKey('h'); // composition onset (first keystroke during the run)
-    await vi.advanceTimersByTimeAsync(30_000); // 30s composing mid-stream
+    await typeBurst(fixture, 30_000); // 30s of sustained typing mid-stream
     fixture.run('input', steerInput('steer'));
 
     const steer = lastSteer(fixture);
     expect(steer).toBeDefined();
-    expect(steer!.billedMs).toBe(30_000); // under 1m grace → billed in full
-    expect(steer!.durationMs).toBe(30_000);
+    expect(steer!.billedMs).toBe(30_000); // active-typing burst, under 1m grace → billed in full
+    expect(steer!.durationMs).toBe(30_000); // wall-clock span == burst (no idle gap)
+    expect(steer!.keystrokes).toBe(31); // 30s at 1s intervals = 31 keys
     expect(steer!.behavior).toBe('steer');
     expect(steer!.grantedBudgetMs).toBe(60_000); // grace 1m, no credit
     expect(steer!.extensionBudgetMs).toBe(0);
@@ -1490,8 +1524,7 @@ describe('steering composition (human types while the agent runs)', () => {
     ]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     fixture.run('agent_start', { type: 'agent_start' }); // close the initial window; start the run
-    fixture.sendEditorKey('h');
-    await vi.advanceTimersByTimeAsync(3 * 60_000); // 3m composing
+    await typeBurst(fixture, 3 * 60_000); // 3m of sustained typing
     fixture.run('input', steerInput('steer'));
 
     const steer = lastSteer(fixture);
@@ -1503,8 +1536,7 @@ describe('steering composition (human types while the agent runs)', () => {
   it('bills a queued followUp the same as a mid-stream steer', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
-    fixture.sendEditorKey('h');
-    await vi.advanceTimersByTimeAsync(45_000); // 45s composing
+    await typeBurst(fixture, 45_000); // 45s of sustained typing
     fixture.run('input', steerInput('followUp'));
 
     const steer = lastSteer(fixture);
@@ -1515,8 +1547,7 @@ describe('steering composition (human types while the agent runs)', () => {
   it('ignores steers from non-interactive sources (extension/rpc injected)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
-    fixture.sendEditorKey('h');
-    await vi.advanceTimersByTimeAsync(30_000);
+    await typeBurst(fixture, 30_000);
     fixture.run('input', steerInput('steer', 'extension'));
     expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
   });
@@ -1539,14 +1570,12 @@ describe('steering composition (human types while the agent runs)', () => {
     expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
   });
 
-  it('records multiple steers in one run, each with its own onset', async () => {
+  it('records multiple steers in one run, each from its own typing burst', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
-    fixture.sendEditorKey('a');
-    await vi.advanceTimersByTimeAsync(10_000);
+    await typeBurst(fixture, 10_000);
     fixture.run('input', steerInput('steer', 'interactive', 'a'));
-    fixture.sendEditorKey('b'); // new onset
-    await vi.advanceTimersByTimeAsync(20_000);
+    await typeBurst(fixture, 20_000); // a new burst after the first steer cleared staging
     fixture.run('input', steerInput('steer', 'interactive', 'b'));
 
     const steers = fixture.readSidecarEvents().filter((e) => e.kind === 'steer') as SteerEvent[];
@@ -1555,24 +1584,25 @@ describe('steering composition (human types while the agent runs)', () => {
     expect(steers[1]!.billedMs).toBe(20_000);
   });
 
-  it('carries an unsubmitted in-run composition into the post-turn idle window (backdated onset)', async () => {
+  it('discards an unsubmitted in-run composition (no backdate — it never reached the agent)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
-    fixture.sendEditorKey('h'); // onset during the run
-    const onset = Date.now();
-    await vi.advanceTimersByTimeAsync(20_000); // 20s into the run, still composing
+    const firstKey = Date.now();
+    await typeBurst(fixture, 20_000); // 20s of typing mid-run, NOT submitted
+    const agentEnd = Date.now(); // == the moment agent_end opens the idle window
     // the agent finishes before the human submits — no `input` fires mid-stream
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // idle window backdated to onset
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // idle window opens FRESH
     await vi.advanceTimersByTimeAsync(0); // flush the wizard's resolved promise
 
     const open = fixture.lastSidecarEvent('human-open') as { openedAt: number } | undefined;
     expect(open).toBeDefined();
-    expect(open!.openedAt).toBe(onset);
-    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // not submitted mid-stream
+    expect(open!.openedAt).toBe(agentEnd); // fresh at agent_end, NOT backdated to the first key
+    expect(open!.openedAt).not.toBe(firstKey);
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // unsubmitted typing is discarded
 
-    await vi.advanceTimersByTimeAsync(10_000); // 10s more → 30s since onset
+    await vi.advanceTimersByTimeAsync(10_000); // 10s of post-run idle
     fixture.run('input', { type: 'input', text: 'h', source: 'interactive' }); // idle prompt
-    fixture.run('agent_start', { type: 'agent_start' }); // closes the window
+    fixture.run('agent_start', { type: 'agent_start' }); // closes the idle window
 
     const close = fixture.lastSidecarEvent('human-close') as
       | {
@@ -1582,39 +1612,73 @@ describe('steering composition (human types while the agent runs)', () => {
         }
       | undefined;
     expect(close).toBeDefined();
-    expect(close!.openedAt).toBe(onset);
-    expect(close!.idleMs).toBe(30_000); // onset → agent_start = 30s
-    expect(close!.billedMs).toBe(30_000); // under the 1m grace
+    expect(close!.openedAt).toBe(agentEnd); // the idle window, not the discarded typing
+    expect(close!.idleMs).toBe(10_000); // only the 10s post-run idle — the 20s mid-run typing is unbilled
+    expect(close!.billedMs).toBe(10_000);
   });
 
-  it('opens a fresh idle window (not backdated) when the steer was submitted mid-run', async () => {
+  it('bills a submitted steer from its burst; the post-turn idle window bills only post-run idle', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
-    fixture.sendEditorKey('h');
-    const onset = Date.now();
-    await vi.advanceTimersByTimeAsync(15_000); // 15s composing
-    fixture.run('input', steerInput('steer')); // submitted mid-run → recorded, onset reset
-    expect(lastSteer(fixture)!.startedAt).toBe(onset);
-    const afterSubmit = Date.now();
-    await vi.advanceTimersByTimeAsync(25_000); // agent keeps working
+    await typeBurst(fixture, 15_000); // 15s typing burst mid-run
+    fixture.run('input', steerInput('steer')); // submitted mid-run → recorded
+    const steer = lastSteer(fixture);
+    expect(steer!.billedMs).toBe(15_000); // the typing burst
+    const afterAgentEnd = Date.now() + 25_000; // agent_end will fire 25s later
+    await vi.advanceTimersByTimeAsync(25_000); // agent keeps working (no typing)
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // idle window opens fresh
     await vi.advanceTimersByTimeAsync(0);
 
     const open = fixture.lastSidecarEvent('human-open') as { openedAt: number } | undefined;
     expect(open).toBeDefined();
-    expect(open!.openedAt).toBe(afterSubmit + 25_000); // agent_end time, NOT the steer onset
-    expect(open!.openedAt).not.toBe(onset);
+    expect(open!.openedAt).toBe(afterAgentEnd); // fresh at agent_end, NOT the steer's first keystroke
+
+    await vi.advanceTimersByTimeAsync(10_000); // 10s post-run idle
+    fixture.run('agent_start', { type: 'agent_start' }); // closes the idle window
+    const close = fixture.lastSidecarEvent('human-close') as
+      | { billedMs: number; idleMs: number }
+      | undefined;
+    expect(close!.idleMs).toBe(10_000); // only post-run idle — no overlap with the steer's burst
+    expect(close!.billedMs).toBe(10_000);
   });
 
-  it('shows in-progress steer composition in /ledger while the run is active', async () => {
+  it('shows in-progress steer typing in /ledger while the run is active', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
-    fixture.sendEditorKey('h'); // onset
-    await vi.advanceTimersByTimeAsync(30_000); // 30s composing (not yet submitted)
+    await typeBurst(fixture, 30_000); // 30s of sustained typing (not yet submitted)
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
-    expect(msg).toContain('human 0.01h (1 windows)'); // 30s counted as 1 in-progress window
+    expect(msg).toContain('human 0.01h (1 windows)'); // 30s active typing as 1 in-progress window
     expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // not submitted yet
+  });
+
+  it('bills only active typing, not the idle wait before submit (billedMs < durationMs)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    await typeBurst(fixture, 30_000); // 30s of typing
+    await vi.advanceTimersByTimeAsync(5 * 60_000); // 5m idle, no typing, before submitting
+    fixture.run('input', steerInput('steer'));
+
+    const steer = lastSteer(fixture);
+    expect(steer!.billedMs).toBe(30_000); // only the typing burst
+    expect(steer!.durationMs).toBe(30_000 + 5 * 60_000); // wall-clock span includes the 5m idle
+    expect(steer!.billedMs).toBeLessThan(steer!.durationMs);
+  });
+
+  it('bills nothing for isolated keystrokes (a key every minute — the abuse guard)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    // press a key every 60s (gaps far over the 3s burst threshold) for 4 minutes
+    for (let i = 0; i < 4; i++) {
+      fixture.sendEditorKey('k');
+      if (i < 3) await vi.advanceTimersByTimeAsync(60_000);
+    }
+    fixture.run('input', steerInput('steer'));
+
+    const steer = lastSteer(fixture);
+    expect(steer).toBeDefined(); // the steer was submitted (audit)…
+    expect(steer!.billedMs).toBe(0); // …but isolated keys form zero-length bursts → bills nothing
+    expect(steer!.keystrokes).toBe(4);
   });
 
   it('rehydrates steer events into human time and rolling credit', async () => {
@@ -1626,6 +1690,7 @@ describe('steering composition (human types while the agent runs)', () => {
         submittedAt: 31_000,
         durationMs: 30_000,
         billedMs: 30_000,
+        keystrokes: 31,
         behavior: 'steer',
         grantedBudgetMs: 60_000,
         extensionBudgetMs: 0,

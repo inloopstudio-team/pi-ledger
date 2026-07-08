@@ -70,6 +70,14 @@ const TPS_CUSTOM_TYPE = 'tps';
 /** Minimum gap between streaming updates to count as an inference stall (ms). */
 const STALL_THRESHOLD_MS = 500;
 
+/** Max gap (ms) between two keystrokes to stay in the same steering-composition
+ *  burst. A steer/followUp is billed by the sum of its typing bursts (active
+ *  typing), not the wall-clock from the first keystroke — so a single key, or
+ *  keys spread minutes apart, bills nothing; only sustained typing bills. Tune
+ *  tighter to make farming a burst harder (at the cost of splitting legitimate
+ *  brief pauses), or looser to preserve longer thinking pauses. */
+const STEER_GAP_MS = 3000;
+
 const MS_PER_HOUR = 3_600_000;
 const MS_PER_MINUTE = 60_000;
 
@@ -171,19 +179,25 @@ export interface HumanCloseEvent {
 /** A steer/followUp the human composed and submitted WHILE the agent was
  *  running (a mid-stream interrupt or a message queued until the agent
  *  finishes). Billed as human time under the same grace + rolling-credit cap
- *  as an idle window. The editor hook records the composition onset (first
- *  keystroke during the run); the `input` event records the submit and how
- *  it was delivered. */
+ *  as an idle window. The editor hook stages every keystroke during the run;
+ *  on submit, the active-typing burst sum (not the wall-clock span) is billed,
+ *  so a single key or keys spread minutes apart bill nothing — only sustained
+ *  typing that's actually queued/steered to the agent bills. Typing never
+ *  submitted is discarded (it never reached the agent). */
 export interface SteerEvent {
   kind: 'steer';
-  /** First keystroke during the run (composition onset). */
+  /** First staged keystroke during the run. */
   startedAt: number;
   /** Submit time (the `input` event). */
   submittedAt: number;
-  /** Composition duration (submittedAt − startedAt), kept for audit. */
+  /** Wall-clock composition span (submittedAt − startedAt), kept for audit. */
   durationMs: number;
-  /** Billed = min(duration, granted budget). */
+  /** Billed active-typing time = min(burst sum, grace + rolling credit). May
+   *  be less than `durationMs` — the burst sum excludes idle gaps before and
+   *  between typing. */
   billedMs: number;
+  /** Number of staged keystrokes (audit). */
+  keystrokes: number;
   /** How the message was delivered: "steer" (mid-stream interrupt) or
    *  "followUp" (queued until the agent finishes). */
   behavior: 'steer' | 'followUp';
@@ -278,6 +292,29 @@ export function closeWindowBudget(
   const idleMs = Math.max(0, closedAt - openedAt);
   const billedMs = Math.min(idleMs, Math.max(0, grantedBudgetMs));
   return { idleMs, billedMs };
+}
+
+/** Sum of typing-burst durations from keystroke timestamps. Consecutive
+ *  keystrokes within `gapMs` cluster into a burst; a burst's duration is its
+ *  last keystroke minus its first (a single keystroke is a zero-length burst).
+ *  Pressing isolated keys therefore bills nothing; only sustained typing
+ *  bills. Timestamps must be ascending (the editor hook pushes them in order).
+ *  Pure. */
+export function computeBurstMs(timestamps: number[], gapMs: number): number {
+  if (timestamps.length === 0) return 0;
+  let sum = 0;
+  let burstStart = timestamps[0]!;
+  let last = timestamps[0]!;
+  for (let i = 1; i < timestamps.length; i++) {
+    const t = timestamps[i]!;
+    if (t - last > gapMs) {
+      sum += last - burstStart;
+      burstStart = t;
+    }
+    last = t;
+  }
+  sum += last - burstStart;
+  return Math.max(0, sum);
 }
 
 /** How much of the rolling extension budget a closing window consumes.
@@ -790,12 +827,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // agent_end). Steering composition is metered only while this is true — the
   // initial and idle windows already capture typing outside a run.
   let agentRunning = false;
-  // Wall-clock of the first keystroke during the current run — the onset of a
-  // steer/followUp the human is composing while the agent works. Set by the
-  // editor hook (`noteKeystroke`), consumed by the `input` event when the steer
-  // is submitted, and reset at agent_start and after each recorded steer.
-  // Null when the human isn't composing mid-run.
-  let steerComposeStart: number | null = null;
+  // Staging buffer of keystroke timestamps during the current run — the raw
+  // material for billing a steer/followUp the human composes while the agent
+  // works. The editor hook (`noteKeystroke`) pushes to it on every keystroke;
+  // the `input` event commits it on submit (billed as a typing-burst sum) and
+  // clears it. Nothing is billed until a steer/followUp is actually queued or
+  // steered to the agent — an uncommitted buffer is discarded at agent_end, so
+  // typing that never reaches the agent costs nothing.
+  let steerStaging: number[] = [];
 
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -904,14 +943,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       const elapsed = Math.max(0, now - humanWindow.openedAt);
       openHumanMs = Math.min(elapsed, humanWindow.grantedBudgetMs);
       openWindows = 1;
-    } else if (agentRunning && steerComposeStart !== null) {
+    } else if (agentRunning && steerStaging.length > 0) {
       // In-progress steer/followUp composition during the run — no idle window
-      // is open while the agent works, so show the composition so far (capped
-      // at grace + current rolling credit) like an open human window, until
-      // it's submitted (then it's recorded as a `steer` event).
-      const elapsed = Math.max(0, now - steerComposeStart);
+      // is open while the agent works, so show the typing-burst sum so far
+      // (capped at grace + current rolling credit) like an open human window,
+      // until it's submitted (then it's recorded as a `steer` event). Shows
+      // active typing only, so idle gaps during composition don't accrue.
       const cap = settings.graceMinutes * MS_PER_MINUTE + extensionBudgetMs;
-      openHumanMs = Math.min(elapsed, cap);
+      openHumanMs = Math.min(computeBurstMs(steerStaging, STEER_GAP_MS), cap);
       openWindows = 1;
     }
     if (totals.agentTurns === 0 && totals.humanWindows === 0) {
@@ -996,15 +1035,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *  closes at the next `agent_start` (or `session_shutdown`) and bills
    *  `min(idle, cap)`, so the first grace minute is always billable and the
    *  rest is scale-to-zero unless explicitly extended. */
-  function openHumanWindow(ctx: ExtensionContext, opts: { silent: boolean; openedAt?: number }) {
+  function openHumanWindow(ctx: ExtensionContext, opts: { silent: boolean }) {
     if (humanWindow) closeHumanWindow(ctx); // safety: close any stale window
     const graceMs = settings.graceMinutes * MS_PER_MINUTE;
     const cap = graceMs + extensionBudgetMs;
-    // `openedAt` lets a post-turn idle window backdate to the onset of a
-    // composition that started during the run (see `agent_end`) — so typing
-    // begun mid-run that's submitted after the agent finishes is metered as
-    // one continuous human window from the first keystroke.
-    const openedAt = opts.openedAt ?? Date.now();
+    const openedAt = Date.now();
     humanWindow = {
       openedAt,
       grantedBudgetMs: cap,
@@ -1029,23 +1064,31 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   }
 
   // Steering composition: the human types a steer/followUp while the agent
-  // runs. The editor hook (`noteKeystroke`) marks the composition onset; the
-  // `input` event records the submit. Billed as human time under the same
-  // grace + rolling-credit cap as an idle window — steering is human oversight,
-  // not agent work, so it's metered separately from generation.
+  // runs. The editor hook (`noteKeystroke`) stages every keystroke; the
+  // `input` event commits it on submit. Billed as the active-typing burst sum
+  // (not wall-clock) under the same grace + rolling-credit cap as an idle
+  // window — a single key or keys spread minutes apart bill nothing, so typing
+  // is only billed when it's actually queued/steered to the agent.
   function noteKeystroke() {
-    // Record the onset of a mid-run composition on its first keystroke.
-    // Subsequent keystrokes (and the submitting Enter) are no-ops here — only
-    // the onset matters; the `input` event closes the window. Outside a run
-    // this is a no-op (the initial/idle windows already capture typing).
-    if (agentRunning && steerComposeStart === null) steerComposeStart = Date.now();
+    // Stage every keystroke during a run (the cadence drives burst detection).
+    // Outside a run this is a no-op — the initial/idle windows already capture
+    // typing. Never throws and never blocks: the callback just pushes a number.
+    if (agentRunning) steerStaging.push(Date.now());
   }
 
-  function recordSteer(ctx: ExtensionContext, behavior: 'steer' | 'followUp', startedAt: number) {
+  function recordSteer(ctx: ExtensionContext, behavior: 'steer' | 'followUp') {
     const submittedAt = Date.now();
     const graceMs = settings.graceMinutes * MS_PER_MINUTE;
     const cap = graceMs + extensionBudgetMs;
-    const { idleMs: durationMs, billedMs } = closeWindowBudget(startedAt, submittedAt, cap);
+    // Bill active typing (burst sum), not the wall-clock span from the first
+    // keystroke — so idle gaps before/between typing don't accrue, and a single
+    // keystroke can't open a billable window.
+    const burstMs = computeBurstMs(steerStaging, STEER_GAP_MS);
+    const billedMs = Math.min(burstMs, Math.max(0, cap));
+    const startedAt = steerStaging[0] ?? submittedAt;
+    const durationMs = Math.max(0, submittedAt - startedAt); // wall-clock span (audit)
+    const keystrokes = steerStaging.length;
+    steerStaging = [];
     // Only billed time beyond the per-window grace consumes rolling credit;
     // the leftover rolls forward (same rule as an idle window).
     extensionBudgetMs -= consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
@@ -1055,6 +1098,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       submittedAt,
       durationMs,
       billedMs,
+      keystrokes,
       behavior,
       grantedBudgetMs: cap,
       extensionBudgetMs,
@@ -1228,13 +1272,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     rehydrate(ctx);
     agentRunning = false;
-    steerComposeStart = null;
-    // Wrap the input editor so keystrokes during an agent run mark the onset
-    // of a steer/followUp composition (metered on submit via the `input`
-    // event). Extends CustomEditor and delegates every keystroke to the base
-    // editor, so app keybindings (escape-to-abort, ctrl+d, …) are preserved.
-    // TUI-only: non-interactive modes have no editor to type into, so there's
-    // no composition onset to capture (and `input` skips non-interactive steers).
+    steerStaging = [];
+    // Wrap the input editor so keystrokes during an agent run are staged for
+    // billing a steer/followUp (committed on submit via the `input` event).
+    // Extends CustomEditor and delegates every keystroke to the base editor,
+    // so app keybindings (escape-to-abort, ctrl+d, …) are preserved. TUI-only:
+    // non-interactive modes have no editor to type into, so there's nothing to
+    // stage (and `input` skips non-interactive steers).
     if (ctx.mode === 'tui' && ctx.hasUI) {
       ctx.ui.setEditorComponent(
         (tui, theme, kb) => new LedgerEditor(tui, theme, kb, noteKeystroke)
@@ -1447,22 +1491,19 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.on('agent_start', (_event, ctx) => {
     lastCtx = ctx;
     agentRunning = true;
-    steerComposeStart = null; // a new run starts; any prior onset is stale
+    steerStaging = []; // a new run starts; any prior staging is stale
     closeHumanWindow(ctx);
   });
 
   pi.on('agent_end', (event, ctx) => {
     lastCtx = ctx;
     agentRunning = false;
-    // If the human was composing during the run but hadn't submitted a
-    // steer/followUp before the agent finished, carry that onset into the
-    // post-turn idle window — composition that started mid-run and continues
-    // into idle is then metered as one continuous human window from the first
-    // keystroke. (A steer submitted mid-stream was already recorded as a
-    // `steer` event and reset this, so the idle window opens fresh.) Reset
-    // either way.
-    const composeStart = steerComposeStart;
-    steerComposeStart = null;
+    // Discard any uncommitted in-run typing: a steer/followUp that was never
+    // submitted never reached the agent, so it bills nothing. (A submitted
+    // steer already cleared the buffer in `recordSteer`.) The post-turn idle
+    // window opens fresh at agent_end — no backdate — so mid-run typing that
+    // isn't actually queued/steered can't inflate the idle window.
+    steerStaging = [];
     if (!tpsEverSeen && !fallbackNotified) {
       fallbackNotified = true;
       notify(
@@ -1485,26 +1526,24 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (lastAssistantStopReason(event.messages) === 'error') return;
     // Open the post-turn idle window (grace + rolling credit). The wizard pops
     // here — immediately when no credit remains, or armed for exhaustion when
-    // some does — so this is where billing extensions are offered. Backdate the
-    // window to a mid-run composition onset (if any) so typing begun during the
-    // run that's submitted after the agent finishes is metered continuously.
-    openHumanWindow(ctx, { silent: false, openedAt: composeStart ?? undefined });
+    // some does — so this is where billing extensions are offered.
+    openHumanWindow(ctx, { silent: false });
   });
 
   // Steering composition is submitted via the `input` event, which tells us
   // how the message is delivered (`streamingBehavior`: "steer" for a mid-stream
   // interrupt, "followUp" for a queued message) and where it came from
-  // (`source`: "interactive" for a human typing). Record the composition window
-  // [onset, submit] as human time. Pass-through: never transform or handle the
-  // input — only observe it for billing.
+  // (`source`: "interactive" for a human typing). Commit the staged typing as
+  // human time — billed as the active-typing burst sum, only when it's
+  // actually queued/steered to the agent. Pass-through: never transform or
+  // handle the input — only observe it for billing.
   pi.on('input', (event, ctx) => {
     lastCtx = ctx;
     const behavior = event.streamingBehavior;
     if (behavior !== 'steer' && behavior !== 'followUp') return; // only mid-run
     if (event.source !== 'interactive') return; // only human-typed steers
-    if (steerComposeStart === null) return; // no onset (e.g. non-TUI / no editor)
-    recordSteer(ctx, behavior, steerComposeStart);
-    steerComposeStart = null;
+    if (steerStaging.length === 0) return; // nothing staged (e.g. non-TUI / no typing)
+    recordSteer(ctx, behavior);
   });
 
   // ── Commands ──────────────────────────────────────────────────────────

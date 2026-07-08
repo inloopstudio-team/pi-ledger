@@ -31,7 +31,7 @@ billable time). Human oversight — review, steering, the next prompt — is
 metered separately, like managed capacity, with a free grace tier and opt-in
 pomodoro extensions. Even the time spent writing the first prompt is metered:
 an initial window opens at `session_start` and closes when you send it, billed
-under the same grace minute. So is steering: a steer or queued followUp you compose while the agent runs is metered from first keystroke to submit, under the same cap. Idle costs nothing by default: only the first
+under the same grace minute. So is steering: a steer or queued followUp you compose while the agent runs is metered by its typing bursts — and only when actually queued/steered to the agent — under the same cap. Idle costs nothing by default: only the first
 grace minute of each idle window is billable (per-window, never rolls), and a
 wizard pops at `agent_end` (inline, pi-core settings style) to offer
 pomodoro-style blocks.
@@ -79,12 +79,12 @@ capped at the grace budget) but enough to demo the output.
 
 ## How time is measured
 
-| Phase     | Bracket                                                   | Billed as  |
-| --------- | --------------------------------------------------------- | ---------- |
-| **Agent** | `agent_start` → `agent_end` (sum of turns)                | Agent time |
-| **Human** | `agent_end` → next `agent_start` (idle window)            | Human time |
-| **Human** | `session_start` → first `agent_start` (initial window)    | Human time |
-| **Human** | steer/followUp composed during a run (keystroke → submit) | Human time |
+| Phase     | Bracket                                                         | Billed as  |
+| --------- | --------------------------------------------------------------- | ---------- |
+| **Agent** | `agent_start` → `agent_end` (sum of turns)                      | Agent time |
+| **Human** | `agent_end` → next `agent_start` (idle window)                  | Human time |
+| **Human** | `session_start` → first `agent_start` (initial window)          | Human time |
+| **Human** | steer/followUp composed during a run (typing bursts, on submit) | Human time |
 
 > A provider-error turn (`stopReason` `error`) opens **no** human window — its
 > retry/queue backoff isn't human idle and isn't billed (see below).
@@ -127,15 +127,17 @@ billed_human  = min(actual_idle, granted_budget)
 granted_budget = grace_minutes + remaining_extension_credit
 ```
 
-**Steering while the agent runs** is also human time. When you type a steer or
-queued followUp mid-stream, pi-ledger meters the composition itself — from the
-first keystroke during the run (captured by a thin input-editor wrapper) to the
-submit (the `input` event's `streamingBehavior`), billed under the same
-`grace + credit` cap as any window. This closes an earlier gap: only typing
-_between_ turns was metered, so composing a steer _during_ a run was unmetered.
-If you start composing mid-run but only submit after the agent finishes, that
-composition folds into the post-turn idle window, backdated to its onset — one
-continuous window from the first keystroke.
+**Steering while the agent runs** is also human time. A thin input-editor
+wrapper stages every keystroke during a run; when you submit a steer or queued
+followUp (the `input` event's `streamingBehavior`), the composition is billed
+as the sum of its **typing bursts** — consecutive keystrokes within a gap
+threshold — not the wall-clock from the first keystroke. A single key, or keys
+spread minutes apart, bills nothing; only sustained typing that's actually
+queued/steered to the agent bills, under the same `grace + credit` cap as any
+window. (This closes an earlier gap: only typing _between_ turns was metered,
+so composing a steer _during_ a run was unmetered.) Typing never submitted never
+reached the agent, so it's discarded — it bills nothing and can't inflate the
+post-turn idle window.
 
 - The first **grace minute** (configurable) of every idle window is always
   billable — per-window, it never rolls.
@@ -213,7 +215,7 @@ entries) and accumulates across **all branches** of the session. Events:
 - `agent` — one per turn: `{ id, turnIndex, agentMs, generationMs, stallMs, toolMs, tokens, model, source, supersedes?, timestamp }`. `agentMs` is the billable time (generation normalized to the reference TPS + tool time); `generationMs`/`stallMs` are the real wall-clock (audit). A `'tps'` turn may `supersede` an earlier `'fallback'` for the same turn (load-order race) so it isn't double-counted.
 - `human-open` — on `session_start` (the initial first-prompt window), on `agent_end` (each idle window), and re-recorded on each wizard extend: `{ openedAt, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. `grantedBudgetMs` is the window's cap = `grace + extensionBudgetMs`; `extensionBudgetMs` is the rolling credit carried into the window.
 - `human-close` — on the next `agent_start` **or on `session_shutdown`** (exit): `{ openedAt, closedAt, billedMs, idleMs, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. Its `extensionBudgetMs` is the rolling credit remaining after this window's consumption (carried forward). Legacy events lacking `extensionBudgetMs` are backfilled on replay.
-- `steer` — a steer/followUp composed while the agent ran (editor onset → `input` submit): `{ startedAt, submittedAt, durationMs, billedMs, behavior, grantedBudgetMs, extensionBudgetMs, timestamp }`. `billedMs` is `min(duration, grace + credit)`; `behavior` is `"steer"` (mid-stream interrupt) or `"followUp"` (queued). Billed as human time, consuming rolling credit beyond grace (same rule as an idle window).
+- `steer` — a steer/followUp composed while the agent ran (editor keystrokes → `input` submit): `{ startedAt, submittedAt, durationMs, billedMs, keystrokes, behavior, grantedBudgetMs, extensionBudgetMs, timestamp }`. `billedMs` is `min` of the typing-burst sum and `grace + credit` (not the wall-clock span — `durationMs` is the span, kept for audit); `keystrokes` is the staged count; `behavior` is `"steer"` (mid-stream interrupt) or `"followUp"` (queued). Billed as human time, consuming rolling credit beyond grace (same rule as an idle window).
 
 On `session_start` (fresh load/reload), pi-ledger replays the sidecar to rebuild
 totals, settings, the rolling extension credit, and the in-progress human
@@ -230,8 +232,8 @@ session_start         → rehydrate from sidecar; if no window is open, open an
                         INITIAL human window (grace + rolling credit) — spans
                         first-prompt composition (session_start → first
                         agent_start). Silent: the wizard never auto-pops here.
-                        Also wraps the input editor (TUI) to mark the onset of
-                        a steer/followUp composed during a run (first keystroke).
+                        Also wraps the input editor (TUI) to stage keystrokes
+                        during a run for steer/followUp billing.
 turn_start            → reset per-turn tool + fallback accumulators
 tool_execution_start  → tool depth counter (union timing)
 tool_execution_end    →   (parallel tools don't double-count)
@@ -250,15 +252,14 @@ agent_end             → open human window (grace + rolling extension budget)
                           backoff, or pi-core's compaction-retry — not human
                           idle; the window reopens at the next non-error
                           agent_end so the backoff is never billed)
-                        └ backdate the window to an unsubmitted in-run
-                          composition onset (if any): mid-run typing that
-                          submits after the agent finishes is one window
 agent_start           → close window: billed = min(idle, grace + credit);
                         consume credit = max(0, billed − grace) (rolls the rest)
-input (steer/followUp)→ record a `steer` event = composition [onset, submit]
-                        billed min(duration, grace + credit); consume credit
-                        beyond grace. Interactive sources only; pass-through
-                        (never transform the input).
+input (steer/followUp)→ commit staged keystrokes as a `steer` event: billed =
+                        the typing-burst sum (not wall-clock), capped at grace +
+                        credit; consume credit beyond grace. Interactive sources
+                        only; pass-through (never transform the input). An
+                        uncommitted buffer is discarded at agent_end — typing
+                        never queued/steered bills nothing.
 session_shutdown      → close any open window (record the exit: idle is retained)
 ```
 
@@ -288,7 +289,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (97 tests)
+pnpm test            # vitest run (105 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```
