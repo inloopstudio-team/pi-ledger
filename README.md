@@ -20,21 +20,32 @@ human prompt is the invocation. Idle costs nothing by default — only the first
 grace minute of human time is billable, and a non-blocking wizard offers
 pomodoro-style extensions.
 
-> **Requires [`@monotykamary/pi-tps`](https://github.com/monotykamary/pi-tps)** as a
-> peer. pi-tps emits the `tps:telemetry` event after every turn; pi-ledger
-> consumes it for per-turn agent timing (generation, stalls, tokens, cost) and
-> adds tool-execution time of its own. Both extensions' data coexist in the
-> session JSONL.
+> **Standalone, but pi-tps-aware.** pi-ledger works on its own — it measures
+> agent time itself when [`@monotykamary/pi-tps`](https://github.com/monotykamary/pi-tps)
+> isn't installed. When pi-tps **is** present, it emits the `tps:telemetry` event
+> after every turn and pi-ledger consumes its refined generation/stall numbers
+> (and adds tool-execution time of its own). Both extensions' data coexist in
+> the session JSONL. Installing pi-tps is purely an upgrade in fidelity.
 
 ## Quick start
 
 ```bash
-pi install npm:@monotykamary/pi-tps
 pi install npm:@monotykamary/pi-ledger
+# optional — better stall detection & per-turn fidelity:
+pi install npm:@monotykamary/pi-tps
 ```
 
 Then in pi: `/ledger-settings` to set your rates, work a session, and
 `/ledger-receipt` for the receipt.
+
+### Demo shortcut: receipt from an existing pi-tps session
+
+Didn't run a full pi-ledger session? `/ledger-receipt` also works on a session
+that only has pi-tps markers (e.g. resume an older pi-tps session, set rates
+with `/ledger-settings`, then `/ledger-receipt`). With no live ledger data it
+converts the `tps` entries into the receipt — lower fidelity (no tool time;
+human time estimated from inter-turn gaps, capped at the grace budget) but
+enough to demo the output.
 
 ## Commands
 
@@ -57,6 +68,10 @@ Then in pi: `/ledger-settings` to set your rates, work a session, and
 - **Generation** (incl. TTFT) is the model producing tokens — billable.
 - **Tool execution** is the agent doing the work (running bash, reading files, …) — billable, measured as the union wall-clock of tool calls within the turn (parallel tools don't double-count).
 - **Stalls** (mid-stream inference pauses) are **excluded**. A slow or queued provider must not inflate billable time — that's the abuse vector this rule closes.
+- **Source** is either `tps` (high-fidelity, from pi-tps's event) or `fallback`
+  (self-measured). Exactly one segment is written per turn regardless of
+  extension load order — a `fallback` may be corrected by a later `tps` entry
+  for the same turn, and rehydration keeps the last per turn (no double-count).
 
 **Human time** is the idle window between when the agent hands control back
 (`agent_end`) and when the user takes it again (`agent_start`), capped by a
@@ -116,7 +131,7 @@ pi-ledger appends custom entries to the session JSONL alongside pi-tps's `tps`
 entries:
 
 - `ledger-settings` — the settings snapshot (last write wins on rehydrate).
-- `ledger-agent` — one per turn: `{ agentMs, generationMs, stallMs, toolMs, tokens, model, turnIndex, timestamp }`.
+- `ledger-agent` — one per turn: `{ agentMs, generationMs, stallMs, toolMs, tokens, model, source, turnIndex, timestamp }` (`source` is `'tps'` or `'fallback'`).
 - `ledger-human` — one per closed idle window: `{ billedMs, idleMs, grantedBudgetMs, extensions, openedAt, closedAt, timestamp }`.
 
 On `session_start` and `/tree`, pi-ledger replays these entries to rebuild
@@ -126,10 +141,14 @@ resumed — billing resumes on the next `agent_end`.)
 ## Architecture
 
 ```
-turn_start            → reset per-turn tool accumulator
+turn_start            → reset per-turn tool + fallback accumulators
 tool_execution_start  → tool depth counter (union timing)
 tool_execution_end    →   (parallel tools don't double-count)
-tps:telemetry (pi-tps)→ record agent segment = (gen − stall) + tool
+message_start/update/end → fallback generation + stall gate (self-sufficient)
+tps:telemetry (pi-tps)→ record 'tps' agent segment = (gen − stall) + tool
+                        └ corrects a 'fallback' already written this turn
+
+turn_end (no pi-tps)  → record 'fallback' agent segment from own measurement
 agent_end             → open human window (grace budget), arm wizard timer
                         └ at grace boundary → non-blocking wizard overlay
                             ├ extend → +pomodoro, re-arm
@@ -137,17 +156,20 @@ agent_end             → open human window (grace budget), arm wizard timer
 agent_start           → close window: billed = min(idle, budget)
 ```
 
-Agent timing comes from pi-tps's `tps:telemetry` event (`generationMs`,
-`stallMs`); tool-execution time is measured locally and paired with the turn.
-The wizard is driven entirely by the extension (the agent is unaware), auto-fires
-at `agent_end + grace`, and is disarmed on the next `agent_start` or
-`session_shutdown`.
+Agent timing prefers pi-tps's `tps:telemetry` (`generationMs`, `stallMs`);
+when pi-tps is absent, pi-ledger measures generation + a basic stall gap gate
+itself at `turn_end`. Tool-execution time is always measured locally and paired
+with the turn. The wizard is driven entirely by the extension (the agent is
+unaware), auto-fires at `agent_end + grace`, and is disarmed on the next
+`agent_start` or `session_shutdown`. Rehydration dedups `ledger-agent` by
+`turnIndex`, keeping the last (so a `fallback` → `tps` correction never
+double-counts).
 
 ## Testing
 
 ```bash
 pnpm install
-pnpm test            # vitest run (33 tests)
+pnpm test            # vitest run (42 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```

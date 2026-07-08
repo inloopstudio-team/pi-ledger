@@ -51,8 +51,14 @@ import {
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-/** Event emitted by @monotykamary/pi-tps after each turn with per-turn telemetry. */
+/** Event emitted by @monotykamary/pi-tps after each turn with per-turn telemetry (optional). */
 const TPS_TELEMETRY_EVENT = 'tps:telemetry';
+
+/** Custom entry type written by @monotykamary/pi-tps into the session JSONL. */
+const TPS_CUSTOM_TYPE = 'tps';
+
+/** Minimum gap between streaming updates to count as an inference stall (ms). */
+const STALL_THRESHOLD_MS = 500;
 
 const MS_PER_HOUR = 3_600_000;
 const MS_PER_MINUTE = 60_000;
@@ -106,6 +112,8 @@ export interface AgentSegment {
   toolMs: number;
   tokens: { input: number; output: number; total: number };
   model: { provider: string; modelId: string };
+  /** 'tps' = high-fidelity, from pi-tps's event; 'fallback' = self-measured. */
+  source: 'tps' | 'fallback';
   timestamp: number;
 }
 
@@ -293,13 +301,12 @@ export function rehydrateFromEntries(
   entries: Array<{ type?: string; customType?: string; data?: unknown }>
 ): { settings: LedgerSettings; totals: Totals } {
   let settings: LedgerSettings | null = null;
-  const totals: Totals = {
-    agentMs: 0,
-    humanMs: 0,
-    agentTurns: 0,
-    humanWindows: 0,
-    agentTokens: { input: 0, output: 0, total: 0 },
-  };
+  // Last agent segment per turnIndex wins: a 'fallback' entry may be followed
+  // by a higher-fidelity 'tps' correction for the same turn (extension load
+  // order), so we keep the later one and never double-count.
+  const agentByTurn = new Map<number, AgentSegment>();
+  let humanMs = 0;
+  let humanWindows = 0;
   for (const e of entries) {
     if (e.type !== 'custom') continue;
     if (e.customType === SETTINGS_CUSTOM_TYPE) {
@@ -307,20 +314,95 @@ export function rehydrateFromEntries(
       if (d) settings = { ...DEFAULT_SETTINGS, ...d };
     } else if (e.customType === AGENT_CUSTOM_TYPE) {
       const d = e.data as AgentSegment | null;
-      if (!d) continue;
-      totals.agentMs += d.agentMs;
-      totals.agentTurns += 1;
-      totals.agentTokens.input += d.tokens.input;
-      totals.agentTokens.output += d.tokens.output;
-      totals.agentTokens.total += d.tokens.total;
+      if (d && typeof d.turnIndex === 'number') agentByTurn.set(d.turnIndex, d);
     } else if (e.customType === HUMAN_CUSTOM_TYPE) {
       const d = e.data as HumanSegment | null;
       if (!d) continue;
-      totals.humanMs += d.billedMs;
-      totals.humanWindows += 1;
+      humanMs += d.billedMs;
+      humanWindows += 1;
     }
   }
-  return { settings: settings ?? { ...DEFAULT_SETTINGS }, totals };
+  let agentMs = 0;
+  const agentTokens = { input: 0, output: 0, total: 0 };
+  for (const d of agentByTurn.values()) {
+    agentMs += d.agentMs;
+    agentTokens.input += d.tokens.input;
+    agentTokens.output += d.tokens.output;
+    agentTokens.total += d.tokens.total;
+  }
+  return {
+    settings: settings ?? { ...DEFAULT_SETTINGS },
+    totals: { agentMs, humanMs, agentTurns: agentByTurn.size, humanWindows, agentTokens },
+  };
+}
+
+/** A pi-tps `tps` entry as it appears in the session JSONL. */
+export interface TpsMarker {
+  timing: { generationMs: number; stallMs: number; totalMs: number };
+  tokens: { input: number; output: number; total: number };
+  model: { provider: string; modelId: string };
+  timestamp: number;
+}
+
+/** Pull pi-tps `tps` entries out of a session entry list. Pure. */
+export function extractTpsEntries(
+  entries: Array<{ type?: string; customType?: string; data?: unknown }>
+): TpsMarker[] {
+  const out: TpsMarker[] = [];
+  for (const e of entries) {
+    if (e.type !== 'custom' || e.customType !== TPS_CUSTOM_TYPE) continue;
+    const d = e.data as TpsMarker | null;
+    if (d && d.timing && d.tokens && d.model && typeof d.timestamp === 'number') out.push(d);
+  }
+  return out;
+}
+
+/** Convert pi-tps markers into billable agent + (estimated) human time. Pure.
+ *
+ * Agent time per marker = (generationMs − stallMs); tool time is unavailable
+ * from pi-tps markers. Human time is estimated from inter-turn gaps — each
+ * gap is capped at the grace budget (no wizard ran, so no extensions) —
+ * which mirrors the scale-to-zero billing rule. @internal */
+export function convertTpsEntries(
+  tps: TpsMarker[],
+  graceMs: number
+): {
+  agentMs: number;
+  agentTurns: number;
+  agentTokens: { input: number; output: number; total: number };
+  humanMs: number;
+  humanWindows: number;
+  startedAt: number;
+} {
+  let agentMs = 0;
+  const agentTokens = { input: 0, output: 0, total: 0 };
+  let humanMs = 0;
+  let humanWindows = 0;
+  for (let i = 0; i < tps.length; i++) {
+    const e = tps[i]!;
+    agentMs += computeAgentMs(e.timing.generationMs || 0, e.timing.stallMs || 0, 0);
+    agentTokens.input += e.tokens.input || 0;
+    agentTokens.output += e.tokens.output || 0;
+    agentTokens.total += e.tokens.total || 0;
+    if (i + 1 < tps.length) {
+      const next = tps[i + 1]!;
+      // next turn started ~ next.timestamp − next.totalMs; idle = that − this turn's end
+      const turnStartNext = (next.timestamp || 0) - (next.timing.totalMs || 0);
+      const gap = turnStartNext - (e.timestamp || 0);
+      if (gap > 0) {
+        humanMs += Math.min(gap, graceMs);
+        humanWindows += 1;
+      }
+    }
+  }
+  return {
+    agentMs,
+    agentTurns: tps.length,
+    agentTokens,
+    humanMs,
+    humanWindows,
+    startedAt: tps.length > 0 ? tps[0]!.timestamp : 0,
+  };
 }
 
 // ─── Receipt HTML ───────────────────────────────────────────────────────────
@@ -510,7 +592,32 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // Latest ctx (event-bus listeners for tps:telemetry don't receive one).
   let lastCtx: ExtensionContext | null = null;
-  let tpsSeen = false;
+
+  // pi-tps awareness: when pi-tps is present it emits `tps:telemetry` per turn
+  // and we use its refined generation/stall numbers. When it's absent we fall
+  // back to our own measurement (basic generation + a stall gap gate) so the
+  // extension stands alone.
+  let tpsEverSeen = false;
+  let lastFallback: {
+    turnIndex: number;
+    agentMs: number;
+    tokens: { input: number; output: number; total: number };
+  } | null = null;
+  let fallbackNotified = false;
+
+  // Fallback per-turn measurement (used iff pi-tps is absent for a turn).
+  const fb = {
+    totalGenerationMs: 0,
+    stallMs: 0,
+    stallCount: 0,
+    inStall: false,
+    lastUpdateMs: 0,
+    firstTokenMs: 0,
+    currentMessageStartMs: 0,
+    messageCount: 0,
+    tokens: { input: 0, output: 0, total: 0 },
+    model: null as { provider: string; modelId: string } | null,
+  };
 
   // ── Settings persistence ───────────────────────────────────────────────
 
@@ -721,6 +828,16 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     toolDepth = 0;
     toolSpanStart = 0;
     toolMsThisTurn = 0;
+    fb.totalGenerationMs = 0;
+    fb.stallMs = 0;
+    fb.stallCount = 0;
+    fb.inStall = false;
+    fb.lastUpdateMs = 0;
+    fb.firstTokenMs = 0;
+    fb.currentMessageStartMs = 0;
+    fb.messageCount = 0;
+    fb.tokens = { input: 0, output: 0, total: 0 };
+    fb.model = null;
   });
 
   pi.on('tool_execution_start', () => {
@@ -737,16 +854,69 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     }
   });
 
-  // ── Agent segment (consumed from pi-tps) ──────────────────────────────
+  // ── Fallback agent timing (self-sufficient; used iff pi-tps is absent) ─
+
+  pi.on('message_start', (event) => {
+    const m = asAssistant(event.message);
+    if (!m) return;
+    const now = Date.now();
+    fb.currentMessageStartMs = now;
+    fb.messageCount += 1;
+    fb.lastUpdateMs = now;
+    fb.inStall = false;
+    fb.firstTokenMs = 0;
+  });
+
+  pi.on('message_update', (event) => {
+    const m = asAssistant(event.message);
+    if (!m) return;
+    const now = Date.now();
+    if (fb.firstTokenMs === 0) {
+      fb.firstTokenMs = now;
+      fb.lastUpdateMs = now;
+      return;
+    }
+    const gap = now - fb.lastUpdateMs;
+    if (gap >= STALL_THRESHOLD_MS) {
+      if (!fb.inStall) fb.stallCount += 1;
+      fb.inStall = true;
+      fb.stallMs += gap;
+    } else {
+      fb.inStall = false;
+    }
+    fb.lastUpdateMs = now;
+  });
+
+  pi.on('message_end', (event) => {
+    const m = asAssistant(event.message);
+    if (!m) return;
+    const now = Date.now();
+    if (fb.currentMessageStartMs) {
+      fb.totalGenerationMs += now - fb.currentMessageStartMs;
+      fb.currentMessageStartMs = 0;
+    }
+    if (m.usage) {
+      fb.tokens.input += m.usage.input || 0;
+      fb.tokens.output += m.usage.output || 0;
+      fb.tokens.total += m.usage.totalTokens || 0;
+    }
+    if (m.provider && m.model && !fb.model) fb.model = { provider: m.provider, modelId: m.model };
+    fb.lastUpdateMs = now;
+  });
+
+  // ── Agent segment ──────────────────────────────────────────────────────
+  // High fidelity from pi-tps when present; otherwise a fallback measured
+  // at turn_end. Exactly one segment is written per turn regardless of
+  // extension load order — a 'fallback' may be corrected by a later 'tps'
+  // entry for the same turnIndex (rehydrate keeps the last per turnIndex).
 
   pi.events.on(TPS_TELEMETRY_EVENT, (payload: unknown) => {
     const t = payload as TpsTelemetry | null;
     if (!t || !t.timing || !t.tokens || !t.model) return;
-    tpsSeen = true;
+    tpsEverSeen = true;
     const generationMs = Number.isFinite(t.timing.generationMs) ? t.timing.generationMs : 0;
     const stallMs = Number.isFinite(t.timing.stallMs) ? t.timing.stallMs : 0;
     const toolMs = toolMsThisTurn;
-    toolMsThisTurn = 0;
     const agentMs = computeAgentMs(generationMs, stallMs, toolMs);
     if (agentMs <= 0) return;
     const seg: AgentSegment = {
@@ -762,6 +932,44 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         total: t.tokens.total || 0,
       },
       model: t.model,
+      source: 'tps',
+      timestamp: Date.now(),
+    };
+    if (lastFallback && lastFallback.turnIndex === currentTurnIndex) {
+      totals.agentMs -= lastFallback.agentMs;
+      totals.agentTurns -= 1;
+      totals.agentTokens.input -= lastFallback.tokens.input;
+      totals.agentTokens.output -= lastFallback.tokens.output;
+      totals.agentTokens.total -= lastFallback.tokens.total;
+      lastFallback = null;
+    }
+    pi.appendEntry(AGENT_CUSTOM_TYPE, seg);
+    totals.agentMs += agentMs;
+    totals.agentTurns += 1;
+    totals.agentTokens.input += seg.tokens.input;
+    totals.agentTokens.output += seg.tokens.output;
+    totals.agentTokens.total += seg.tokens.total;
+    updateStatus(lastCtx);
+  });
+
+  // Fallback: pi-tps absent for this turn → measure ourselves at turn_end.
+  pi.on('turn_end', (event, ctx) => {
+    lastCtx = ctx;
+    if (tpsEverSeen) return; // pi-tps present; it handles turns (or intentionally skips)
+    if (fb.messageCount === 0 || !fb.model) return;
+    const toolMs = toolMsThisTurn;
+    const agentMs = computeAgentMs(fb.totalGenerationMs, fb.stallMs, toolMs);
+    if (agentMs <= 0) return;
+    const seg: AgentSegment = {
+      kind: 'agent',
+      turnIndex: event.turnIndex,
+      agentMs,
+      generationMs: fb.totalGenerationMs,
+      stallMs: fb.stallMs,
+      toolMs,
+      tokens: { input: fb.tokens.input, output: fb.tokens.output, total: fb.tokens.total },
+      model: fb.model,
+      source: 'fallback',
       timestamp: Date.now(),
     };
     pi.appendEntry(AGENT_CUSTOM_TYPE, seg);
@@ -770,7 +978,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     totals.agentTokens.input += seg.tokens.input;
     totals.agentTokens.output += seg.tokens.output;
     totals.agentTokens.total += seg.tokens.total;
-    updateStatus(lastCtx);
+    lastFallback = { turnIndex: event.turnIndex, agentMs, tokens: { ...seg.tokens } };
+    updateStatus(ctx);
   });
 
   // ── Human idle windows ────────────────────────────────────────────────
@@ -788,11 +997,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       grantedBudgetMs: settings.graceMinutes * MS_PER_MINUTE,
       extensions: 0,
     };
-    if (!tpsSeen) {
+    if (!tpsEverSeen && !fallbackNotified) {
+      fallbackNotified = true;
       notify(
         ctx,
-        'pi-ledger: no tps:telemetry seen — install @monotykamary/pi-tps to track agent time.',
-        'warning'
+        'pi-ledger: built-in timing in use (pi-tps not detected; install @monotykamary/pi-tps for refined stall detection).',
+        'info'
       );
     }
     armWizardForBoundary(ctx);
@@ -811,6 +1021,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         ` · blended ${b.totalHours > 0 ? fmtMoney(b.blendedRate, settings.currency) + '/h' : '—'}` +
         ` · total ${fmtMoney(b.total, settings.currency)}`;
       ctx.ui.notify(msg, 'info');
+      if (totals.agentTurns === 0) {
+        const tps = extractTpsEntries(ctx.sessionManager.getBranch());
+        if (tps.length > 0) {
+          ctx.ui.notify(
+            `No live ledger data; ${tps.length} pi-tps markers available — /ledger-receipt converts them.`,
+            'info'
+          );
+        }
+      }
     },
   });
 
@@ -892,9 +1111,36 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     description:
       'Export an HTML receipt for this session (billable agent + human hours, blended rate, total).',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      const b = computeBilling(totals.agentMs, totals.humanMs, settings);
+      let agentMs = totals.agentMs;
+      let humanMs = totals.humanMs;
+      let agentTurns = totals.agentTurns;
+      let humanWindows = totals.humanWindows;
+      const agentTokens = { ...totals.agentTokens };
+      let startedAt = earliestLedgerTimestamp(ctx);
+
+      // No live ledger data (pi-ledger wasn't tracking) → convert pi-tps markers
+      // from the session so an existing pi-tps session still yields a receipt.
+      if (agentTurns === 0) {
+        const tps = extractTpsEntries(ctx.sessionManager.getBranch());
+        if (tps.length > 0) {
+          const c = convertTpsEntries(tps, settings.graceMinutes * MS_PER_MINUTE);
+          agentMs = c.agentMs;
+          agentTurns = c.agentTurns;
+          agentTokens.input = c.agentTokens.input;
+          agentTokens.output = c.agentTokens.output;
+          agentTokens.total = c.agentTokens.total;
+          humanMs = c.humanMs;
+          humanWindows = c.humanWindows;
+          startedAt = c.startedAt;
+          ctx.ui.notify(
+            `Receipt built from ${tps.length} pi-tps markers (lower fidelity: no tool time; human time estimated from inter-turn gaps).`,
+            'info'
+          );
+        }
+      }
+
+      const b = computeBilling(agentMs, humanMs, settings);
       const sessionId = ctx.sessionManager.getSessionId?.() ?? 'unknown';
-      const startedAt = earliestLedgerTimestamp(ctx);
       const data: ReceiptData = {
         project: effectiveProject(ctx),
         author: effectiveAuthor(),
@@ -908,9 +1154,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         humanCost: b.humanCost,
         total: b.total,
         blendedRate: b.blendedRate,
-        agentTurns: totals.agentTurns,
-        humanWindows: totals.humanWindows,
-        agentTokens: { ...totals.agentTokens },
+        agentTurns,
+        humanWindows,
+        agentTokens,
         startedAt,
         generatedAt: Date.now(),
       };
@@ -1066,4 +1312,21 @@ function defaultAuthor(): string {
   } catch {
     return 'operator';
   }
+}
+
+/** Narrow an AgentMessage to its assistant fields (for fallback timing). */
+function asAssistant(message: unknown): {
+  role?: string;
+  usage?: { input?: number; output?: number; totalTokens?: number };
+  provider?: string;
+  model?: string;
+} | null {
+  if (!message || typeof message !== 'object') return null;
+  const m = message as {
+    role?: string;
+    usage?: { input?: number; output?: number; totalTokens?: number };
+    provider?: string;
+    model?: string;
+  };
+  return m.role === 'assistant' ? m : null;
 }

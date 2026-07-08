@@ -161,3 +161,38 @@ export async function activateExtension(fixture: TestFixture): Promise<void> {
   const { default: ledgerExtension } = await import('../index.js');
   ledgerExtension(fixture.mockPi as ExtensionAPI);
 }
+
+/** An assistant message for the message_start/update/end hooks (fallback timing). */
+export function makeAssistantMessage(
+  overrides: {
+    input?: number;
+    output?: number;
+    totalTokens?: number;
+    provider?: string;
+    model?: string;
+  } = {}
+): unknown {
+  const {
+    input = 100,
+    output = 50,
+    totalTokens = 150,
+    provider = 'openai',
+    model = 'gpt-4',
+  } = overrides;
+  return {
+    role: 'assistant',
+    content: [{ type: 'text', text: 'ok' }],
+    provider,
+    model,
+    usage: {
+      input,
+      output,
+      totalTokens,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'stop',
+    timestamp: Date.now(),
+  };
+}

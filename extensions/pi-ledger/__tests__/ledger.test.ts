@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import {
   activateExtension,
   createTestFixture,
+  makeAssistantMessage,
   makeTpsTelemetry,
   type TestFixture,
 } from './helpers';
@@ -14,6 +15,8 @@ import {
   closeWindowBudget,
   computeAgentMs,
   computeBilling,
+  convertTpsEntries,
+  extractTpsEntries,
   fmtHours,
   fmtMoney,
   rehydrateFromEntries,
@@ -181,6 +184,109 @@ describe('rehydrateFromEntries', () => {
     expect(r.settings).toEqual(DEFAULTS);
     expect(r.totals.agentMs).toBe(0);
   });
+  it('dedups agent segments by turnIndex, keeping the last (tps over fallback)', () => {
+    const entries = [
+      {
+        type: 'custom',
+        customType: 'ledger-agent',
+        data: {
+          kind: 'agent',
+          turnIndex: 0,
+          agentMs: 800,
+          generationMs: 800,
+          stallMs: 0,
+          toolMs: 0,
+          tokens: { input: 0, output: 0, total: 0 },
+          model: { provider: 'openai', modelId: 'gpt-4' },
+          source: 'fallback',
+          timestamp: 1,
+        },
+      },
+      {
+        type: 'custom',
+        customType: 'ledger-agent',
+        data: {
+          kind: 'agent',
+          turnIndex: 0,
+          agentMs: 1500,
+          generationMs: 2000,
+          stallMs: 500,
+          toolMs: 0,
+          tokens: { input: 10, output: 5, total: 15 },
+          model: { provider: 'openai', modelId: 'gpt-4' },
+          source: 'tps',
+          timestamp: 2,
+        },
+      },
+    ];
+    const r = rehydrateFromEntries(entries);
+    expect(r.totals.agentMs).toBe(1500);
+    expect(r.totals.agentTurns).toBe(1);
+    expect(r.totals.agentTokens.total).toBe(15);
+  });
+});
+
+describe('extractTpsEntries + convertTpsEntries', () => {
+  it('extracts only tps markers', () => {
+    const entries = [
+      { type: 'custom', customType: 'ledger-settings', data: {} },
+      {
+        type: 'custom',
+        customType: 'tps',
+        data: {
+          timing: { generationMs: 1, stallMs: 0, totalMs: 1 },
+          tokens: { input: 0, output: 0, total: 0 },
+          model: { provider: 'p', modelId: 'm' },
+          timestamp: 10,
+        },
+      },
+      { type: 'custom', customType: 'ledger-agent', data: {} },
+    ];
+    const tps = extractTpsEntries(entries);
+    expect(tps).toHaveLength(1);
+    expect(tps[0]!.timestamp).toBe(10);
+  });
+
+  it('converts markers to agent + estimated human time (gaps capped at grace)', () => {
+    const c = convertTpsEntries(
+      [
+        {
+          timing: { generationMs: 2000, stallMs: 0, totalMs: 2500 },
+          tokens: { input: 100, output: 50, total: 150 },
+          model: { provider: 'p', modelId: 'm' },
+          timestamp: 0,
+        },
+        {
+          timing: { generationMs: 3000, stallMs: 500, totalMs: 4000 },
+          tokens: { input: 200, output: 100, total: 300 },
+          model: { provider: 'p', modelId: 'm' },
+          timestamp: 70000,
+        },
+        {
+          timing: { generationMs: 1000, stallMs: 0, totalMs: 1500 },
+          tokens: { input: 50, output: 25, total: 75 },
+          model: { provider: 'p', modelId: 'm' },
+          timestamp: 90000,
+        },
+      ],
+      60_000
+    );
+    // agent = (2000-0) + (3000-500) + (1000-0) = 5500
+    expect(c.agentMs).toBe(5500);
+    expect(c.agentTurns).toBe(3);
+    expect(c.agentTokens.total).toBe(525);
+    // gap0 = (70000-4000) - 0 = 66000 -> capped at 60000; gap1 = (90000-1500) - 70000 = 18500
+    expect(c.humanMs).toBe(60000 + 18500);
+    expect(c.humanWindows).toBe(2);
+    expect(c.startedAt).toBe(0);
+  });
+
+  it('returns zeros for no markers', () => {
+    const c = convertTpsEntries([], 60_000);
+    expect(c.agentMs).toBe(0);
+    expect(c.humanMs).toBe(0);
+    expect(c.startedAt).toBe(0);
+  });
 });
 
 describe('buildReceiptHtml', () => {
@@ -327,6 +433,94 @@ describe('extension integration', () => {
     expect(seg.toolMs).toBe(600); // union [0,600], not 200+400+... summed
   });
 
+  it('records a fallback agent segment at turn_end when pi-tps is absent', async () => {
+    const msg = makeAssistantMessage();
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
+    fixture.run('message_start', { type: 'message_start', message: msg });
+    fixture.run('message_update', { type: 'message_update', message: msg }); // first token
+    await vi.advanceTimersByTimeAsync(400);
+    fixture.run('message_update', { type: 'message_update', message: msg });
+    await vi.advanceTimersByTimeAsync(400);
+    fixture.run('message_update', { type: 'message_update', message: msg });
+    await vi.advanceTimersByTimeAsync(400);
+    fixture.run('message_end', { type: 'message_end', message: msg });
+    // no tps:telemetry → fallback fires at turn_end
+    fixture.run('turn_end', { type: 'turn_end', turnIndex: 0, message: msg, toolResults: [] });
+
+    const seg = lastEntry(fixture, 'ledger-agent');
+    expect(seg).toBeDefined();
+    expect(seg.source).toBe('fallback');
+    expect(seg.agentMs).toBe(1200); // 1200ms generation, no stalls, no tools
+    expect(seg.generationMs).toBe(1200);
+    expect(seg.stallMs).toBe(0);
+    expect(seg.model.modelId).toBe('gpt-4');
+  });
+
+  it('excludes stalls in the fallback measurement', async () => {
+    const msg = makeAssistantMessage();
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
+    fixture.run('message_start', { type: 'message_start', message: msg });
+    fixture.run('message_update', { type: 'message_update', message: msg }); // first token
+    await vi.advanceTimersByTimeAsync(400);
+    fixture.run('message_update', { type: 'message_update', message: msg }); // gap 400, no stall
+    await vi.advanceTimersByTimeAsync(1500);
+    fixture.run('message_update', { type: 'message_update', message: msg }); // gap 1500 → stall
+    await vi.advanceTimersByTimeAsync(400);
+    fixture.run('message_end', { type: 'message_end', message: msg });
+    fixture.run('turn_end', { type: 'turn_end', turnIndex: 0, message: msg, toolResults: [] });
+
+    const seg = lastEntry(fixture, 'ledger-agent');
+    // generation 2300 (message span) − stall 1500 = 800
+    expect(seg.source).toBe('fallback');
+    expect(seg.generationMs).toBe(2300);
+    expect(seg.stallMs).toBe(1500);
+    expect(seg.agentMs).toBe(800);
+  });
+
+  it('corrects a fallback with the later tps segment for the same turn (no double-count)', async () => {
+    const msg = makeAssistantMessage();
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
+    fixture.run('message_start', { type: 'message_start', message: msg });
+    fixture.run('message_update', { type: 'message_update', message: msg });
+    await vi.advanceTimersByTimeAsync(400);
+    fixture.run('message_update', { type: 'message_update', message: msg });
+    await vi.advanceTimersByTimeAsync(400);
+    fixture.run('message_end', { type: 'message_end', message: msg });
+    // ledger-before-tps load order: fallback first...
+    fixture.run('turn_end', { type: 'turn_end', turnIndex: 0, message: msg, toolResults: [] });
+    expect(lastEntry(fixture, 'ledger-agent').source).toBe('fallback');
+    expect(lastEntry(fixture, 'ledger-agent').agentMs).toBe(800);
+    // ...then tps arrives and corrects it
+    fixture.emitEvent('tps:telemetry', makeTpsTelemetry({ generationMs: 2000, stallMs: 500 }));
+
+    const seg = lastEntry(fixture, 'ledger-agent');
+    expect(seg.source).toBe('tps');
+    expect(seg.agentMs).toBe(1500); // (2000 - 500) + 0
+    expect(entryCount(fixture, 'ledger-agent')).toBe(2); // fallback + tps entries kept
+    // rehydrate dedups → keeps tps
+    const appended = fixture.appendEntrySpy.mock.calls
+      .filter((c) => c[0] === 'ledger-agent')
+      .map((c) => ({ type: 'custom', customType: 'ledger-agent', data: c[1] }));
+    const r = rehydrateFromEntries(appended);
+    expect(r.totals.agentMs).toBe(1500);
+    expect(r.totals.agentTurns).toBe(1);
+  });
+
+  it('writes no fallback once pi-tps has been seen (skipped turns stay skipped)', async () => {
+    const msg = makeAssistantMessage();
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
+    fixture.emitEvent('tps:telemetry', makeTpsTelemetry({ generationMs: 1000, stallMs: 0 }));
+    fixture.run('turn_start', { type: 'turn_start', turnIndex: 1, timestamp: Date.now() });
+    fixture.run('message_start', { type: 'message_start', message: msg });
+    fixture.run('message_update', { type: 'message_update', message: msg });
+    await vi.advanceTimersByTimeAsync(400);
+    fixture.run('message_end', { type: 'message_end', message: msg });
+    fixture.run('turn_end', { type: 'turn_end', turnIndex: 1, message: msg, toolResults: [] });
+    // turn 1 had no tps:telemetry (skipped); tpsEverSeen is true → no fallback
+    const agentEntries = fixture.appendEntrySpy.mock.calls.filter((c) => c[0] === 'ledger-agent');
+    expect(agentEntries).toHaveLength(1); // only the turn-0 tps entry
+  });
+
   it('opens/closes a human window and bills actual idle under the grace budget', async () => {
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // grace 1m
     await vi.advanceTimersByTimeAsync(5000); // 5s idle — wizard (60s) not yet fired
@@ -444,22 +638,28 @@ describe('extension integration', () => {
     );
   });
 
-  it('emits a one-time pi-tps warning on first agent_end before any telemetry', async () => {
+  it('notifies (once, info) that built-in timing is in use when pi-tps is absent', async () => {
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     expect(fixture.notifySpy).toHaveBeenCalledWith(
-      expect.stringContaining('tps:telemetry'),
-      'warning'
+      expect.stringContaining('built-in timing'),
+      'info'
     );
+    fixture.notifySpy.mockClear();
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    const noted = fixture.notifySpy.mock.calls.some(
+      (c) => typeof c[0] === 'string' && c[0].includes('built-in timing')
+    );
+    expect(noted).toBe(false); // one-time only
   });
 
-  it('does not warn after telemetry has been seen', async () => {
+  it('does not notify built-in timing after telemetry has been seen', async () => {
     fixture.run('turn_start', { type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
     fixture.emitEvent('tps:telemetry', makeTpsTelemetry());
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
-    const warned = fixture.notifySpy.mock.calls.some(
-      (c) => typeof c[0] === 'string' && c[0].includes('tps:telemetry')
+    const noted = fixture.notifySpy.mock.calls.some(
+      (c) => typeof c[0] === 'string' && c[0].includes('built-in timing')
     );
-    expect(warned).toBe(false);
+    expect(noted).toBe(false);
   });
 
   it('/ledger-receipt writes an HTML file with the totals', async () => {
@@ -509,6 +709,48 @@ describe('extension integration', () => {
       expect(
         fixture.notifySpy.mock.calls.some(
           (c) => typeof c[0] === 'string' && c[0].startsWith('Receipt →')
+        )
+      ).toBe(true);
+    } finally {
+      delete process.env.XDG_CACHE_HOME;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('/ledger-receipt converts pi-tps markers when there is no live ledger data', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
+    process.env.XDG_CACHE_HOME = tmp;
+    try {
+      // A session with only pi-tps markers — pi-ledger wasn't tracking.
+      fixture.mockEntries.push({
+        type: 'custom',
+        customType: 'ledger-settings',
+        data: { ...DEFAULTS, agentRatePerHour: 100, humanRatePerHour: 50, project: 'demo' },
+      });
+      fixture.mockEntries.push({
+        type: 'custom',
+        customType: 'tps',
+        data: {
+          timing: { generationMs: 3_600_000, stallMs: 0, totalMs: 3_700_000 },
+          tokens: { input: 0, output: 0, total: 1500 },
+          model: { provider: 'openai', modelId: 'gpt-4' },
+          timestamp: 1000,
+        },
+      });
+      fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // settings + empty totals
+
+      await fixture.commands['ledger-receipt'].handler('', fixture.mockCtx);
+
+      const dir = path.join(tmp, 'pi-ledger');
+      const files = fs.readdirSync(dir);
+      expect(files).toHaveLength(1);
+      const html = fs.readFileSync(path.join(dir, files[0]!), 'utf8');
+      // 1h agent @ $100 = $100; single marker → no inter-turn gap → no human time
+      expect(html).toContain('$100.00');
+      expect(html).toContain('demo');
+      expect(
+        fixture.notifySpy.mock.calls.some(
+          (c) => typeof c[0] === 'string' && c[0].includes('pi-tps markers')
         )
       ).toBe(true);
     } finally {
