@@ -15,11 +15,13 @@ import {
   closeWindowBudget,
   computeAgentMs,
   computeBilling,
+  consumeExtensionBudget,
   convertTpsEntries,
   extractTpsEntries,
   fmtHours,
   fmtMoney,
   rehydrateFromSidecar,
+  resolveExtensionBudget,
   sidecarPathFor,
   type LedgerSettings,
   type ReceiptData,
@@ -80,6 +82,77 @@ describe('closeWindowBudget', () => {
   });
   it('clamps negative durations', () => {
     expect(closeWindowBudget(100, 50, 60_000)).toEqual({ idleMs: 0, billedMs: 0 });
+  });
+});
+
+describe('consumeExtensionBudget', () => {
+  const grace = 60_000;
+  it('consumes nothing while billed stays within the per-window grace', () => {
+    expect(consumeExtensionBudget(30_000, grace, 20 * 60_000)).toBe(0);
+    expect(consumeExtensionBudget(60_000, grace, 20 * 60_000)).toBe(0); // exactly grace → free
+  });
+  it('consumes the billed time beyond grace, up to the provisioned budget', () => {
+    // billed 5m, grace 1m → 4m beyond grace, 20m provisioned → consume 4m
+    expect(consumeExtensionBudget(5 * 60_000, grace, 20 * 60_000)).toBe(4 * 60_000);
+  });
+  it('caps consumption at the remaining provisioned budget', () => {
+    // billed 10m, grace 1m → 9m beyond grace, but only 2m provisioned → consume 2m
+    expect(consumeExtensionBudget(10 * 60_000, grace, 2 * 60_000)).toBe(2 * 60_000);
+  });
+  it('clamps zero/empty budgets', () => {
+    expect(consumeExtensionBudget(5 * 60_000, grace, 0)).toBe(0);
+    expect(consumeExtensionBudget(0, grace, 20 * 60_000)).toBe(0);
+  });
+});
+
+describe('resolveExtensionBudget', () => {
+  const grace = 60_000;
+  it('reads the recorded field when present (open + close)', () => {
+    const open = {
+      kind: 'human-open',
+      openedAt: 0,
+      grantedBudgetMs: 21 * 60_000,
+      extensions: 1,
+      extensionBudgetMs: 20 * 60_000,
+      timestamp: 0,
+    } as SidecarEvent;
+    expect(resolveExtensionBudget(open, grace)).toBe(20 * 60_000);
+    const close = {
+      kind: 'human-close',
+      openedAt: 0,
+      closedAt: 1000,
+      billedMs: 1000,
+      idleMs: 1000,
+      grantedBudgetMs: 21 * 60_000,
+      extensions: 1,
+      extensionBudgetMs: 19 * 60_000,
+      timestamp: 1,
+    } as SidecarEvent;
+    expect(resolveExtensionBudget(close, grace)).toBe(19 * 60_000);
+  });
+  it('backfills an open legacy event as cap − grace (the extension portion)', () => {
+    const open = {
+      kind: 'human-open',
+      openedAt: 0,
+      grantedBudgetMs: 21 * 60_000,
+      extensions: 1,
+      timestamp: 0,
+    } as SidecarEvent;
+    expect(resolveExtensionBudget(open, grace)).toBe(20 * 60_000);
+  });
+  it('backfills a close legacy event as cap − max(billed, grace)', () => {
+    // billed 5m, grace 1m, cap 21m → remaining = 21m − 5m = 16m
+    const close = {
+      kind: 'human-close',
+      openedAt: 0,
+      closedAt: 5 * 60_000,
+      billedMs: 5 * 60_000,
+      idleMs: 5 * 60_000,
+      grantedBudgetMs: 21 * 60_000,
+      extensions: 1,
+      timestamp: 1,
+    } as SidecarEvent;
+    expect(resolveExtensionBudget(close, grace)).toBe(16 * 60_000);
   });
 });
 
@@ -256,6 +329,68 @@ describe('rehydrateFromSidecar', () => {
     expect(r.humanWindow).toBeNull();
     expect(r.totals.humanMs).toBe(4000);
     expect(r.totals.humanWindows).toBe(1);
+  });
+  it('reconstructs the rolling extension budget carried into an open window', () => {
+    const events: SidecarEvent[] = [
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      {
+        kind: 'human-open',
+        openedAt: 1000,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 20 * 60_000,
+        timestamp: 1000,
+      },
+    ];
+    const r = rehydrateFromSidecar(events);
+    expect(r.humanWindow).toEqual({
+      openedAt: 1000,
+      grantedBudgetMs: 21 * 60_000,
+      extensions: 1,
+    });
+    expect(r.extensionBudgetMs).toBe(20 * 60_000);
+  });
+  it('reconstructs the rolling budget remaining after a closed window', () => {
+    const events: SidecarEvent[] = [
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      {
+        kind: 'human-open',
+        openedAt: 1000,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 20 * 60_000,
+        timestamp: 1000,
+      },
+      {
+        kind: 'human-close',
+        openedAt: 1000,
+        closedAt: 3 * 60_000,
+        billedMs: 3 * 60_000,
+        idleMs: 3 * 60_000,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 18 * 60_000,
+        timestamp: 3000,
+      },
+    ];
+    const r = rehydrateFromSidecar(events);
+    expect(r.humanWindow).toBeNull();
+    expect(r.extensionBudgetMs).toBe(18 * 60_000);
+  });
+  it('backfills the rolling budget for legacy events missing the field', () => {
+    // open with cap 21m (grace 1m + 20m ext), no extensionBudgetMs field
+    const events: SidecarEvent[] = [
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      {
+        kind: 'human-open',
+        openedAt: 1000,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        timestamp: 1000,
+      },
+    ];
+    const r = rehydrateFromSidecar(events);
+    expect(r.extensionBudgetMs).toBe(20 * 60_000);
   });
 });
 
@@ -588,6 +723,86 @@ describe('extension integration', () => {
     expect(seg.grantedBudgetMs).toBe(60_000 + 20 * 60_000);
     expect(seg.extensions).toBe(1);
     expect(seg.billedMs).toBe(360_000); // 6 min
+  });
+
+  it('suppresses the wizard at the next agent_end while rolling extension credit remains', async () => {
+    fixture.setCustomResult('extend');
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pops → +20m
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(120_000); // 2m idle (under 21m cap); flushes the extend
+    fixture.run('agent_start', { type: 'agent_start' }); // close: 2m billed, 1m ext consumed → 19m left
+
+    const seg1 = lastEntry(fixture, 'ledger-human');
+    expect(seg1.billedMs).toBe(120_000);
+    expect(seg1.extensionBudgetMs).toBe(19 * 60_000);
+
+    // next agent_end: 19m credit remains → wizard is NOT shown (armed for exhaustion instead)
+    fixture.customSpy.mockClear();
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    // the new window's cap = per-window grace (1m) + 19m rolling credit = 20m
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open!.grantedBudgetMs).toBe(20 * 60_000);
+    expect(open!.extensionBudgetMs).toBe(19 * 60_000);
+  });
+
+  it('rolls unused extension credit across multiple agent turns', async () => {
+    fixture.setCustomResult('extend');
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // +20m
+    await vi.advanceTimersByTimeAsync(120_000); // 2m idle
+    fixture.run('agent_start', { type: 'agent_start' }); // close → 1m ext consumed → 19m left
+
+    // turn 2: credit remains → no pop
+    fixture.customSpy.mockClear();
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(120_000); // 2m idle
+    fixture.run('agent_start', { type: 'agent_start' }); // close → 1m ext consumed → 18m left
+    expect(lastEntry(fixture, 'ledger-human').extensionBudgetMs).toBe(18 * 60_000);
+
+    // turn 3: still 18m credit → still suppressed
+    fixture.customSpy.mockClear();
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+  });
+
+  it('pops the wizard at agent_end when no rolling credit remains', async () => {
+    fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // no credit → pop immediately
+  });
+
+  it('suppresses the wizard at agent_end when rolling credit is rehydrated', async () => {
+    // A prior idle window left 19m of rolling pomodoro credit on the sidecar.
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      {
+        kind: 'human-open',
+        openedAt: 0,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 20 * 60_000,
+        timestamp: 1000,
+      },
+      {
+        kind: 'human-close',
+        openedAt: 0,
+        closedAt: 2 * 60_000,
+        billedMs: 2 * 60_000,
+        idleMs: 2 * 60_000,
+        grantedBudgetMs: 21 * 60_000,
+        extensions: 1,
+        extensionBudgetMs: 19 * 60_000,
+        timestamp: 2000,
+      },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // rehydrate 19m credit
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    expect(fixture.customSpy).not.toHaveBeenCalled(); // 19m credit → suppressed
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open!.grantedBudgetMs).toBe(20 * 60_000); // grace 1m + 19m credit
+    expect(open!.extensionBudgetMs).toBe(19 * 60_000);
   });
 
   it('/ledger-extend opens the wizard; confirming extends by the given minutes', async () => {

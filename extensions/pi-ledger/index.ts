@@ -14,7 +14,9 @@
  * Human time = the idle window between agent_end and the next agent_start,
  * capped by a granted budget: the first grace minute is always billable,
  * then a non-blocking wizard offers +pomodoro extensions; `/ledger-extend`
- * does the same manually.
+ * does the same manually. Extensions are ROLLING credit — provisioned
+ * pomodoro blocks survive across agent turns, so the wizard stays silent
+ * while credit remains and only re-pops when it's exhausted.
  *
  * Commands: /ledger, /ledger-settings, /ledger-extend [m], /ledger-receipt
  *
@@ -118,16 +120,24 @@ export interface AgentEvent {
   timestamp: number;
 }
 
-/** Opens (and re-records, on each wizard extend) a human idle window. */
+/** Opens (and re-records, on each wizard extend) a human idle window.
+ *  `extensionBudgetMs` is the rolling billable-human-time budget carried INTO
+ *  this window (provisioned pomodoro credit that survives across agent turns);
+ *  `grantedBudgetMs` is this window's billing cap = grace + `extensionBudgetMs`. */
 export interface HumanOpenEvent {
   kind: 'human-open';
   openedAt: number;
   grantedBudgetMs: number;
   extensions: number;
+  /** Remaining rolling extension budget at the time of this event. Optional
+   *  on legacy events; backfilled from `grantedBudgetMs` − grace on replay. */
+  extensionBudgetMs?: number;
   timestamp: number;
 }
 
-/** Closes a human idle window (at the next agent_start, or at session exit). */
+/** Closes a human idle window (at the next agent_start, or at session exit).
+ *  `extensionBudgetMs` is the rolling budget REMAINING after this window's
+ *  consumption — the credit carried forward to the next idle window. */
 export interface HumanCloseEvent {
   kind: 'human-close';
   openedAt: number;
@@ -136,6 +146,9 @@ export interface HumanCloseEvent {
   idleMs: number;
   grantedBudgetMs: number;
   extensions: number;
+  /** Remaining rolling extension budget after this window's consumption.
+   *  Optional on legacy events; backfilled on replay. */
+  extensionBudgetMs?: number;
   timestamp: number;
 }
 
@@ -210,6 +223,32 @@ export function closeWindowBudget(
   const idleMs = Math.max(0, closedAt - openedAt);
   const billedMs = Math.min(idleMs, Math.max(0, grantedBudgetMs));
   return { idleMs, billedMs };
+}
+
+/** How much of the rolling extension budget a closing window consumes.
+ *
+ *  The first `graceMs` of every idle window is always billable (per-window,
+ *  never rolls). Only the billed time BEYOND grace eats into the rolling
+ *  extension credit, capped at what was provisioned. Pure. */
+export function consumeExtensionBudget(
+  billedMs: number,
+  graceMs: number,
+  extensionBudgetMs: number
+): number {
+  return Math.min(Math.max(0, billedMs - graceMs), Math.max(0, extensionBudgetMs));
+}
+
+/** Resolve the rolling extension budget recorded on a human event, with a
+ *  backfill for legacy sidecar entries that predate the field. Pure.
+ *  @internal Exported for testing only. */
+export function resolveExtensionBudget(
+  e: HumanOpenEvent | HumanCloseEvent,
+  graceMs: number
+): number {
+  if (typeof e.extensionBudgetMs === 'number') return e.extensionBudgetMs;
+  if (e.kind === 'human-open') return Math.max(0, e.grantedBudgetMs - graceMs);
+  // human-close: remaining = cap − max(billed, grace) (grace is free per window)
+  return Math.max(0, e.grantedBudgetMs - Math.max(e.billedMs, graceMs));
 }
 
 export function computeBilling(
@@ -314,6 +353,7 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
   settings: LedgerSettings;
   totals: Totals;
   humanWindow: { openedAt: number; grantedBudgetMs: number; extensions: number } | null;
+  extensionBudgetMs: number;
 } {
   let settings: LedgerSettings | null = null;
   const superseded = new Set<string>();
@@ -323,6 +363,11 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
   const agentTokens = { input: 0, output: 0, total: 0 };
   let humanMs = 0;
   let humanWindows = 0;
+  // Rolling billable-human-time budget (provisioned pomodoro credit) carried
+  // across agent turns. The last human-open/close event in the log holds the
+  // current value: an open window records what was carried in (and extended);
+  // a close records what remains after that window's consumption.
+  let extensionBudgetMs = 0;
   const closedOpenedAts = new Set<number>();
   for (const e of events) {
     if (e.kind === 'settings') {
@@ -338,6 +383,15 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
       closedOpenedAts.add(e.openedAt);
       humanMs += e.billedMs;
       humanWindows += 1;
+      extensionBudgetMs = resolveExtensionBudget(
+        e,
+        (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE
+      );
+    } else if (e.kind === 'human-open') {
+      extensionBudgetMs = resolveExtensionBudget(
+        e,
+        (settings ?? DEFAULT_SETTINGS).graceMinutes * MS_PER_MINUTE
+      );
     }
   }
   // Last unclosed human-open (by append order) is the in-progress window.
@@ -355,6 +409,7 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
     settings: settings ?? { ...DEFAULT_SETTINGS },
     totals: { agentMs, humanMs, agentTurns, humanWindows, agentTokens },
     humanWindow,
+    extensionBudgetMs,
   };
 }
 
@@ -645,8 +700,18 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   let toolMsThisTurn = 0;
   let currentTurnIndex = 0;
 
-  // Current human idle window (null while the agent is working).
+  // Current human idle window (null while the agent is working). Its
+  // `grantedBudgetMs` is this window's billing cap = grace + the rolling
+  // extension budget carried into it.
   let humanWindow: { openedAt: number; grantedBudgetMs: number; extensions: number } | null = null;
+
+  // Rolling billable-human-time budget: provisioned pomodoro credit that
+  // survives across agent turns (the serverless "provisioned capacity"
+  // analogy). The first grace minute of every idle window is always billable
+  // and never rolls; only time beyond grace consumes this budget. The wizard
+  // is suppressed at `agent_end` while this is > 0, and re-arms to fire when
+  // it's exhausted.
+  let extensionBudgetMs = 0;
 
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -800,6 +865,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (!w) return;
     const closedAt = Date.now();
     const { idleMs, billedMs } = closeWindowBudget(w.openedAt, closedAt, w.grantedBudgetMs);
+    // Only the billed time beyond the per-window grace consumes the rolling
+    // extension budget; the leftover rolls forward to the next idle window.
+    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
+    extensionBudgetMs -= consumeExtensionBudget(billedMs, graceMs, extensionBudgetMs);
     // Always record the close (even 0-billed) so the open window is marked
     // closed on replay — never restored as a stale in-progress window.
     appendSidecar({
@@ -810,6 +879,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       idleMs,
       grantedBudgetMs: w.grantedBudgetMs,
       extensions: w.extensions,
+      extensionBudgetMs,
       timestamp: closedAt,
     });
     if (billedMs > 0) {
@@ -856,6 +926,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     wizardTimer = null;
     if (!humanWindow) return;
     const pomodoro = extendMins;
+    // Snapshot the rolling credit still provisioned (and unconsumed so far) so
+    // the user knows extending ADDS to existing capacity, not replaces it.
+    // Captured before the async custom() closure — `humanWindow` can change.
+    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
+    const elapsedNow = Math.max(0, Date.now() - humanWindow.openedAt);
+    const remainingProvisioned = Math.max(0, extensionBudgetMs - Math.max(0, elapsedNow - graceMs));
 
     ctx.ui
       .custom<string>((tui, theme, _kb, done) => {
@@ -873,6 +949,21 @@ export default function ledgerExtension(pi: ExtensionAPI) {
             0
           )
         );
+        // Show any rolling credit still provisioned (and unconsumed so far) so
+        // the user knows extending ADDS to existing capacity, not replaces it.
+        if (remainingProvisioned > 0) {
+          container.addChild(new Spacer(1));
+          container.addChild(
+            new Text(
+              theme.fg(
+                'dim',
+                `${Math.max(1, Math.round(remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more.`
+              ),
+              1,
+              0
+            )
+          );
+        }
         container.addChild(new Spacer(1));
         const items: SelectItem[] = [
           {
@@ -907,13 +998,16 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       })
       .then((choice) => {
         if (!humanWindow || choice !== 'extend') return;
-        humanWindow.grantedBudgetMs += pomodoro * MS_PER_MINUTE;
+        const addMs = pomodoro * MS_PER_MINUTE;
+        humanWindow.grantedBudgetMs += addMs;
         humanWindow.extensions += 1;
+        extensionBudgetMs += addMs;
         appendSidecar({
           kind: 'human-open',
           openedAt: humanWindow.openedAt,
           grantedBudgetMs: humanWindow.grantedBudgetMs,
           extensions: humanWindow.extensions,
+          extensionBudgetMs,
           timestamp: Date.now(),
         });
         armWizardForBoundary(ctx);
@@ -947,6 +1041,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       totals.humanWindows = r.totals.humanWindows;
       totals.agentTokens = r.totals.agentTokens;
       humanWindow = r.humanWindow;
+      extensionBudgetMs = r.extensionBudgetMs;
     }
     updateStatus(ctx);
   }
@@ -1153,9 +1248,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.on('agent_end', (_event, ctx) => {
     lastCtx = ctx;
     if (humanWindow) closeHumanWindow(ctx); // safety: should already be null
+    // This window's cap = the per-window grace + whatever rolling pomodoro
+    // credit survived the last idle window. The grace minute is always
+    // billable; the extension credit rolls across turns.
+    const graceMs = settings.graceMinutes * MS_PER_MINUTE;
+    const cap = graceMs + extensionBudgetMs;
     humanWindow = {
       openedAt: Date.now(),
-      grantedBudgetMs: settings.graceMinutes * MS_PER_MINUTE,
+      grantedBudgetMs: cap,
       extensions: 0,
     };
     appendSidecar({
@@ -1163,6 +1263,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       openedAt: humanWindow.openedAt,
       grantedBudgetMs: humanWindow.grantedBudgetMs,
       extensions: 0,
+      extensionBudgetMs,
       timestamp: humanWindow.openedAt,
     });
     if (!tpsEverSeen && !fallbackNotified) {
@@ -1173,7 +1274,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         'info'
       );
     }
-    armWizardNow(ctx);
+    // Don't nag while provisioned capacity remains: arm the wizard to fire
+    // only when this window's budget is exhausted. With no credit left, pop
+    // immediately so the user can buy a pomodoro block.
+    if (extensionBudgetMs > 0) armWizardForBoundary(ctx);
+    else armWizardNow(ctx);
     updateStatus(ctx);
   });
 
