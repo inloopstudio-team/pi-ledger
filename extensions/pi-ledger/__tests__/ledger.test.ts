@@ -2144,3 +2144,133 @@ describe('steering composition (human types while the agent runs)', () => {
     expect(msg).toContain('(1 windows)'); // just the rehydrated steer — no initial window (engagement-gated)
   });
 });
+
+// ─── Skip-billing guard ─────────────────────────────────────────────────────
+
+function plainInput(source: 'interactive' | 'extension' = 'interactive') {
+  return { type: 'input' as const, text: 'hello', source };
+}
+
+describe('skip-billing guard (choosing "Stop billing" blocks agent messages)', () => {
+  let fixture: TestFixture;
+  let cacheDir: string;
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
+    process.env.XDG_CACHE_HOME = cacheDir;
+    fixture = createTestFixture();
+    await activateExtension(fixture);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.XDG_CACHE_HOME;
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  /** Pop the engagement wizard (agent_end, no credit) and flush the choice. */
+  async function chooseWizard(choice: 'stop' | 'extend' | 'dismiss') {
+    fixture.setCustomResult(choice);
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    await vi.advanceTimersByTimeAsync(0); // flush the wizard .then
+  }
+
+  it('choosing "Stop billing" blocks interactive prompts to the agent', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    await chooseWizard('stop'); // skip billing → pause
+
+    const res = fixture.run('input', plainInput());
+    expect(res).toEqual({ action: 'handled' }); // dropped — no agent turn
+    expect(
+      fixture.notifySpy.mock.calls.some(
+        (c) => typeof c[0] === 'string' && c[0].includes('Billing is paused')
+      )
+    ).toBe(true);
+    expect(fixture.lastSidecarEvent('billing-pause')!.paused).toBe(true);
+    expect(fixture.setStatusSpy).toHaveBeenCalledWith('ledger', expect.stringContaining('paused'));
+  });
+
+  it('also blocks a mid-run steer while billing is paused', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    await chooseWizard('stop');
+    fixture.run('agent_start', { type: 'agent_start' }); // run begins
+    await typeBurst(fixture, 20_000); // stage a steer
+    const res = fixture.run('input', steerInput('steer'));
+    expect(res).toEqual({ action: 'handled' }); // blocked before the steer bills
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // no steer recorded
+  });
+
+  it('does not block programmatic (non-interactive) input', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    await chooseWizard('stop');
+    fixture.notifySpy.mockClear();
+    const res = fixture.run('input', plainInput('extension'));
+    expect(res).toBeUndefined(); // guard scopes to interactive — passes through
+    // the guard's block notify must not fire for programmatic input
+    expect(fixture.notifySpy).not.toHaveBeenCalled();
+  });
+
+  it('dismissing the wizard (esc) does NOT pause billing (no change)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    await chooseWizard('dismiss'); // esc dismiss → no change (not "Stop billing")
+    const res = fixture.run('input', plainInput());
+    expect(res).toBeUndefined(); // allowed — not paused
+    expect(fixture.lastSidecarEvent('billing-pause')).toBeUndefined();
+  });
+
+  it('/ledger-extend → "Extend" resumes: clears the pause and unblocks input', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    await chooseWizard('stop'); // pause
+    expect(fixture.run('input', plainInput())).toEqual({ action: 'handled' });
+
+    fixture.setCustomResult('extend');
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx);
+    await vi.advanceTimersByTimeAsync(0); // flush the extend → clears pause + grants 5m
+
+    expect(fixture.lastSidecarEvent('billing-pause')!.paused).toBe(false);
+    expect(fixture.run('input', plainInput())).toBeUndefined(); // unblocked
+    // a steer now bills again (no longer guarded)
+    fixture.run('agent_start', { type: 'agent_start' });
+    await typeBurst(fixture, 60_000);
+    fixture.run('input', steerInput('steer'));
+    expect(fixture.lastSidecarEvent('steer')).toBeDefined();
+  });
+
+  it('the pause survives a reload via the sidecar (autoWizard off)', async () => {
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, autoWizard: false }, timestamp: 0 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // autoWizard off → no pop
+    // pause via /ledger-extend → "Stop" (the wizard opens regardless of autoWizard)
+    fixture.setCustomResult('stop');
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx);
+    await vi.advanceTimersByTimeAsync(0); // flush → pause (billing-pause: true)
+    expect(fixture.run('input', plainInput())).toEqual({ action: 'handled' });
+
+    // reload: rehydrate restores the pause from the sidecar; autoWizard off → no re-pop
+    fixture.run('session_start', { type: 'session_start', reason: 'reload' });
+    expect(fixture.run('input', plainInput())).toEqual({ action: 'handled' }); // still paused
+    expect(fixture.lastSidecarEvent('billing-pause')!.paused).toBe(true);
+  });
+});
+
+describe('rehydrateFromSidecar — skip-billing guard', () => {
+  it('restores billingPaused from the last billing-pause event (last wins)', () => {
+    const events: SidecarEvent[] = [
+      { kind: 'billing-pause', paused: true, timestamp: 1 },
+      { kind: 'billing-pause', paused: false, timestamp: 2 },
+      { kind: 'billing-pause', paused: true, timestamp: 3 },
+    ];
+    expect(rehydrateFromSidecar(events).billingPaused).toBe(true); // last wins
+  });
+
+  it('defaults billingPaused to false when no billing-pause event is present', () => {
+    const events: SidecarEvent[] = [{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }];
+    expect(rehydrateFromSidecar(events).billingPaused).toBe(false);
+  });
+
+  it('defaults billingPaused to false for an empty sidecar', () => {
+    expect(rehydrateFromSidecar([]).billingPaused).toBe(false);
+  });
+});

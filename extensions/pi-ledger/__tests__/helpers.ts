@@ -171,7 +171,7 @@ export function createTestFixture(): TestFixture {
     for (const listener of eventListeners.get(event) ?? []) listener(payload);
   };
   const run = (name: string, event: unknown) => {
-    handlers[name]?.(event, mockCtx);
+    return handlers[name]?.(event, mockCtx);
   };
 
   const mockPi: Partial<ExtensionAPI> = {

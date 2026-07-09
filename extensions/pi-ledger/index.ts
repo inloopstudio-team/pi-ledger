@@ -41,6 +41,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  InputEventResult,
   KeybindingsManager,
   Theme,
 } from '@earendil-works/pi-coding-agent';
@@ -240,9 +241,21 @@ export interface SettingsEvent {
   timestamp: number;
 }
 
+/** A billing-pause toggle (the wizard's "Stop billing" choice). Last one wins
+ *  on replay: while paused, interactive prompts/steers to the agent are
+ *  blocked (the `input` event returns "handled") until the human extends via
+ *  `/ledger-extend`. Slash commands are unaffected — pi-core runs registered
+ *  slash commands before emitting the `input` event. */
+export interface BillingPauseEvent {
+  kind: 'billing-pause';
+  paused: boolean;
+  timestamp: number;
+}
+
 /** The sidecar event log: per-session, append-only, survives compaction. */
 export type SidecarEvent =
   | SettingsEvent
+  | BillingPauseEvent
   | AgentEvent
   | HumanOpenEvent
   | HumanCloseEvent
@@ -524,6 +537,7 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
     engagedVia: 'keystroke' | 'extension';
   } | null;
   extensionBudgetMs: number;
+  billingPaused: boolean;
 } {
   let settings: LedgerSettings | null = null;
   const superseded = new Set<string>();
@@ -562,6 +576,9 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
   // the live grant/consume calls exactly, so rehydrate reconstructs the same
   // totals.
   let extensionBudgetMs = 0;
+  // Skip-billing guard: last `billing-pause` event wins on replay. While
+  // paused, interactive prompts/steers are blocked until the human extends.
+  let billingPaused = false;
   const closedOpenedAts = new Set<number>();
   // Apply a recorded rolling-budget value: a rise = a credit grant (one
   // block), a fall = a consumption (billed against credit). Mirrors the live
@@ -608,6 +625,8 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
       applyBudgetDelta(resolveExtensionBudget(e));
     } else if (e.kind === 'human-open') {
       applyBudgetDelta(resolveExtensionBudget(e));
+    } else if (e.kind === 'billing-pause') {
+      billingPaused = e.paused;
     } else if (e.kind === 'steer') {
       // A steer/followUp composed during a run is human time, billed under the
       // same rolling-credit cap as an idle window. It consumes rolling credit;
@@ -676,6 +695,7 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
     },
     humanWindow,
     extensionBudgetMs,
+    billingPaused,
   };
 }
 
@@ -1108,6 +1128,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // it's exhausted.
   let extensionBudgetMs = 0;
 
+  // Skip-billing guard: set when the human chooses "Stop billing" in the
+  // wizard. While true, the `input` event blocks interactive prompts/steers
+  // from reaching the agent (returns "handled") until the human extends via
+  // `/ledger-extend`. Slash commands are unaffected (pi-core runs them
+  // before emitting `input`). Persisted to the sidecar so the guard survives
+  // reload/compaction (the source of truth); rehydrate restores it.
+  let billingPaused = false;
+
   // Whether the agent loop is currently running (between agent_start and
   // agent_end). Steering composition is metered only while this is true — the
   // initial and idle windows already capture typing outside a run.
@@ -1215,6 +1243,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     appendSidecar({ kind: 'settings', settings: { ...settings }, timestamp: Date.now() });
   }
 
+  function persistPause(paused: boolean) {
+    appendSidecar({ kind: 'billing-pause', paused, timestamp: Date.now() });
+  }
+
   function effectiveAuthor(): string {
     return settings.author || defaultAuthor();
   }
@@ -1294,7 +1326,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (!ctx || !ctx.hasUI) return;
     const t = computeDisplayTotals(ctx);
     const b = computeBilling(t.agentMs, t.humanMs, settings);
-    const text = `ledger · agent ${fmtHours(t.agentMs)} · human ${fmtHours(t.humanMs)} · ${fmtMoney(b.total, settings.currency)}`;
+    const text = `ledger · agent ${fmtHours(t.agentMs)} · human ${fmtHours(t.humanMs)} · ${fmtMoney(b.total, settings.currency)}${billingPaused ? ' · paused' : ''}`;
     const theme = ctx.ui.theme;
     ctx.ui.setStatus('ledger', theme ? theme.fg('dim', text) : text);
   }
@@ -1566,12 +1598,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
           {
             value: 'stop',
             label: 'Stop billing',
-            description: 'Cap human time at the current budget',
+            description: 'Pause the agent until you extend via /ledger-extend',
           },
         ];
         const list = new SelectList(items, 5, getSelectListTheme());
         list.onSelect = (item) => done(item.value);
-        list.onCancel = () => done('stop');
+        list.onCancel = () => done('dismiss'); // esc dismiss = no change (not "Stop billing")
         container.addChild(list);
         container.addChild(new Spacer(1));
         container.addChild(
@@ -1589,7 +1621,31 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         };
       })
       .then((choice) => {
-        if (choice !== 'extend') return; // stop/dismiss = no engagement, no change
+        if (choice !== 'extend' && choice !== 'stop') return; // dismiss = no change
+        if (choice === 'stop') {
+          // "Stop billing" = skip billing: arm the guard so interactive
+          // prompts/steers to the agent are blocked until the human extends
+          // (via /ledger-extend). Slash commands are unaffected (pi-core runs
+          // them before emitting the `input` event). Persist so the guard
+          // survives reload/compaction — the sidecar is the source of truth.
+          billingPaused = true;
+          persistPause(true);
+          updateStatus(ctx);
+          notify(
+            ctx,
+            'Billing stopped — run /ledger-extend to extend your time and resume the agent.',
+            'warning'
+          );
+          return;
+        }
+        // Extend: resume billing (clear the skip-billing guard) and grant
+        // capacity. Clearing the guard here is what unblocks agent messages
+        // after a "Stop billing" — running /ledger-extend and extending is the
+        // documented way to resume.
+        if (billingPaused) {
+          billingPaused = false;
+          persistPause(false);
+        }
         const addMs = pomodoro * MS_PER_MINUTE;
         if (!humanWindow) {
           // No window yet: extend both engages (onset = now) and grants capacity.
@@ -1645,6 +1701,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       // window while the status bar (which uses the bundled ms) stayed correct.
       Object.assign(totals, r.totals);
       extensionBudgetMs = r.extensionBudgetMs; // rolling credit carries forward
+      billingPaused = r.billingPaused; // skip-billing guard carries forward
       // An unclosed window from a prior session was never committed by an agent
       // action — idle with no output is wasted, so abandon it (bills 0) rather
       // than continuing its stale onset across the session gap. Mark it closed
@@ -1962,15 +2019,27 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     if (extensionBudgetMs <= 0) armWizardNow(ctx);
   });
 
-  // Steering composition is submitted via the `input` event, which tells us
-  // how the message is delivered (`streamingBehavior`: "steer" for a mid-stream
-  // interrupt, "followUp" for a queued message) and where it came from
-  // (`source`: "interactive" for a human typing). Commit the staged typing as
-  // human time — billed as the active-typing burst sum, only when it's
-  // actually queued/steered to the agent. Pass-through: never transform or
-  // handle the input — only observe it for billing.
-  pi.on('input', (event, ctx) => {
+  // The `input` event fires for every interactive submit that isn't a slash
+  // command (pi-core runs registered slash commands before emitting `input`),
+  // so this is the choke point to guard agent messages when billing is
+  // skipped. Steering composition is also submitted here (see below).
+  pi.on('input', (event, ctx): InputEventResult | void => {
     lastCtx = ctx;
+    // Skip-billing guard: if the human chose "Stop billing" in the wizard,
+    // block interactive prompts/steers from reaching the agent until they
+    // extend via /ledger-extend. Returning "handled" tells pi-core to drop the
+    // input (no agent turn). Slash commands are unaffected — pi-core executes
+    // them before `input` fires — so /ledger-extend still works to resume.
+    // Programmatic sources (extension/rpc) are left alone so other extensions'
+    // workflows aren't blocked by a human billing decision.
+    if (billingPaused && event.source === 'interactive') {
+      notify(
+        ctx,
+        'Billing is paused — run /ledger-extend to extend your time and resume.',
+        'warning'
+      );
+      return { action: 'handled' };
+    }
     const behavior = event.streamingBehavior;
     if (behavior !== 'steer' && behavior !== 'followUp') return; // only mid-run
     if (event.source !== 'interactive') return; // only human-typed steers
