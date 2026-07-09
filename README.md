@@ -35,8 +35,10 @@ against it. Even the time spent writing the first prompt is metered: an initial
 window opens on your **first keystroke** and commits when you send the prompt
 (it produces agent work), billed against your credit. So is steering: a steer
 or queued followUp you compose while the agent runs is metered by its typing
-bursts — and only when actually queued/steered to the agent — under the same
-cap. Idle costs nothing by default: an idle window opens only when you
+bursts — billed when the message is actually **delivered** to the agent (the
+agent outcome), not at submit — under the same cap. Reverting a queued message
+and re-steering it bills the composition once at the re-steer's delivery; one
+you dequeue and never re-send bills nothing. Idle costs nothing by default: an idle window opens only when you
 **engage** it (first keystroke or extension) after `agent_end`, and bills only
 when your next submit produces agent work (`agent_start`) — so pure idle, or
 idle you walk away from, bills nothing. A wizard pops at `agent_end` (inline,
@@ -86,12 +88,12 @@ billed) but enough to demo the output.
 
 ## How time is measured
 
-| Phase     | Bracket                                                          | Billed as  |
-| --------- | ---------------------------------------------------------------- | ---------- |
-| **Agent** | `agent_start` → `agent_end` (sum of turns)                       | Agent time |
-| **Human** | idle after `agent_end` (engaged → committed at `agent_start`)    | Human time |
-| **Human** | first-prompt composition (first keystroke → first `agent_start`) | Human time |
-| **Human** | steer/followUp composed during a run (typing bursts, on submit)  | Human time |
+| Phase     | Bracket                                                                  | Billed as  |
+| --------- | ------------------------------------------------------------------------ | ---------- |
+| **Agent** | `agent_start` → `agent_end` (sum of turns)                               | Agent time |
+| **Human** | idle after `agent_end` (engaged → committed at `agent_start`)            | Human time |
+| **Human** | first-prompt composition (first keystroke → first `agent_start`)         | Human time |
+| **Human** | steer/followUp composed during a run (typing bursts, billed at delivery) | Human time |
 
 > A provider-error turn (`stopReason` `error`) opens **no** human window — its
 > retry/queue backoff isn't human idle and isn't billed (see below).
@@ -134,17 +136,24 @@ billed_human  = min(engaged_idle, granted_budget)   # only when committed at age
 granted_budget = remaining_extension_credit
 ```
 
-**Steering while the agent runs** is also human time. A thin input-editor
-wrapper stages every keystroke during a run; when you submit a steer or queued
-followUp (the `input` event's `streamingBehavior`), the composition is billed
-as the sum of its **typing bursts** — consecutive keystrokes within a gap
-threshold — not the wall-clock from the first keystroke. A single key, or keys
-spread minutes apart, bills nothing; only sustained typing that's actually
-queued/steered to the agent bills, under the same credit cap as any
-window. (This closes an earlier gap: only typing _between_ turns was metered,
-so composing a steer _during_ a run was unmetered.) Typing never submitted never
-reached the agent, so it's discarded — it bills nothing and can't inflate the
-post-turn idle window.
+**Steering while the agent runs** is also human time, and — like idle — it's
+**commit-gated on an agent outcome**. A thin input-editor wrapper stages every
+keystroke during a run; when you submit a steer or queued followUp (the `input`
+event's `streamingBehavior`), the composition becomes **pending** (queued to
+the agent) and is **billed at delivery** — the `message_start` user message
+that means the queued composition reached the agent — as the sum of its
+**typing bursts** (consecutive keystrokes within a gap threshold), not the
+wall-clock from the first keystroke. A single key, or keys spread minutes
+apart, bills nothing; only sustained typing that's actually delivered to the
+agent bills, under the same credit cap as any window. Billing at delivery
+closes the revert/re-steer abuse: reverting a queued message back to the
+editor (alt+up, "restore queued messages") carries its composition forward to
+the next submit, so reverting then re-steering bills the original typing once
+at the re-steer's delivery — never twice, never free. A composition you dequeue
+and never re-send never reaches the agent, so it bills nothing (no agent
+outcome) and is abandoned at `session_shutdown`. Typing never submitted never
+reached the agent either, so it's discarded — it bills nothing and can't
+inflate the post-turn idle window.
 
 **Idle time is engagement-gated and commit-gated.** Between turns an idle
 window opens only when you **engage** — the first keystroke you type, or the
@@ -194,7 +203,8 @@ pi-ledger bills **forward progress, not process** — four choices shape the
 whole engine:
 
 - **Bill the outcome, not the time spent.** Idle bills only when a submit
-  produces agent work; steering bills only typing actually queued to the agent.
+  produces agent work; steering bills only typing actually delivered to the
+  agent (billed at delivery, not submit).
   Thinking that led nowhere (you dismissed, walked away, or the agent did
   nothing) costs nothing. We charge for collaboration that moved the session,
   not for minutes the human spent.
@@ -270,7 +280,7 @@ entries) and accumulates across **all branches** of the session. Events:
 - `agent` — one per turn: `{ id, turnIndex, agentMs, generationMs, stallMs, toolMs, tokens, model, source, supersedes?, timestamp }`. `agentMs` is the billable time (generation normalized to the reference TPS + tool time); `generationMs`/`stallMs` are the real wall-clock (audit). A `'tps'` turn may `supersede` an earlier `'fallback'` for the same turn (load-order race) so it isn't double-counted.
 - `human-open` — on **engagement** (the first keystroke you type after a turn, or the first extension — both open the window), and re-recorded on each wizard extend: `{ openedAt, engagedVia, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. `openedAt` is the engagement onset; `engagedVia` is `"keystroke"` or `"extension"` (audit); `grantedBudgetMs` is the window's cap = `extensionBudgetMs` (the rolling credit carried into the window). No `human-open` is written at `session_start` or `agent_end` — the window is engagement-gated.
 - `human-close` — on the next `agent_start` (**committed** = your submit produced agent work) **or on `session_shutdown`** (**abandoned** = you left without submitting): `{ openedAt, closedAt, billedMs, idleMs, keystrokes, committed, grantedBudgetMs, extensions, extensionBudgetMs, timestamp }`. Committed bills `min([onset, agent_start], credit)`; abandoned bills 0 (idle with no output is wasted). `keystrokes` is the composition-density count while the window was open (after held-key collapse; idle bills wall-clock, so it's analytics, not a billing input). `committed` defaults to `true` on legacy events. Its `extensionBudgetMs` is the rolling credit remaining after this window's consumption (carried forward). Legacy events lacking `extensionBudgetMs` are backfilled on replay.
-- `steer` — a steer/followUp composed while the agent ran (editor keystrokes → `input` submit): `{ startedAt, submittedAt, durationMs, billedMs, keystrokes, behavior, grantedBudgetMs, extensionBudgetMs, timestamp }`. `billedMs` is `min` of the typing-burst sum and `credit` (not the wall-clock span — `durationMs` is the span, kept for audit); `keystrokes` is the staged count; `behavior` is `"steer"` (mid-stream interrupt) or `"followUp"` (queued). Billed as human time, consuming rolling credit (same rule as an idle window).
+- `steer` — a steer/followUp composed while the agent ran, billed at **delivery** (the `message_start` user message = the agent outcome), not at submit: `{ startedAt, submittedAt, durationMs, billedMs, keystrokes, behavior, grantedBudgetMs, extensionBudgetMs, timestamp }`. `submittedAt` is the (re-)submit time; `timestamp` is the delivery/commit time; `billedMs` is `min` of the typing-burst sum and `credit` (not the wall-clock span — `durationMs` is the span, kept for audit); `keystrokes` is the staged count; `behavior` is `"steer"` (mid-stream interrupt) or `"followUp"` (queued). Billed as human time, consuming rolling credit (same rule as an idle window). A pending composition (submitted but not yet delivered) is in-memory only — never persisted; one dequeued and not re-sent, or interrupted by reload/shutdown, is abandoned (bills 0; no agent outcome).
 
 On `session_start` (fresh load/reload), pi-ledger replays the sidecar to rebuild
 totals, settings, and the rolling extension credit. An unclosed window from a
@@ -320,16 +330,30 @@ agent_start           → COMMIT the engaged window: billed =
                         min([onset, agent_start], credit), committed;
                         consume credit = billed (rolls the rest).
                         No engagement → no window → bills nothing.
-input (steer/followUp)→ commit staged keystrokes as a `steer` event: billed =
-                        the typing-burst sum (not wall-clock), capped at
-                        credit; consume credit. Interactive sources
-                        only; pass-through (never transform the input). An
-                        uncommitted buffer is discarded at agent_end — typing
-                        never queued/steered bills nothing. Held keys
-                        (auto-repeat) collapse, so they can't fake a burst;
-                        idle keystrokes are counted (composition density).
+input (steer/followUp)→ stage the composition as PENDING (queued to the agent):
+                        snapshot the typing bursts (a prior dequeue's
+                        dequeuedBuffer prepended), clear staging — NOT billed
+                        yet. Interactive sources only; pass-through (never
+                        transform the input). A no-typing submit with no prior
+                        dequeue stages nothing. Held keys (auto-repeat)
+                        collapse, so they can't fake a burst; idle keystrokes
+                        are counted (composition density).
+dequeue (alt+up)      → a queued composition reverts to the editor (the
+                        app.message.dequeue action, observed via the editor
+                        wrapper): merge all pending compositions into
+                        dequeuedBuffer, carried forward to the next submit
+                        (the re-steer/re-queue). Not abandoned — re-steering
+                        bills it once at delivery.
+message_start (user)  → a queued steer/followUp DELIVERED to the agent (the
+                        agent outcome): commit the front pending composition as
+                        a `steer` event — billed = the typing-burst sum (not
+                        wall-clock), capped at credit; consume credit. The
+                        initial/normal prompt stages no pending (no
+                        streamingBehavior), so it's a no-op for them.
 session_shutdown      → ABANDON any open window (committed: false, billed 0 —
-                        idle with no submit is wasted; nothing retained).
+                        idle with no submit is wasted; nothing retained) AND
+                        any pending/dequeued steer composition (never delivered
+                        → no agent outcome → bills 0).
 ```
 
 Agent timing prefers pi-tps's `tps:telemetry` (`generationMs`, `stallMs`,
@@ -358,7 +382,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (113 tests)
+pnpm test            # vitest run (129 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```

@@ -204,12 +204,17 @@ export interface HumanCloseEvent {
 
 /** A steer/followUp the human composed and submitted WHILE the agent was
  *  running (a mid-stream interrupt or a message queued until the agent
- *  finishes). Billed as human time under the same rolling-credit cap
- *  as an idle window. The editor hook stages every keystroke during the run;
- *  on submit, the active-typing burst sum (not the wall-clock span) is billed,
- *  so a single key or keys spread minutes apart bill nothing — only sustained
- *  typing that's actually queued/steered to the agent bills. Typing never
- *  submitted is discarded (it never reached the agent). */
+ *  finishes). Billed as human time under the same rolling-credit cap as an
+ *  idle window. The editor hook stages every keystroke during the run; on
+ *  submit the composition becomes PENDING (queued to the agent) and is billed
+ *  at DELIVERY — when the queued message enters the conversation (an agent
+ *  outcome) — not at submit. So a steer you revert (dequeue) and re-steer
+ *  bills once at the delivery that produces agent work, and one you dequeue
+ *  and never re-send bills nothing (no outcome). The billed amount is the
+ *  active-typing burst sum (not the wall-clock span), so a single key or keys
+ *  spread minutes apart bill nothing — only sustained typing that's actually
+ *  queued/steered to the agent bills. `submittedAt` is the (re-)submit time;
+ *  `timestamp` is the delivery/commit time. */
 export interface SteerEvent {
   kind: 'steer';
   /** First staged keystroke during the run. */
@@ -1143,11 +1148,34 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // Staging buffer of keystroke timestamps during the current run — the raw
   // material for billing a steer/followUp the human composes while the agent
   // works. The editor hook (`noteKeystroke`) pushes to it on every keystroke;
-  // the `input` event commits it on submit (billed as a typing-burst sum) and
-  // clears it. Nothing is billed until a steer/followUp is actually queued or
-  // steered to the agent — an uncommitted buffer is discarded at agent_end, so
-  // typing that never reaches the agent costs nothing.
+  // the `input` event STAGES it into a pending composition (a submit per burst
+  // group) and clears it — billing is committed at DELIVERY (the agent
+  // outcome), not at submit. Nothing is billed until a steer/followUp is
+  // actually delivered to the agent; an unsubmitted buffer is discarded at
+  // agent_end, and a submitted-but-undelivered (e.g. dequeued) composition is
+  // abandoned at shutdown, so typing that never reaches the agent costs nothing.
   let steerStaging: number[] = [];
+
+  // Pending steer/followUp compositions: submitted (queued to the agent) but
+  // not yet DELIVERED. Committed (billed) at delivery — the `message_start` user
+  // message that means the queued composition reached the agent — so a steer
+  // you revert (dequeue) and re-steer bills once at the re-steer's delivery, and
+  // one you dequeue and never re-send bills nothing (no agent outcome). Each
+  // entry holds the typing bursts snapshotted at its submit; dequeue merges
+  // them into `dequeuedBuffer` (carried to the next submit). In-memory only —
+  // never persisted; on reload a pending is abandoned (bills 0).
+  let pendingSteers: {
+    bursts: number[];
+    behavior: 'steer' | 'followUp';
+    submittedAt: number;
+  }[] = [];
+
+  // Composition a dequeue put back in the editor (the human reverted a queued
+  // steer/followUp). Its typing bursts carry forward to the next submit (the
+  // re-steer/re-queue), so reverting then re-steering bills the original
+  // composition at the re-steer's delivery. Cleared on the next submit or at
+  // shutdown. In-memory only.
+  let dequeuedBuffer: number[] | null = null;
 
   // Held-key collapse for steer burst billing: auto-repeat (a held key) fires
   // handleInput rapidly with the same data. Consecutive identical keystrokes
@@ -1284,16 +1312,26 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       openIdleMs = Math.min(elapsed, humanWindow.grantedBudgetMs);
       openIdleWindows = 1;
       openIdleKeystrokes = idleKeystrokes;
-    } else if (agentRunning && steerStaging.length > 0) {
-      // In-progress steer/followUp composition during the run — no idle window
-      // is open while the agent works, so show the typing-burst sum so far
-      // (capped at current rolling credit) like an open human window,
-      // until it's submitted (then it's recorded as a `steer` event). Shows
-      // active typing only, so idle gaps during composition don't accrue.
-      const cap = extensionBudgetMs;
-      openSteerMs = Math.min(computeBurstMs(steerStaging, STEER_GAP_MS), cap);
-      openSteerCount = 1;
-      openSteerKeystrokes = steerStaging.length;
+    } else {
+      // In-flight steer composition: typing staged this run, plus compositions
+      // submitted (pending, awaiting delivery) or reverted to the editor
+      // (dequeuedBuffer) — all billed at delivery, so show the typing-burst sum
+      // so far (capped at current rolling credit) like open human windows. No
+      // idle window is open while any of this is in flight; a pending followUp
+      // awaiting delivery after agent_end shows here too. Active typing only,
+      // so idle gaps during composition don't accrue.
+      const inFlight = [
+        ...(dequeuedBuffer ?? []),
+        ...pendingSteers.flatMap((p) => p.bursts),
+        ...steerStaging,
+      ];
+      if (inFlight.length > 0) {
+        const cap = extensionBudgetMs;
+        openSteerMs = Math.min(computeBurstMs(inFlight, STEER_GAP_MS), cap);
+        openSteerCount =
+          pendingSteers.length + (dequeuedBuffer ? 1 : 0) + (steerStaging.length > 0 ? 1 : 0);
+        openSteerKeystrokes = inFlight.length;
+      }
     }
     const openHumanMs = openIdleMs + openSteerMs;
     const openWindows = openIdleWindows + openSteerCount;
@@ -1432,17 +1470,18 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // Steering composition: the human types a steer/followUp while the agent
   // runs. The editor hook (`noteKeystroke`) stages every keystroke; the
-  // `input` event commits it on submit. Billed as the active-typing burst sum
-  // (not wall-clock) under the same rolling-credit cap as an idle
-  // window — a single key or keys spread minutes apart bill nothing, so typing
-  // is only billed when it's actually queued/steered to the agent.
+  // `input` event stages it as PENDING on submit, and the `message_start` user
+  // message (delivery — the agent outcome) commits it. Billed as the
+  // active-typing burst sum (not wall-clock) under the same rolling-credit cap
+  // as an idle window — a single key or keys spread minutes apart bill
+  // nothing, so typing is only billed when it's actually delivered to the agent.
   function noteKeystroke(data: string) {
     const now = Date.now();
     // Held-key collapse: a held key auto-repeats the same data within
     // AUTO_REPEAT_MS. Collapse to one event so a single physical action can't
     // fabricate a sustained burst (steer staging) or inflate the idle keystroke
     // count. Varied keys, same-key gaps at/above the threshold, and voice/paste
-    // (distinct blobs) are unaffected. Reset at agent_start/end and recordSteer.
+    // (distinct blobs) are unaffected. Reset at agent_start/end and at submit.
     const autoRepeat = data === lastKey && now - lastKeyTime < AUTO_REPEAT_MS;
     lastKey = data;
     lastKeyTime = now;
@@ -1459,22 +1498,44 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     }
   }
 
-  function recordSteer(ctx: ExtensionContext, behavior: 'steer' | 'followUp') {
-    const submittedAt = Date.now();
+  /** A steer/followUp submit (the `input` event): the composition is now
+   *  queued to the agent. Stage it as PENDING — billed at delivery (the agent
+   *  outcome), not here. A prior dequeue's composition (`dequeuedBuffer`, text
+   *  the human reverted to the editor) is prepended so a re-steer/re-queue
+   *  bills the original typing at this submit's delivery. Typing bursts are
+   *  snapshotted per submit, so multiple distinct steers in one run each bill
+   *  at their own delivery. */
+  function stagePendingSteer(ctx: ExtensionContext | null, behavior: 'steer' | 'followUp') {
+    const bursts = [...(dequeuedBuffer ?? []), ...steerStaging].sort((a, b) => a - b);
+    if (bursts.length === 0) return; // no typing composed (non-TUI / paste / no keystrokes)
+    pendingSteers.push({ bursts, behavior, submittedAt: Date.now() });
+    dequeuedBuffer = null;
+    steerStaging = [];
+    lastKey = null; // reset held-key tracking so the next burst starts fresh
+    lastKeyTime = 0;
+    updateStatus(ctx);
+  }
+
+  /** A queued steer/followUp was DELIVERED to the agent (a `message_start` user
+   *  message — the agent outcome): commit the front pending composition. Bills
+   *  its typing-burst sum, capped at the rolling credit remaining, and consumes
+   *  that credit. The initial/normal prompt fires `message_start` too but stages
+   *  no pending (no `streamingBehavior`), so this is a no-op for them. */
+  function commitPendingSteer(ctx: ExtensionContext | null) {
+    const entry = pendingSteers.shift();
+    if (!entry) return;
+    const submittedAt = entry.submittedAt;
     const cap = extensionBudgetMs;
     // Bill active typing (burst sum), not the wall-clock span from the first
     // keystroke — so idle gaps before/between typing don't accrue, and a single
     // keystroke can't open a billable window.
-    const burstMs = computeBurstMs(steerStaging, STEER_GAP_MS);
+    const burstMs = computeBurstMs(entry.bursts, STEER_GAP_MS);
     const billedMs = Math.min(burstMs, Math.max(0, cap));
-    const startedAt = steerStaging[0] ?? submittedAt;
+    const startedAt = entry.bursts[0] ?? submittedAt;
     const durationMs = Math.max(0, submittedAt - startedAt); // wall-clock span (audit)
-    const keystrokes = steerStaging.length;
-    steerStaging = [];
-    lastKey = null; // reset held-key tracking so the next burst starts fresh
-    lastKeyTime = 0;
-    // All billed typing consumes rolling credit; the leftover
-    // rolls forward (same rule as an idle window).
+    const keystrokes = entry.bursts.length;
+    // All billed typing consumes rolling credit; the leftover rolls forward
+    // (same rule as an idle window).
     const consumed = consumeExtensionBudget(billedMs, extensionBudgetMs);
     extensionBudgetMs -= consumed;
     totals.extensionConsumedMs += consumed;
@@ -1485,15 +1546,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       durationMs,
       billedMs,
       keystrokes,
-      behavior,
+      behavior: entry.behavior,
       grantedBudgetMs: cap,
       extensionBudgetMs,
-      timestamp: submittedAt,
+      timestamp: Date.now(),
     });
     if (billedMs > 0) {
       totals.humanMs += billedMs;
       totals.humanWindows += 1;
-      if (behavior === 'steer') {
+      if (entry.behavior === 'steer') {
         totals.humanSteerMs += billedMs;
         totals.steerCount += 1;
         totals.steerKeystrokes += keystrokes;
@@ -1504,6 +1565,29 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       }
     }
     updateStatus(ctx);
+  }
+
+  /** The human reverted a queued message back to the editor (the
+   *  `app.message.dequeue` action, alt+up). The composition isn't abandoned —
+   *  it carries forward to the next submit (the re-steer/re-queue), which bills
+   *  it at delivery. Merge all pending compositions into `dequeuedBuffer`
+   *  (dequeue restores ALL queued messages at once, joined in the editor). */
+  function revertSteerToEditor() {
+    if (pendingSteers.length === 0) return; // nothing queued (a no-op dequeue)
+    dequeuedBuffer = [...(dequeuedBuffer ?? []), ...pendingSteers.flatMap((p) => p.bursts)].sort(
+      (a, b) => a - b
+    );
+    pendingSteers = [];
+    updateStatus(lastCtx);
+  }
+
+  /** Abandon any pending/dequeued steer composition (bill 0). Called at
+   *  session_shutdown and rehydrate: a pending composition never reached the
+   *  agent (it was dequeued and not re-sent, or the run was interrupted), so no
+   *  agent outcome means no bill. Never persisted — a pending was never billed. */
+  function abandonPendingSteer() {
+    pendingSteers = [];
+    dequeuedBuffer = null;
   }
 
   // ── Wizard ─────────────────────────────────────────────────────────────
@@ -1733,6 +1817,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     lastKey = null;
     lastKeyTime = 0;
     idleKeystrokes = 0;
+    // A pending/dequeued composition is in-memory only — on a fresh load/reload
+    // it was never delivered (no agent outcome), so abandon it (bills 0). Same
+    // rule as an unclosed idle window: uncommitted, so not restored.
+    pendingSteers = [];
+    dequeuedBuffer = null;
     // Wrap the input editor so keystrokes stage for billing: during a run they
     // feed a steer/followUp burst (committed on submit via `input`); between
     // turns the FIRST keystroke engages an idle window at its onset. Extends
@@ -1741,7 +1830,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // interactive modes have no editor to type into, so nothing stages.
     if (ctx.mode === 'tui' && ctx.hasUI) {
       ctx.ui.setEditorComponent(
-        (tui, theme, kb) => new LedgerEditor(tui, theme, kb, noteKeystroke)
+        (tui, theme, kb) => new LedgerEditor(tui, theme, kb, noteKeystroke, revertSteerToEditor)
       );
     }
     // No initial window is opened here — engagement is gated on the first
@@ -1765,6 +1854,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   });
 
   pi.on('session_shutdown', () => {
+    // Abandon any pending/dequeued steer composition: it never reached the
+    // agent (dequeued and not re-sent, or the run was interrupted) — no agent
+    // outcome means no bill. Never persisted (a pending was never billed).
+    abandonPendingSteer();
     // Record the exit: close any open human window. Idle only bills when
     // committed by a submitted prompt (an agent action) — a window still open
     // at shutdown was never committed, so it's abandoned and bills 0 (idle
@@ -1808,7 +1901,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // ── Fallback agent timing (self-sufficient; used iff pi-tps is absent) ─
 
-  pi.on('message_start', (event) => {
+  pi.on('message_start', (event, ctx) => {
+    // A queued steer/followUp delivered to the agent = the agent outcome that
+    // commits its pending composition (bills the typing bursts, capped at
+    // credit). Fires for every user message, but only a steer/followUp submit
+    // stages a pending — the initial/normal prompt (no `streamingBehavior`)
+    // leaves `pendingSteers` empty, so this is a no-op for them.
+    if (isUserMessage(event.message)) {
+      commitPendingSteer(ctx ?? lastCtx);
+    }
     const m = asAssistant(event.message);
     if (!m) return;
     const now = Date.now();
@@ -1984,9 +2085,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     agentRunning = false;
     // Discard any uncommitted in-run typing: a steer/followUp that was never
     // submitted never reached the agent, so it bills nothing (a submitted
-    // steer already cleared the buffer in `recordSteer`). The post-turn idle
-    // window opens only on the next engagement — no backdate — so mid-run
-    // typing that isn't actually queued/steered can't inflate it.
+    // steer already moved its bursts to a pending composition at submit).
+    // Pending compositions survive agent_end — they deliver in a later run
+    // (a followUp) or were already delivered mid-run (a steer) — so they're
+    // NOT abandoned here. The post-turn idle window opens only on the next
+    // engagement — no backdate — so mid-run typing that isn't actually
+    // queued/steered can't inflate it.
     steerStaging = [];
     lastKey = null;
     lastKeyTime = 0;
@@ -2043,8 +2147,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const behavior = event.streamingBehavior;
     if (behavior !== 'steer' && behavior !== 'followUp') return; // only mid-run
     if (event.source !== 'interactive') return; // only human-typed steers
-    if (steerStaging.length === 0) return; // nothing staged (e.g. non-TUI / no typing)
-    recordSteer(ctx, behavior);
+    // Queued to the agent — stage the composition as PENDING, billed at
+    // delivery (the agent outcome), not here. A no-typing submit (paste / no
+    // keystrokes) with no prior dequeue stages nothing and bills nothing.
+    stagePendingSteer(ctx, behavior);
   });
 
   // ── Commands ──────────────────────────────────────────────────────────
@@ -2352,19 +2458,40 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 /** Editor wrapper that observes keystrokes so pi-ledger can meter steering
  *  composition while the agent runs. Extends `CustomEditor` (app keybindings,
  *  escape-to-abort, ctrl+d, model switching, autocomplete, …) and delegates
- *  every keystroke to the base editor; the only addition is a lightweight
- *  `onKeystroke` callback fired before `super.handleInput`. The callback is
- *  trivial (sets one timestamp) and never throws, so input is never blocked. */
+ *  every keystroke to the base editor; additions are a lightweight `onKeystroke`
+ *  callback fired before `super.handleInput` (stages a typing burst) and an
+ *  `onDequeue` callback fired when the human reverts a queued message back to
+ *  the editor (alt+up). Both are trivial and never throw, so input is never
+ *  blocked. */
 class LedgerEditor extends CustomEditor {
+  private readonly kb: KeybindingsManager;
   constructor(
     tui: TUI,
     theme: EditorTheme,
     keybindings: KeybindingsManager,
-    private readonly onKeystroke: (data: string) => void
+    private readonly onKeystroke: (data: string) => void,
+    private readonly onDequeue: () => void
   ) {
     super(tui, theme, keybindings);
+    this.kb = keybindings;
   }
   override handleInput(data: string): void {
+    // The dequeue (alt+up) and followUp (alt+enter) actions are submits/edits,
+    // not composition typing — don't stage them as steer bursts. Dequeue also
+    // signals pi-ledger that a queued composition reverted to the editor, so its
+    // typing carries forward to the next submit (not abandoned here). Matched by
+    // action id, so a rebound key still fires; only a fully-unbound
+    // app.message.dequeue would be missed (then revert/re-steer degrades to the
+    // pre-fix no-bill — never over-billing).
+    if (this.kb.matches(data, 'app.message.dequeue')) {
+      this.onDequeue();
+      super.handleInput(data); // run the copied handler → restore text to editor
+      return;
+    }
+    if (this.kb.matches(data, 'app.message.followUp')) {
+      super.handleInput(data); // queue the followUp (the `input` event stages it)
+      return;
+    }
     this.onKeystroke(data);
     super.handleInput(data);
   }
@@ -2393,6 +2520,13 @@ function asAssistant(message: unknown): {
     model?: string;
   };
   return m.role === 'assistant' ? m : null;
+}
+
+/** Narrow to a user message (a queued steer/followUp delivered to the agent).
+ *  Mirrors `asAssistant`'s safe `unknown` cast. */
+function isUserMessage(message: unknown): boolean {
+  if (!message || typeof message !== 'object') return false;
+  return (message as { role?: string }).role === 'user';
 }
 
 /** stopReason of the last assistant message in an `agent_end` event's

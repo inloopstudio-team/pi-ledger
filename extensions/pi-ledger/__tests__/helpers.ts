@@ -30,7 +30,14 @@ const FAKE_THEME = {
   bg: (s: string) => s,
   fg: (_c: string, s: string) => s,
 };
-const FAKE_KB = { matches: () => false };
+// Recognizes sentinel editor keys for app actions so tests can drive the
+// LedgerEditor wrapper's dequeue/followUp branches (matched by action id, as
+// in production). Real keybindings are not needed headlessly.
+const FAKE_KB = {
+  matches: (data: string, action: string) =>
+    (action === 'app.message.dequeue' && data === 'dequeue') ||
+    (action === 'app.message.followUp' && data === 'followUp'),
+};
 
 const TEST_SESSION_ID = '019fabcd-aaaa-bbbb-cccc-dddddddddddd';
 

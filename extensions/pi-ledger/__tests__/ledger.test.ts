@@ -1755,6 +1755,16 @@ function steerInput(behavior: 'steer' | 'followUp', source = 'interactive', text
   return { type: 'input' as const, text, source, streamingBehavior: behavior };
 }
 
+/** Simulate a queued steer/followUp being DELIVERED to the agent — the
+ *  `message_start` user message that commits a pending composition (the agent
+ *  outcome). A no-op when no steer is pending (e.g. the initial prompt). */
+function deliverSteer(fixture: TestFixture) {
+  fixture.run('message_start', {
+    type: 'message_start',
+    message: { role: 'user', content: [{ type: 'text', text: 'steered' }], timestamp: Date.now() },
+  });
+}
+
 /** Type a sustained burst: keys at `gapMs` intervals spanning ~`durationMs`, so
  *  they cluster into one typing burst (gaps under STEER_GAP_MS). A single key,
  *  or keys spread minutes apart, bill nothing — only a burst like this bills. */
@@ -1850,7 +1860,8 @@ describe('steering composition (human types while the agent runs)', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' }); // run begins; closes the initial window
     await typeBurst(fixture, 30_000); // 30s of sustained typing mid-stream
-    fixture.run('input', steerInput('steer'));
+    fixture.run('input', steerInput('steer')); // queued → pending (billed at delivery)
+    deliverSteer(fixture); // delivered to the agent → commits the pending
 
     const steer = lastSteer(fixture);
     expect(steer).toBeDefined();
@@ -1868,7 +1879,8 @@ describe('steering composition (human types while the agent runs)', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     fixture.run('agent_start', { type: 'agent_start' }); // close the initial window; start the run
     await typeBurst(fixture, 3 * 60_000); // 3m of sustained typing
-    fixture.run('input', steerInput('steer'));
+    fixture.run('input', steerInput('steer')); // queued → pending
+    deliverSteer(fixture); // delivered → commits (bills 3m, consumes credit)
 
     const steer = lastSteer(fixture);
     expect(steer!.billedMs).toBe(3 * 60_000); // under the 18m cap
@@ -1881,7 +1893,8 @@ describe('steering composition (human types while the agent runs)', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 45_000); // 45s of sustained typing
-    fixture.run('input', steerInput('followUp'));
+    fixture.run('input', steerInput('followUp')); // queued → pending
+    deliverSteer(fixture); // delivered → commits
 
     const steer = lastSteer(fixture);
     expect(steer!.behavior).toBe('followUp');
@@ -1893,6 +1906,7 @@ describe('steering composition (human types while the agent runs)', () => {
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 30_000);
     fixture.run('input', steerInput('steer', 'extension'));
+    deliverSteer(fixture); // a delivery wouldn't bill it either — no pending was staged
     expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
   });
 
@@ -1922,6 +1936,9 @@ describe('steering composition (human types while the agent runs)', () => {
     fixture.run('input', steerInput('steer', 'interactive', 'a'));
     await typeBurst(fixture, 20_000); // a new burst after the first steer cleared staging
     fixture.run('input', steerInput('steer', 'interactive', 'b'));
+    // both queued → pending; deliver each (FIFO) to commit at its own delivery
+    deliverSteer(fixture);
+    deliverSteer(fixture);
 
     const steers = fixture.readSidecarEvents().filter((e) => e.kind === 'steer') as SteerEvent[];
     expect(steers).toHaveLength(2);
@@ -2044,7 +2061,8 @@ describe('steering composition (human types while the agent runs)', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 15_000); // 15s typing burst mid-run
-    fixture.run('input', steerInput('steer')); // committed mid-run
+    fixture.run('input', steerInput('steer')); // queued → pending
+    deliverSteer(fixture); // delivered mid-run → commits
     const steer = lastSteer(fixture);
     expect(steer!.billedMs).toBe(15_000); // the typing burst
     await vi.advanceTimersByTimeAsync(25_000); // agent keeps working (no typing)
@@ -2079,7 +2097,8 @@ describe('steering composition (human types while the agent runs)', () => {
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 30_000); // 30s of typing
     await vi.advanceTimersByTimeAsync(5 * 60_000); // 5m idle, no typing, before submitting
-    fixture.run('input', steerInput('steer'));
+    fixture.run('input', steerInput('steer')); // queued → pending (submittedAt spans the 5m idle)
+    deliverSteer(fixture); // delivered → commits
 
     const steer = lastSteer(fixture);
     expect(steer!.billedMs).toBe(30_000); // only the typing burst
@@ -2095,7 +2114,8 @@ describe('steering composition (human types while the agent runs)', () => {
       fixture.sendEditorKey('k');
       if (i < 3) await vi.advanceTimersByTimeAsync(60_000);
     }
-    fixture.run('input', steerInput('steer'));
+    fixture.run('input', steerInput('steer')); // queued → pending
+    deliverSteer(fixture); // delivered → commits (a $0 audit line — no burst)
 
     const steer = lastSteer(fixture);
     expect(steer).toBeDefined(); // the steer was submitted (audit)…
@@ -2112,7 +2132,8 @@ describe('steering composition (human types while the agent runs)', () => {
       fixture.sendEditorKey('a');
       await vi.advanceTimersByTimeAsync(10);
     }
-    fixture.run('input', steerInput('steer'));
+    fixture.run('input', steerInput('steer')); // queued → pending
+    deliverSteer(fixture); // delivered → commits (a $0 audit line — no burst)
 
     const steer = lastSteer(fixture);
     expect(steer).toBeDefined();
@@ -2142,6 +2163,114 @@ describe('steering composition (human types while the agent runs)', () => {
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
     expect(msg).toContain('human 0.01h'); // 30s steer rehydrated as human time
     expect(msg).toContain('(1 windows)'); // just the rehydrated steer — no initial window (engagement-gated)
+  });
+
+  it('bills a reverted-then-re-steered composition once at the re-steer delivery', async () => {
+    seedCredit(fixture, 20 * 60_000);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    await typeBurst(fixture, 30_000); // 30s typing mid-run
+    fixture.run('input', steerInput('followUp')); // queued → pending (not billed)
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // not billed at submit
+    fixture.sendEditorKey('dequeue'); // revert: composition back to the editor
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // reverting isn't a bill
+    fixture.run('input', steerInput('steer')); // re-steer the restored text (no new typing)
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // still pending, not billed
+    deliverSteer(fixture); // the re-steer is delivered → agent outcome
+    const steer = lastSteer(fixture);
+    expect(steer).toBeDefined();
+    expect(steer!.billedMs).toBe(30_000); // the original 30s, billed once at delivery
+    expect(steer!.behavior).toBe('steer'); // the re-steer's delivery behavior
+    const all = fixture.readSidecarEvents().filter((e) => e.kind === 'steer');
+    expect(all).toHaveLength(1); // billed exactly once — no free replay of the revert
+  });
+
+  it('bills nothing when a queued composition is reverted and never re-sent', async () => {
+    seedCredit(fixture, 20 * 60_000);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    await typeBurst(fixture, 30_000);
+    fixture.run('input', steerInput('followUp')); // queued → pending
+    fixture.sendEditorKey('dequeue'); // revert to the editor
+    // never re-submitted → never delivered; agent_end does NOT abandon pending
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('session_shutdown', { type: 'session_shutdown' }); // abandon (no outcome → no bill)
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
+    const r = rehydrateFromSidecar(fixture.readSidecarEvents());
+    expect(r.totals.humanMs).toBe(0);
+    expect(r.totals.humanSteerMs).toBe(0);
+    expect(r.totals.humanQueueMs).toBe(0);
+  });
+
+  it('bills a pending followUp at a later delivery (survives agent_end)', async () => {
+    seedCredit(fixture, 20 * 60_000);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    await typeBurst(fixture, 45_000);
+    fixture.run('input', steerInput('followUp')); // queued → pending
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // not billed at submit
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pending survives (delivers later)
+    // the followUp auto-delivers in a new run (agent_start + a user message)
+    fixture.run('agent_start', { type: 'agent_start' });
+    deliverSteer(fixture); // delivered → bills
+    const steer = lastSteer(fixture);
+    expect(steer).toBeDefined();
+    expect(steer!.billedMs).toBe(45_000);
+    expect(steer!.behavior).toBe('followUp');
+  });
+
+  it('does not bill a steer at the initial prompt (no pending staged)', async () => {
+    seedCredit(fixture, 20 * 60_000);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    // initial prompt: agent_start (no prior steer pending) + a user message
+    fixture.run('agent_start', { type: 'agent_start' });
+    deliverSteer(fixture); // the initial user message — no pending → no-op
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
+  });
+
+  it('merges multiple pending compositions on dequeue; re-steer bills the sum once', async () => {
+    seedCredit(fixture, 30 * 60_000);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    await typeBurst(fixture, 10_000);
+    fixture.run('input', steerInput('steer', 'interactive', 'a')); // pending 10s
+    await typeBurst(fixture, 20_000);
+    fixture.run('input', steerInput('steer', 'interactive', 'b')); // pending 20s
+    fixture.sendEditorKey('dequeue'); // revert BOTH → dequeuedBuffer (30s merged)
+    fixture.run('input', steerInput('steer')); // re-steer the joined text (no new typing)
+    deliverSteer(fixture); // one delivery → bills the merged 30s
+    const steer = lastSteer(fixture);
+    expect(steer!.billedMs).toBe(30_000);
+    const all = fixture.readSidecarEvents().filter((e) => e.kind === 'steer');
+    expect(all).toHaveLength(1);
+  });
+
+  it('abandons a pending steer on reload (never delivered → bills 0)', async () => {
+    seedCredit(fixture, 20 * 60_000);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    await typeBurst(fixture, 30_000);
+    fixture.run('input', steerInput('steer')); // pending (not delivered)
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
+    // reload → session_start abandons the in-memory pending (bills 0)
+    fixture.run('session_start', { type: 'session_start', reason: 'reload' });
+    await vi.advanceTimersByTimeAsync(0); // flush the reload wizard pop (no engagement)
+    deliverSteer(fixture); // nothing pending → no-op
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
+    const r = rehydrateFromSidecar(fixture.readSidecarEvents());
+    expect(r.totals.humanSteerMs).toBe(0);
+  });
+
+  it('shows a pending (submitted, undelivered) steer as in-progress in /ledger', async () => {
+    seedCredit(fixture, 20 * 60_000);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    await typeBurst(fixture, 30_000);
+    fixture.run('input', steerInput('steer')); // staged → pending (not delivered)
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
+    expect(msg).toContain('human 0.01h (1 windows)'); // 30s pending as 1 in-progress window
+    expect(fixture.lastSidecarEvent('steer')).toBeUndefined(); // not delivered yet
   });
 });
 
@@ -2233,7 +2362,8 @@ describe('skip-billing guard (choosing "Stop billing" blocks agent messages)', (
     // a steer now bills again (no longer guarded)
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 60_000);
-    fixture.run('input', steerInput('steer'));
+    fixture.run('input', steerInput('steer')); // queued → pending
+    deliverSteer(fixture); // delivered → bills again (no longer guarded)
     expect(fixture.lastSidecarEvent('steer')).toBeDefined();
   });
 
