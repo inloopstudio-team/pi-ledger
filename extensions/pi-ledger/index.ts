@@ -19,7 +19,7 @@
  * work (agent_start) — so idle with no engagement, or engagement with no
  * submit, bills nothing (idle with no output is wasted). Capped by a
  * budget (rolling extension credit). A non-blocking wizard prompts
- * engagement (agent_end with no credit, /resume) and offers +pomodoro
+ * engagement (agent_settled with no credit, /resume) and offers +pomodoro
  * extensions; `/ledger-extend` does the same manually. Extensions are ROLLING
  * credit — provisioned pomodoro blocks survive across agent turns, so the
  * wizard stays silent while credit remains and only re-pops when it's
@@ -1129,7 +1129,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // survives across agent turns (the serverless "provisioned capacity"
   // analogy). All billed idle/steering time consumes this budget (no free
   // minute); the leftover rolls forward. The wizard is suppressed at
-  // `agent_end` while this is > 0, and re-arms to fire when
+  // `agent_settled` while this is > 0, and re-arms to fire when
   // it's exhausted.
   let extensionBudgetMs = 0;
 
@@ -2080,7 +2080,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     closeHumanWindow(ctx, true);
   });
 
-  pi.on('agent_end', (event, ctx) => {
+  pi.on('agent_end', (_event, ctx) => {
     lastCtx = ctx;
     agentRunning = false;
     // Discard any uncommitted in-run typing: a steer/followUp that was never
@@ -2102,24 +2102,31 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         'info'
       );
     }
-    // Skip the human idle window when the turn ended in a provider error
-    // (last assistant stopReason "error"). That's a retry/queue in flight, not
-    // a human handoff — a retry extension (pi-retry) sleeps with backoff then
-    // re-prompts, or pi-core compacts an overflow and retries — so opening a
-    // window here would bill the retry's backoff sleep as human time. That
-    // violates scale-to-zero: "a slow/queued provider is a retry, not billable
-    // time." No window means no billing (and no wizard pop) during the retry;
-    // the next non-error agent_end opens the window for genuine post-turn idle.
-    // max_tokens ("length") continuations are left alone: their pre-continue
-    // gap is small and they're ambiguous without a retry extension (a bare
-    // max_tokens stop hands control back to the human to decide).
-    if (lastAssistantStopReason(event.messages) === 'error') return;
+    // The engagement prompt (wizard) and the post-turn idle window are NOT
+    // armed here — they live at `agent_settled` (see below). agent_end fires
+    // per low-level run, but Pi may still auto-retry, auto-compact and retry,
+    // or continue with a queued follow-up; popping here would prompt the human
+    // to engage during that in-flight time, billing a retry backoff or an
+    // overflow compaction as human time (violating scale-to-zero: a
+    // slow/queued provider is a retry, not billable). The earlier stopReason
+    // "error" heuristic only caught provider-error retries, missing overflow
+    // compactions and queued follow-ups; agent_settled is the pi-core-blessed
+    // "no more automatic continuation" signal, so it needs no such heuristic.
+  });
+
+  pi.on('agent_settled', (_event, ctx) => {
+    lastCtx = ctx;
+    // The agent will not continue automatically — no retry, compaction, or
+    // queued follow-up is left — so this is the genuine human handoff moment.
     // The idle window is NOT opened here — it opens only when the human
     // engages (first keystroke or extension). Until then, idle bills nothing.
     // If the human has no rolling credit (hasn't extended), pop the wizard now
     // to prompt that engagement (an extension both engages and grants
     // capacity). With credit, stay quiet — the window opens on the first
-    // keystroke and arms for exhaustion then.
+    // keystroke and arms for exhaustion then. This also re-offers the prompt
+    // after a retry storm exhausts — the last errored agent_end no longer
+    // suppresses it, since the run has now settled and the human must take
+    // over.
     if (extensionBudgetMs <= 0) armWizardNow(ctx);
   });
 
@@ -2527,21 +2534,4 @@ function asAssistant(message: unknown): {
 function isUserMessage(message: unknown): boolean {
   if (!message || typeof message !== 'object') return false;
   return (message as { role?: string }).role === 'user';
-}
-
-/** stopReason of the last assistant message in an `agent_end` event's
- *  `messages`, or undefined when no assistant message is present. A turn whose
- *  final assistant message has stopReason "error" is a provider failure — a
- *  retry/queue in flight (pi-retry backoff, or pi-core compaction), not a
- *  human idle moment — so its idle window must not open.
- *  @internal Exported for testing only. */
-export function lastAssistantStopReason(messages: unknown): string | undefined {
-  if (!Array.isArray(messages)) return undefined;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (!m || typeof m !== 'object') continue;
-    const r = m as { role?: string; stopReason?: string };
-    if (r.role === 'assistant') return r.stopReason;
-  }
-  return undefined;
 }

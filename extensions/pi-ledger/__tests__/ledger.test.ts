@@ -21,7 +21,6 @@ import {
   extractTpsEntries,
   fmtHours,
   fmtMoney,
-  lastAssistantStopReason,
   rehydrateFromSidecar,
   resolveExtensionBudget,
   sidecarPathFor,
@@ -183,37 +182,6 @@ describe('formatting', () => {
     expect(fmtMoney(125, 'EUR')).toBe('€125.00');
     expect(fmtMoney(125, 'VND')).toBe('₫125.00');
     expect(fmtMoney(125, 'XYZ')).toBe('125.00'); // unknown → no symbol
-  });
-});
-
-describe('lastAssistantStopReason', () => {
-  it('returns the stopReason of the last assistant message', () => {
-    expect(
-      lastAssistantStopReason([{ role: 'user' }, { role: 'assistant', stopReason: 'error' }])
-    ).toBe('error');
-    expect(lastAssistantStopReason([{ role: 'assistant', stopReason: 'stop' }])).toBe('stop');
-  });
-  it('scans from the end and stops at the first assistant', () => {
-    expect(
-      lastAssistantStopReason([
-        { role: 'assistant', stopReason: 'stop' },
-        { role: 'assistant', stopReason: 'error' },
-      ])
-    ).toBe('error');
-  });
-  it('skips a trailing toolResult/user message', () => {
-    expect(
-      lastAssistantStopReason([{ role: 'assistant', stopReason: 'error' }, { role: 'toolResult' }])
-    ).toBe('error');
-  });
-  it('returns undefined when no assistant is present', () => {
-    expect(lastAssistantStopReason([{ role: 'user' }, { role: 'toolResult' }])).toBeUndefined();
-    expect(lastAssistantStopReason([])).toBeUndefined();
-  });
-  it('returns undefined for non-array input', () => {
-    expect(lastAssistantStopReason(undefined)).toBeUndefined();
-    expect(lastAssistantStopReason(null)).toBeUndefined();
-    expect(lastAssistantStopReason({})).toBeUndefined();
   });
 });
 
@@ -961,9 +929,10 @@ describe('extension integration', () => {
     expect(agentEntries).toHaveLength(1); // only the turn-0 tps entry
   });
 
-  it('pops the wizard at agent_end (no credit); engaging without extending bills 0', async () => {
+  it('pops the wizard at agent_settled (no credit); engaging without extending bills 0', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // install the editor (no pop)
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → wizard pops (engagement prompt)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // per-run cleanup; no pop here
+    fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → wizard pops (engagement prompt)
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard promise
     fixture.sendEditorKey('k'); // ENGAGE the idle window at onset (no credit → cap 0)
@@ -981,12 +950,13 @@ describe('extension integration', () => {
 
   // ── Retry/queue turns (pi-retry backoff) are not human idle ─────────────
 
-  it('does not open a human window when agent_end carries a provider error (retry in flight)', async () => {
+  it('does not open a human window during a provider-error retry (agent_settled not fired)', async () => {
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'error' }],
     });
-    // no human window → no wizard, no human-open event
+    // the engagement wizard now pops at agent_settled, which hasn't fired (a
+    // retry is in flight) → no wizard, no human-open, no engagement
     expect(fixture.customSpy).not.toHaveBeenCalled();
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
     // the retry's backoff sleep is NOT billed: agent_start has no window to close
@@ -996,7 +966,7 @@ describe('extension integration', () => {
   });
 
   it('does not bill the retry backoff between an errored turn and the retry agent_start', async () => {
-    // turn 1 errors → retry in flight (no human window opened, no engagement)
+    // turn 1 errors → retry in flight (no agent_settled → no wizard, no engagement)
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'error' }],
@@ -1006,6 +976,8 @@ describe('extension integration', () => {
     expect(fixture.lastSidecarEvent('human-close')).toBeUndefined(); // backoff NOT billed
     // retry succeeds → the agent hands back control, but no window opens until the
     // human engages (idle is engagement-gated now); nothing is billed yet.
+    // (agent_settled would pop the no-credit wizard here — covered by the
+    // dedicated test below; this one isolates the backoff-not-billed path.)
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'stop' }],
@@ -1015,7 +987,9 @@ describe('extension integration', () => {
   });
 
   it('does not bill backoff across a multi-retry storm (one error turn per retry)', async () => {
-    // simulate 3 errored retries, each separated by a 60s backoff
+    // simulate 3 errored retries, each separated by a 60s backoff. agent_settled
+    // never fires (each agent_end is followed by a retry agent_start), so the
+    // engagement wizard never pops and no window opens during the storm.
     for (let i = 0; i < 3; i++) {
       fixture.run('agent_end', {
         type: 'agent_end',
@@ -1029,33 +1003,79 @@ describe('extension integration', () => {
     expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-close')).toHaveLength(0);
   });
 
-  it('pops the wizard for a normal (stop) agent_end; a keystroke then engages the window', async () => {
+  it('pops the wizard at agent_settled after a retry storm exhausts (re-offers engagement)', async () => {
+    // A storm of 2 errored retries, then a final errored turn with no retry left.
+    // The old stopReason "error" heuristic suppressed the wizard on every errored
+    // agent_end, so after the storm exhausted the human got no engagement prompt.
+    // agent_settled fires once after the final (exhausted) agent_end and re-offers
+    // the prompt — the human must take over.
+    for (let i = 0; i < 2; i++) {
+      fixture.run('agent_end', {
+        type: 'agent_end',
+        messages: [{ role: 'assistant', stopReason: 'error' }],
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      fixture.run('agent_start', { type: 'agent_start' }); // retry fires
+    }
+    fixture.run('agent_end', {
+      type: 'agent_end',
+      messages: [{ role: 'assistant', stopReason: 'error' }],
+    }); // final exhaustion — no retry left
+    fixture.run('agent_settled', { type: 'agent_settled' }); // the storm has settled
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // engagement prompt re-offered
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // still engagement-gated
+  });
+
+  it('does not pop the wizard at agent_end during a queued follow-up; pops once at agent_settled', async () => {
+    // A normal stop agent_end with a queued follow-up: pi-core continues
+    // automatically, so agent_settled does NOT fire yet. The wizard must not pop
+    // at agent_end (it used to, spuriously, since stopReason was 'stop'). Only
+    // after the follow-up run ends and the run settles does the wizard pop once.
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', {
+      type: 'agent_end',
+      messages: [{ role: 'assistant', stopReason: 'stop' }],
+    }); // a follow-up is queued → not settled
+    expect(fixture.customSpy).not.toHaveBeenCalled(); // no spurious pop during the continuation
+    fixture.run('agent_start', { type: 'agent_start' }); // the follow-up run auto-starts
+    fixture.run('agent_end', {
+      type: 'agent_end',
+      messages: [{ role: 'assistant', stopReason: 'stop' }],
+    }); // follow-up done; nothing left
+    fixture.run('agent_settled', { type: 'agent_settled' }); // now settled
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // pops exactly once, at settle
+  });
+
+  it('pops the wizard for a normal (stop) turn at agent_settled; a keystroke then engages the window', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'stop' }],
     });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops (engagement prompt)
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no window until engaged
     fixture.sendEditorKey('k'); // engage → opens the idle window
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
   });
 
-  it('still pops the wizard for an aborted agent_end (a retry is not in flight)', async () => {
+  it('still pops the wizard for an aborted turn at agent_settled (a retry is not in flight)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'aborted' }],
     });
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops (not an error retry)
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops (not a retry in flight)
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no window until engaged
     fixture.sendEditorKey('k');
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
   });
 
-  it('pops the wizard when agent_end has no assistant message; a keystroke engages', async () => {
+  it('pops the wizard at agent_settled when no assistant message is present; a keystroke engages', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
     fixture.sendEditorKey('k');
@@ -1065,7 +1085,8 @@ describe('extension integration', () => {
   it('bills 0 for engaged idle after the wizard is dismissed (no credit)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('stop');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops, dismissed ('stop' → no engagement)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // wizard pops, dismissed ('stop' → no engagement)
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard
     fixture.sendEditorKey('k'); // engage the idle window at onset (no credit → cap 0)
@@ -1079,7 +1100,8 @@ describe('extension integration', () => {
 
   it('extends the budget when the wizard is accepted', async () => {
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops immediately, accepted → +20m, engages, re-armed at 20m
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // wizard pops immediately, accepted → +20m, engages, re-armed at 20m
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(360_000); // 6m idle, under 20m budget → re-armed wizard not fired
     fixture.run('agent_start', { type: 'agent_start' });
@@ -1093,7 +1115,8 @@ describe('extension integration', () => {
   it('bills the thinking span for extend + extend + extend + type-and-go (the nuance pattern)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend'); // every wizard pop → extend (engages + grants capacity)
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → 1st pop → engage + +20m
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → 1st pop → engage + +20m
     await vi.advanceTimersByTimeAsync(0); // flush the 1st extend → openIdleWindow('extension', 20m), cap 20m
     // idle to the first exhaustion (20m credit) → 2nd pop → +20m (cap 40m)
     await vi.advanceTimersByTimeAsync(20 * 60_000);
@@ -1123,10 +1146,11 @@ describe('extension integration', () => {
     expect(r.totals.abandonedWindows).toBe(0);
   });
 
-  it('suppresses the wizard at the next agent_end while rolling extension credit remains', async () => {
+  it('suppresses the wizard at the next agent_settled while rolling extension credit remains', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pops → +20m, engages via extension
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // pops → +20m, engages via extension
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(120_000); // 2m idle (under 20m cap); flushes the extend
     fixture.run('agent_start', { type: 'agent_start' }); // commit: 2m billed, 2m ext consumed → 18m left
@@ -1135,9 +1159,10 @@ describe('extension integration', () => {
     expect(seg1.billedMs).toBe(120_000);
     expect(seg1.extensionBudgetMs).toBe(18 * 60_000);
 
-    // next agent_end: 18m credit remains → wizard is NOT shown (no pop, no auto-open)
+    // next settle: 18m credit remains → wizard is NOT shown (no pop, no auto-open)
     fixture.customSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     expect(fixture.customSpy).not.toHaveBeenCalled();
     // the idle window opens only on engagement; engage via keystroke → cap = 18m credit
     fixture.sendEditorKey('k');
@@ -1149,13 +1174,15 @@ describe('extension integration', () => {
   it('rolls unused extension credit across multiple agent turns', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pops → +20m, engages via extension
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // pops → +20m, engages via extension
     await vi.advanceTimersByTimeAsync(120_000); // 2m idle (flushes the extend)
     fixture.run('agent_start', { type: 'agent_start' }); // commit → 2m billed, 2m consumed → 18m left
 
-    // turn 2: 18m credit remains → no pop at agent_end; engage via keystroke
+    // turn 2: 18m credit remains → no pop at agent_settled; engage via keystroke
     fixture.customSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     expect(fixture.customSpy).not.toHaveBeenCalled();
     fixture.sendEditorKey('k'); // engage the new window (cap = 18m credit)
     await vi.advanceTimersByTimeAsync(120_000); // 2m idle
@@ -1165,13 +1192,15 @@ describe('extension integration', () => {
     // turn 3: still 16m credit → still suppressed
     fixture.customSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     expect(fixture.customSpy).not.toHaveBeenCalled();
   });
 
-  it('pops the wizard at agent_end when no rolling credit remains', async () => {
+  it('pops the wizard at agent_settled when no rolling credit remains', async () => {
     fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate settings; no pop (startup)
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     expect(fixture.customSpy).toHaveBeenCalledTimes(1); // no credit → pop immediately
   });
 
@@ -1213,6 +1242,7 @@ describe('extension integration', () => {
     ]);
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate 18m credit; no pop
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     expect(fixture.customSpy).not.toHaveBeenCalled(); // 18m credit → suppressed
     fixture.sendEditorKey('k'); // engage → open window with cap = 18m credit
     const open = fixture.lastSidecarEvent('human-open');
@@ -1226,7 +1256,8 @@ describe('extension integration', () => {
     ]);
     fixture.setCustomResult('extend');
     fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // apply autoWizard: false
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens window; autoWizard off → no auto-pop
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // autoWizard off → no auto-pop
     expect(fixture.customSpy).not.toHaveBeenCalled();
 
     await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // opens the wizard → confirm → +5m
@@ -1345,7 +1376,8 @@ describe('extension integration', () => {
   it('counts the in-progress open human window in /ledger (entire session up to now)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → wizard → extend +20m (engages)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → wizard → extend +20m (engages)
     await vi.advanceTimersByTimeAsync(0); // flush the extend → open window, cap 20m
     await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window still open (uncommitted)
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
@@ -1504,7 +1536,8 @@ describe('extension integration', () => {
 
   it('session_shutdown abandons an uncommitted idle window (exit recorded, bills 0)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // wizard pops (no credit)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // wizard pops (no credit)
     await vi.advanceTimersByTimeAsync(0); // flush dismissed wizard
     fixture.sendEditorKey('k'); // engage the idle window
     await vi.advanceTimersByTimeAsync(30_000); // 30s idle, uncommitted (no submit)
@@ -1561,7 +1594,8 @@ describe('extension integration', () => {
   it('session_tree keeps the open human window idle (the growing-idle case)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no credit → wizard → extend +20m (engages)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → wizard → extend +20m (engages)
     await vi.advanceTimersByTimeAsync(0); // flush the extend → open window, cap 20m
     await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window open
     fixture.run('session_tree', { type: 'session_tree' }); // /tree → "go back"
@@ -1635,7 +1669,8 @@ describe('extension integration', () => {
   it('records 0 idle keystrokes when the window engaged via extension (no typing)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.setCustomResult('extend');
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // pop → extend engages (no keystroke)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // pop → extend engages (no keystroke)
     await vi.advanceTimersByTimeAsync(0); // flush the extend → openIdleWindow('extension')
     await vi.advanceTimersByTimeAsync(10_000); // idle, no typing
     fixture.run('agent_start', { type: 'agent_start' }); // commit
@@ -1648,6 +1683,7 @@ describe('extension integration', () => {
   it('collapses a held key in the idle keystroke count (no auto-repeat inflation)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     await vi.advanceTimersByTimeAsync(0); // flush dismissed wizard
     // hold one key for ~1s: auto-repeat fires the same data every 10ms
     for (let i = 0; i < 100; i++) {
@@ -1735,12 +1771,13 @@ describe('extension integration', () => {
     expect(close!.billedMs).toBe(4 * 60_000); // 4m, under the 5m cap
   });
 
-  it('the silent initial window does not suppress the wizard at the following agent_end', async () => {
+  it('the silent initial window does not suppress the wizard at the following agent_settled', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     expect(fixture.customSpy).not.toHaveBeenCalled(); // initial window silent
     fixture.run('agent_start', { type: 'agent_start' }); // first prompt → close initial (~0 billed)
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // post-turn window → wizard pops
-    // the wizard pops at agent_end (where it belongs), not at session_start
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // per-run cleanup; no pop
+    fixture.run('agent_settled', { type: 'agent_settled' }); // post-turn window → wizard pops
+    // the wizard pops at agent_settled (where it belongs), not at session_start
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
   });
 });
@@ -1913,7 +1950,7 @@ describe('steering composition (human types while the agent runs)', () => {
   it('does not record a steer for a normal idle prompt (submitted between turns)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_start', { type: 'agent_start' });
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // opens the idle window
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // run ends; no window opens here (engagement-gated)
     await vi.advanceTimersByTimeAsync(30_000);
     fixture.run('input', { type: 'input', text: 'next', source: 'interactive' }); // no streamingBehavior
     expect(fixture.lastSidecarEvent('steer')).toBeUndefined();
@@ -2036,7 +2073,8 @@ describe('steering composition (human types while the agent runs)', () => {
     fixture.run('agent_start', { type: 'agent_start' });
     await typeBurst(fixture, 20_000); // 20s of typing mid-run, NOT submitted
     // the agent finishes before the human submits — no `input` fires mid-stream
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // discard staging; credit remains → no wizard pop
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // discard staging
+    fixture.run('agent_settled', { type: 'agent_settled' }); // credit remains → no wizard pop
 
     // No steer (never submitted) and no NEW idle window (no engagement yet) — the
     // mid-run typing never reached the agent, so it bills nothing and opens nothing.
@@ -2066,7 +2104,8 @@ describe('steering composition (human types while the agent runs)', () => {
     const steer = lastSteer(fixture);
     expect(steer!.billedMs).toBe(15_000); // the typing burst
     await vi.advanceTimersByTimeAsync(25_000); // agent keeps working (no typing)
-    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // credit remains → no wizard pop; no idle window opens (engagement-gated)
+    fixture.run('agent_end', { type: 'agent_end', messages: [] }); // no idle window opens here (engagement-gated)
+    fixture.run('agent_settled', { type: 'agent_settled' }); // credit remains → no wizard pop
 
     // No NEW idle window yet — the human hasn't engaged post-run (only the seeded, closed one exists).
     const opensBeforeEngage = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
@@ -2298,10 +2337,11 @@ describe('skip-billing guard (choosing "Stop billing" blocks agent messages)', (
     fs.rmSync(cacheDir, { recursive: true, force: true });
   });
 
-  /** Pop the engagement wizard (agent_end, no credit) and flush the choice. */
+  /** Pop the engagement wizard (agent_settled, no credit) and flush the choice. */
   async function chooseWizard(choice: 'stop' | 'extend' | 'dismiss') {
     fixture.setCustomResult(choice);
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
     await vi.advanceTimersByTimeAsync(0); // flush the wizard .then
   }
 
