@@ -1,6 +1,6 @@
 {
   "name": "@monotykamary/pi-ledger",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Billing engine for the serverless agency — a pi extension that meters agentic dev work like cloud compute and invoices it like a timesheet.",
   "keywords": [
     "pi-package"
@@ -56,5 +56,13 @@
     "protobufjs": "8.4.0",
     "ws": "8.20.1"
   },
-  "packageManager": "pnpm@11.6.0"
+  "packageManager": "pnpm@11.6.0",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }
