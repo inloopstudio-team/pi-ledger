@@ -114,6 +114,7 @@ const DEFAULT_SETTINGS: LedgerSettings = {
   author: '',
   currency: 'USD',
   autoWizard: true,
+  autoExtend: false,
 };
 
 // ─── Data types ─────────────────────────────────────────────────────────────
@@ -129,6 +130,12 @@ export interface LedgerSettings {
   author: string;
   currency: string;
   autoWizard: boolean;
+  /** When `autoWizard` would prompt, auto-provision a pomodoro block silently
+   *  instead (no dialog) — for headless/GUI sessions where a prompt can't be
+   *  shown or a hands-off "bill my review time" policy is wanted. Bills only
+   *  idle that's committed by a later submit, capped at the block (scale-to-zero
+   *  with provisioned capacity), so walking away never over-bills. */
+  autoExtend: boolean;
 }
 
 /** Persisted per agent turn (replayed on rehydrate). */
@@ -517,6 +524,9 @@ export function applySettingValue(
       break;
     case 'autoWizard':
       next.autoWizard = value === 'on';
+      break;
+    case 'autoExtend':
+      next.autoExtend = value === 'on';
       break;
   }
   return next;
@@ -1605,13 +1615,21 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   function armWizardForBoundary(ctx: ExtensionContext) {
     clearWizardTimer();
-    if (!humanWindow || !settings.autoWizard || !ctx.hasUI || ctx.mode !== 'tui') return;
+    if (!humanWindow || !settings.autoWizard) return;
     // No credit provisioned → nothing to exhaust; the agent_end / resume prompt
     // already offered engagement, so don't re-pop on the first keystroke (that
     // would intercept typing). Only arm the exhaustion pop when there's credit.
     if (humanWindow.grantedBudgetMs <= 0) return;
     const elapsed = Date.now() - humanWindow.openedAt;
     const delay = humanWindow.grantedBudgetMs - elapsed;
+    if (settings.autoExtend) {
+      // Auto-extend silently when the block is exhausted — works in any mode
+      // (no UI needed), so headless/GUI sessions keep review-time credit rolling.
+      if (delay <= 0) autoExtendNow(ctx);
+      else wizardTimer = setTimeout(() => autoExtendNow(ctx), delay);
+      return;
+    }
+    if (!canPromptWizard(ctx)) return;
     if (delay <= 0) {
       showWizard(ctx);
       return;
@@ -1619,12 +1637,101 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     wizardTimer = setTimeout(() => showWizard(ctx), delay);
   }
 
+  /** A wizard prompt can be shown where a dialog renders: the TUI (custom
+   *  component) or an RPC client that speaks the `select` dialog protocol
+   *  (e.g. the vscode-pi GUI). `hasUI` is true in both; `print`/`json` have no
+   *  dialog UI, so they fall back to the silent auto-extend path. */
+  function canPromptWizard(ctx: ExtensionContext): boolean {
+    return ctx.hasUI && (ctx.mode === 'tui' || ctx.mode === 'rpc');
+  }
+
+  /** Grant `mins` of billable-human-time capacity and engage an idle window if
+   *  none is open. Shared by the wizard's "Extend" choice and `autoExtend` —
+   *  both provision a rolling pomodoro block (credit survives across turns). */
+  function extendHumanTime(ctx: ExtensionContext, mins: number) {
+    // Extending resumes billing: clear the skip-billing guard so agent messages
+    // reach the model again (the documented way to resume after "Stop billing").
+    if (billingPaused) {
+      billingPaused = false;
+      persistPause(false);
+    }
+    const addMs = mins * MS_PER_MINUTE;
+    if (!humanWindow) {
+      // No window yet: extend both engages (onset = now) and grants capacity.
+      // openIdleWindow opens, records, arms for exhaustion, and re-renders.
+      openIdleWindow(ctx, 'extension', addMs);
+      return;
+    }
+    // Window already engaged: grant capacity and re-record the cap bump.
+    humanWindow.grantedBudgetMs += addMs;
+    humanWindow.extensions += 1;
+    extensionBudgetMs += addMs;
+    totals.extensionCreditMs += addMs; // provisioned capacity (one block)
+    totals.extensionsGranted += 1;
+    appendSidecar({
+      kind: 'human-open',
+      openedAt: humanWindow.openedAt,
+      engagedVia: humanWindow.engagedVia,
+      grantedBudgetMs: humanWindow.grantedBudgetMs,
+      extensions: humanWindow.extensions,
+      extensionBudgetMs,
+      timestamp: Date.now(),
+    });
+    armWizardForBoundary(ctx);
+    updateStatus(ctx);
+  }
+
+  /** `autoExtend`: provision a pomodoro block silently (no dialog) when the
+   *  wizard would otherwise prompt — for headless/GUI sessions where a prompt
+   *  can't render, or a hands-off "bill my review time" policy. Acts exactly
+   *  like choosing "Extend" in the wizard. Works in any mode (no UI needed). */
+  function autoExtendNow(ctx: ExtensionContext, mins: number = settings.pomodoroMinutes) {
+    extendHumanTime(ctx, mins);
+    notify(ctx, `Auto-extended billable human time by ${mins}m.`, 'info');
+  }
+
+  /** Apply the wizard's choice: 'extend' grants capacity (shared path),
+   *  'stop' arms the skip-billing guard, anything else (dismiss) is a no-op. */
+  function applyWizardChoice(
+    ctx: ExtensionContext,
+    choice: 'extend' | 'stop' | 'dismiss' | undefined,
+    pomodoro: number
+  ) {
+    if (choice !== 'extend' && choice !== 'stop') return; // dismiss = no change
+    if (choice === 'stop') {
+      // "Stop billing" = skip billing: arm the guard so interactive
+      // prompts/steers to the agent are blocked until the human extends
+      // (via /ledger-extend). Slash commands are unaffected (pi-core runs
+      // them before emitting the `input` event). Persist so the guard
+      // survives reload/compaction — the sidecar is the source of truth.
+      billingPaused = true;
+      persistPause(true);
+      updateStatus(ctx);
+      notify(
+        ctx,
+        'Billing stopped — run /ledger-extend to extend your time and resume the agent.',
+        'warning'
+      );
+      return;
+    }
+    extendHumanTime(ctx, pomodoro);
+    notify(ctx, `Extended billable human time by ${pomodoro}m.`, 'info');
+  }
+
   /** Show the wizard immediately — to prompt engagement at `agent_end` (no
    *  credit) or on `/resume` (no window yet), or as a re-offer. Works with or
-   *  without an open window: the extend action engages one if none is open. */
+   *  without an open window: the extend action engages one if none is open.
+   *  With `autoExtend`, skip the prompt and provision a block silently (any
+   *  mode, including headless); otherwise prompt only where a dialog can show
+   *  (TUI custom render, or an RPC `select` dialog for GUI clients). */
   function armWizardNow(ctx: ExtensionContext) {
     clearWizardTimer();
-    if (!settings.autoWizard || !ctx.hasUI || ctx.mode !== 'tui') return;
+    if (!settings.autoWizard) return;
+    if (settings.autoExtend) {
+      autoExtendNow(ctx);
+      return;
+    }
+    if (!canPromptWizard(ctx)) return;
     showWizard(ctx);
   }
 
@@ -1640,6 +1747,30 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const remainingProvisioned = humanWindow
       ? Math.max(0, extensionBudgetMs - elapsedNow)
       : extensionBudgetMs;
+    const extendLabel = `Extend +${pomodoro}m`;
+    const stopLabel = 'Stop billing';
+
+    // RPC/GUI clients (and any non-TUI dialog surface) get a plain `select`
+    // dialog: the `custom` TUI component only renders in the terminal, but
+    // `select` round-trips through the extension_ui protocol, so a GUI like
+    // vscode-pi renders the same Extend/Stop choice without a TUI.
+    if (ctx.mode !== 'tui') {
+      const credit =
+        remainingProvisioned > 0
+          ? ` · ${Math.max(1, Math.round(remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more.`
+          : '';
+      ctx.ui
+        .select(
+          `⏱ Extend billable human time? Idle after the agent. Add a ${pomodoro}m pomodoro block?${credit}`,
+          [extendLabel, stopLabel]
+        )
+        .then((picked) => {
+          const choice =
+            picked === extendLabel ? 'extend' : picked === stopLabel ? 'stop' : 'dismiss';
+          applyWizardChoice(ctx, choice as 'extend' | 'stop' | 'dismiss', pomodoro);
+        });
+      return;
+    }
 
     ctx.ui
       .custom<string>((tui, theme, _kb, done) => {
@@ -1705,57 +1836,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         };
       })
       .then((choice) => {
-        if (choice !== 'extend' && choice !== 'stop') return; // dismiss = no change
-        if (choice === 'stop') {
-          // "Stop billing" = skip billing: arm the guard so interactive
-          // prompts/steers to the agent are blocked until the human extends
-          // (via /ledger-extend). Slash commands are unaffected (pi-core runs
-          // them before emitting the `input` event). Persist so the guard
-          // survives reload/compaction — the sidecar is the source of truth.
-          billingPaused = true;
-          persistPause(true);
-          updateStatus(ctx);
-          notify(
-            ctx,
-            'Billing stopped — run /ledger-extend to extend your time and resume the agent.',
-            'warning'
-          );
-          return;
-        }
-        // Extend: resume billing (clear the skip-billing guard) and grant
-        // capacity. Clearing the guard here is what unblocks agent messages
-        // after a "Stop billing" — running /ledger-extend and extending is the
-        // documented way to resume.
-        if (billingPaused) {
-          billingPaused = false;
-          persistPause(false);
-        }
-        const addMs = pomodoro * MS_PER_MINUTE;
-        if (!humanWindow) {
-          // No window yet: extend both engages (onset = now) and grants capacity.
-          // openIdleWindow opens, records, arms for exhaustion, and re-renders.
-          openIdleWindow(ctx, 'extension', addMs);
-          notify(ctx, `Extended billable human time by ${pomodoro}m.`, 'info');
-          return;
-        }
-        // Window already engaged: grant capacity and re-record the cap bump.
-        humanWindow.grantedBudgetMs += addMs;
-        humanWindow.extensions += 1;
-        extensionBudgetMs += addMs;
-        totals.extensionCreditMs += addMs; // provisioned capacity (one block)
-        totals.extensionsGranted += 1;
-        appendSidecar({
-          kind: 'human-open',
-          openedAt: humanWindow.openedAt,
-          engagedVia: humanWindow.engagedVia,
-          grantedBudgetMs: humanWindow.grantedBudgetMs,
-          extensions: humanWindow.extensions,
-          extensionBudgetMs,
-          timestamp: Date.now(),
-        });
-        armWizardForBoundary(ctx);
-        updateStatus(ctx);
-        notify(ctx, `Extended billable human time by ${pomodoro}m.`, 'info');
+        applyWizardChoice(ctx, choice as 'extend' | 'stop' | 'dismiss', pomodoro);
       });
   }
 
@@ -2194,15 +2275,16 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         .map((p) => ({ value: p, label: `${p}m` }));
     },
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      if (ctx.mode !== 'tui' || !ctx.hasUI) {
+      if (!ctx.hasUI || (ctx.mode !== 'tui' && ctx.mode !== 'rpc')) {
         ctx.ui.notify(
-          'Open the wizard in a TUI session (extend after the agent finishes a turn).',
+          'Open the wizard in a TUI or GUI session (extend after the agent finishes a turn).',
           'warning'
         );
         return;
       }
       // Works with or without an open window: with no window, extend engages
       // one (onset = now) and grants the block — an explicit engagement signal.
+      // TUI renders the custom wizard; RPC (e.g. vscode-pi) renders a `select`.
       const mins = parseMinutes(args) ?? settings.pomodoroMinutes;
       showWizard(ctx, mins);
     },
@@ -2210,12 +2292,40 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   pi.registerCommand('ledger-settings', {
     description:
-      'Configure billing: agent $/h, human $/h, pomodoro minutes, project, author, currency, auto-wizard.',
+      'Configure billing: agent $/h, human $/h, pomodoro minutes, project, author, currency, auto-wizard, auto-extend.',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      // RPC/GUI (e.g. vscode-pi): a `select` -> `input`/`select` flow, since the
+      // custom SettingsList only renders in the terminal. One setting per run.
       if (ctx.mode !== 'tui') {
-        ctx.ui.notify('/ledger-settings requires TUI mode', 'error');
+        if (!ctx.hasUI) {
+          ctx.ui.notify('/ledger-settings requires a UI (TUI or GUI)', 'error');
+          return;
+        }
+        const items = rpcSettingItems(ctx);
+        const pick = await ctx.ui.select(
+          'pi-ledger · billing settings — pick a setting to change',
+          items.map((i) => `${i.label}: ${i.current}`)
+        );
+        if (pick === undefined) return; // dismissed
+        const item = items.find((i) => pick.startsWith(`${i.label}:`));
+        if (!item) return;
+        let value: string | undefined;
+        if (item.values) {
+          value = await ctx.ui.select(item.label, item.values);
+        } else {
+          value = await ctx.ui.input(`New value for ${item.label}`, item.current);
+        }
+        if (value === undefined || value.trim() === '') return;
+        settings = applySettingValue(settings, item.id, value.trim());
+        persistSettings();
+        updateStatus(ctx);
+        ctx.ui.notify(
+          `Saved ${item.label} = ${value.trim()}. Run /ledger-settings for more.`,
+          'info'
+        );
         return;
       }
+      // TUI: the rich searchable SettingsList (submenus, inline edit).
       await ctx.ui.custom((_tui, theme, _kb, done) => {
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
@@ -2343,6 +2453,49 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // ── Helpers requiring ctx ─────────────────────────────────────────────
 
+  /** Setting descriptors for the RPC/GUI `/ledger-settings` flow (a `select`
+   *  -> `input`/`select` dialog). Mirrors `buildSettingItems` without the TUI
+   *  `submenu` factories (which need a terminal to render). */
+  interface RpcSettingItem {
+    id: string;
+    label: string;
+    current: string;
+    values?: string[];
+  }
+
+  function rpcSettingItems(ctx: ExtensionCommandContext): RpcSettingItem[] {
+    return [
+      { id: 'agentRatePerHour', label: 'Agent rate', current: fmtRate(settings.agentRatePerHour) },
+      { id: 'humanRatePerHour', label: 'Human rate', current: fmtRate(settings.humanRatePerHour) },
+      {
+        id: 'pomodoroMinutes',
+        label: 'Pomodoro minutes',
+        current: String(settings.pomodoroMinutes),
+      },
+      { id: 'referenceTps', label: 'Reference TPS', current: fmtTps(settings.referenceTps) },
+      { id: 'project', label: 'Project', current: settings.project || basename(ctx.cwd) },
+      { id: 'author', label: 'Author', current: settings.author || defaultAuthor() },
+      {
+        id: 'currency',
+        label: 'Currency',
+        current: settings.currency,
+        values: ['USD', 'EUR', 'GBP', 'JPY', 'VND', 'AUD', 'CAD', 'SGD'],
+      },
+      {
+        id: 'autoWizard',
+        label: 'Auto-wizard',
+        current: settings.autoWizard ? 'on' : 'off',
+        values: ['on', 'off'],
+      },
+      {
+        id: 'autoExtend',
+        label: 'Auto-extend',
+        current: settings.autoExtend ? 'on' : 'off',
+        values: ['on', 'off'],
+      },
+    ];
+  }
+
   function buildSettingItems(theme: Theme, ctx: ExtensionContext): SettingItem[] {
     return [
       {
@@ -2399,6 +2552,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         label: 'Auto-wizard',
         currentValue: settings.autoWizard ? 'on' : 'off',
         description: 'Auto-popup to prompt extending when billable credit runs out',
+        values: ['on', 'off'],
+      },
+      {
+        id: 'autoExtend',
+        label: 'Auto-extend',
+        currentValue: settings.autoExtend ? 'on' : 'off',
+        description:
+          'Auto-provision a pomodoro block silently (no prompt) when credit runs out — for GUI/headless sessions',
         values: ['on', 'off'],
       },
     ];

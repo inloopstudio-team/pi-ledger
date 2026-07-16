@@ -42,6 +42,7 @@ const DEFAULTS: LedgerSettings = {
   author: '',
   currency: 'USD',
   autoWizard: true,
+  autoExtend: false,
 };
 
 const KIND_BY_CUSTOM_TYPE: Record<string, SidecarEvent['kind']> = {
@@ -216,6 +217,8 @@ describe('applySettingValue', () => {
     expect(applySettingValue(DEFAULTS, 'currency', 'EUR').currency).toBe('EUR');
     expect(applySettingValue(DEFAULTS, 'autoWizard', 'off').autoWizard).toBe(false);
     expect(applySettingValue(DEFAULTS, 'autoWizard', 'on').autoWizard).toBe(true);
+    expect(applySettingValue(DEFAULTS, 'autoExtend', 'on').autoExtend).toBe(true);
+    expect(applySettingValue(DEFAULTS, 'autoExtend', 'off').autoExtend).toBe(false);
   });
   it('ignores non-numeric input for numeric fields', () => {
     expect(
@@ -1282,6 +1285,85 @@ describe('extension integration', () => {
     expect(open).toBeDefined();
     expect(open!.engagedVia).toBe('extension');
     expect(open!.grantedBudgetMs).toBe(5 * 60_000); // 5m credit
+  });
+
+  it('shows a `select` dialog (not the TUI custom wizard) in RPC mode at agent_settled', async () => {
+    (fixture.mockCtx as unknown as { mode: string }).mode = 'rpc';
+    fixture.setSelectResult('Extend +20m');
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // no credit -> RPC select pops
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.selectSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(0); // flush the select resolve -> applyWizardChoice('extend')
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open).toBeDefined();
+    expect(open!.engagedVia).toBe('extension');
+    expect(open!.grantedBudgetMs).toBe(20 * 60_000); // +20m block
+  });
+
+  it('auto-extends a pomodoro block silently (no dialog) when credit runs out', async () => {
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, autoExtend: true }, timestamp: 0 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate autoExtend; no pop
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // no credit -> auto-extend (no pop)
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.selectSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(0); // flush
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open).toBeDefined();
+    expect(open!.engagedVia).toBe('extension');
+    expect(open!.grantedBudgetMs).toBe(20 * 60_000);
+    expect(fixture.notifySpy).toHaveBeenCalledWith(
+      'Auto-extended billable human time by 20m.',
+      'info'
+    );
+  });
+
+  it('auto-extends even in a headless (print) mode with no dialog UI', async () => {
+    (fixture.mockCtx as unknown as { mode: string }).mode = 'print';
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, autoExtend: true }, timestamp: 0 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open).toBeDefined();
+    expect(open!.grantedBudgetMs).toBe(20 * 60_000);
+  });
+
+  it('/ledger-extend opens the select wizard in RPC mode (Stop billing arms the guard)', async () => {
+    (fixture.mockCtx as unknown as { mode: string }).mode = 'rpc';
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, autoWizard: false }, timestamp: 0 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    fixture.setSelectResult('Stop billing');
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx);
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.selectSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(0); // flush -> applyWizardChoice('stop')
+    const pause = fixture.lastSidecarEvent('billing-pause');
+    expect(pause).toBeDefined();
+    expect(pause!.paused).toBe(true);
+  });
+
+  it('/ledger-settings edits a scalar via select -> input in RPC mode', async () => {
+    (fixture.mockCtx as unknown as { mode: string }).mode = 'rpc';
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.setSelectResult('Agent rate: 60');
+    fixture.setInputResult('120');
+    await fixture.commands['ledger-settings'].handler('', fixture.mockCtx);
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.selectSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.inputSpy).toHaveBeenCalledTimes(1);
+    const settingsEvt = fixture.lastSidecarEvent('settings');
+    expect(settingsEvt).toBeDefined();
+    expect(settingsEvt!.settings.agentRatePerHour).toBe(120);
   });
 
   it('rehydrates totals + settings on session_start and /ledger reports them', async () => {

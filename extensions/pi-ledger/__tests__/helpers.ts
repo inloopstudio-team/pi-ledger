@@ -56,6 +56,8 @@ export interface TestFixture {
   notifySpy: ReturnType<typeof vi.fn>;
   setStatusSpy: ReturnType<typeof vi.fn>;
   customSpy: ReturnType<typeof vi.fn>;
+  selectSpy: ReturnType<typeof vi.fn>;
+  inputSpy: ReturnType<typeof vi.fn>;
   registerCommandSpy: ReturnType<typeof vi.fn>;
   setEditorComponentSpy: ReturnType<typeof vi.fn>;
   /** Send a keystroke into the editor wrapper installed via setEditorComponent. */
@@ -65,6 +67,10 @@ export interface TestFixture {
   run: (name: string, event: unknown) => void;
   /** Set the value that ctx.ui.custom()'s promise resolves with (for wizard accept/dismiss). */
   setCustomResult: (value: unknown) => void;
+  /** Set the value ctx.ui.select() resolves with (for RPC wizard/settings). */
+  setSelectResult: (value: unknown) => void;
+  /** Set the value ctx.ui.input() resolves with (for RPC settings). */
+  setInputResult: (value: unknown) => void;
   mockEntries: Array<{ type?: string; customType?: string; data?: unknown }>;
   mockCtx: ExtensionContext;
   /** Overwrite the per-session sidecar event log with `events` (simulates a resumed session). */
@@ -123,6 +129,8 @@ export function createTestFixture(): TestFixture {
   const notifySpy = vi.fn();
   const setStatusSpy = vi.fn();
   const customSpy = vi.fn();
+  const selectSpy = vi.fn();
+  const inputSpy = vi.fn();
   const registerCommandSpy = vi.fn((name: string, options: unknown) => {
     commands[name] = options as TestFixture['commands'][string];
   });
@@ -144,6 +152,14 @@ export function createTestFixture(): TestFixture {
   const setCustomResult = (value: unknown) => {
     customResult = value;
   };
+  let selectResult: unknown = undefined;
+  const setSelectResult = (value: unknown) => {
+    selectResult = value;
+  };
+  let inputResult: unknown = undefined;
+  const setInputResult = (value: unknown) => {
+    inputResult = value;
+  };
 
   const mockCtx = {
     hasUI: true,
@@ -153,6 +169,8 @@ export function createTestFixture(): TestFixture {
       notify: notifySpy,
       setStatus: setStatusSpy,
       custom: customSpy,
+      select: selectSpy,
+      input: inputSpy,
       setEditorComponent: setEditorComponentSpy,
     },
     sessionManager: {
@@ -202,6 +220,8 @@ export function createTestFixture(): TestFixture {
   // ctx.ui.custom: by default resolve immediately without invoking the factory
   // (avoids needing a terminal). Tests can set a result to simulate a choice.
   customSpy.mockImplementation(() => Promise.resolve(customResult));
+  selectSpy.mockImplementation(() => Promise.resolve(selectResult));
+  inputSpy.mockImplementation(() => Promise.resolve(inputResult));
 
   const sidecarFile = () => sidecarPathFor(TEST_SESSION_ID);
   const seedSidecar = (events: SidecarEvent[]) => {
@@ -246,12 +266,16 @@ export function createTestFixture(): TestFixture {
     notifySpy,
     setStatusSpy,
     customSpy,
+    selectSpy,
+    inputSpy,
     registerCommandSpy,
     setEditorComponentSpy,
     sendEditorKey,
     emitEvent,
     run,
     setCustomResult,
+    setSelectResult,
+    setInputResult,
     mockEntries,
     mockCtx,
     seedSidecar,

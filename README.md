@@ -43,11 +43,16 @@ you dequeue and never re-send bills nothing. Idle costs nothing by default: an i
 when your next submit produces agent work (`agent_start`) — so pure idle, or
 idle you walk away from, bills nothing. A wizard pops at `agent_settled` (inline,
 pi-core settings style) and on `/resume` to offer pomodoro-style blocks when no
-rolling credit remains. Extensions are **rolling credit** — provisioned pomodoro blocks
+rolling credit remains — a styled TUI component in the terminal, or a `select`
+dialog in a GUI (the vscode-pi extension runs pi in RPC mode, where the custom
+component can't render). Extensions are **rolling credit** — provisioned pomodoro blocks
 survive across agent turns (like provisioned capacity) and are themselves an
 engagement signal, so the wizard stays silent while credit remains and only
-re-pops when it's exhausted. `/ledger-receipt` then emits the invoice — the
-cloud-provider usage report, for your own work.
+re-pops when it's exhausted. For headless/GUI sessions where a prompt can't
+render (or a hands-off "bill my review time" policy), enable **auto-extend** to
+provision a block silently instead of prompting — it bills only idle a later
+submit commits, capped at the block, so walking away never over-bills.
+`/ledger-receipt` then emits the invoice — the cloud-provider usage report, for your own work.
 
 > **Standalone, but pi-tps-aware.** pi-ledger works on its own — it measures
 > agent time itself when [`@monotykamary/pi-tps`](https://github.com/monotykamary/pi-tps)
@@ -79,12 +84,12 @@ billed) but enough to demo the output.
 
 ## Commands
 
-| Command              | What it does                                                                                                                                                |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/ledger`            | Show running totals: agent/human hours, costs, total.                                                                                                       |
-| `/ledger-settings`   | Bordered, searchable settings TUI (rates, pomodoro, project, author, currency, auto-wizard).                                                                |
-| `/ledger-extend [m]` | Open the human-time wizard to extend the window by `m` minutes (default: pomodoro length); confirm or stop in the dialog. Engages a window if none is open. |
-| `/ledger-receipt`    | Export a self-contained HTML receipt for the session and open it.                                                                                           |
+| Command              | What it does                                                                                                                                                                                |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/ledger`            | Show running totals: agent/human hours, costs, total.                                                                                                                                       |
+| `/ledger-settings`   | Configure billing (rates, pomodoro, project, author, currency, auto-wizard, auto-extend). TUI: a searchable settings list; GUI: a `select`→`input` flow.                                    |
+| `/ledger-extend [m]` | Open the human-time wizard to extend the window by `m` minutes (default: pomodoro length); confirm or stop in the dialog (TUI component or GUI `select`). Engages a window if none is open. |
+| `/ledger-receipt`    | Export a self-contained HTML receipt for the session and open it.                                                                                                                           |
 
 ## How time is measured
 
@@ -182,7 +187,9 @@ Idle with no output is wasted time.
 - **At `agent_settled`**, a **wizard** pops inline (the same pi-core settings style
   as `/ledger-settings`, so the status bar stays visible) **only when no
   rolling credit remains** — to prompt engagement (an extension both engages and
-  grants capacity). `agent_settled` fires once the run is fully settled (no
+  grants capacity). In the TUI it renders a custom component; in a GUI (RPC) it
+  falls back to a `select` dialog; with **auto-extend** on, it skips the prompt
+  and provisions a block silently. `agent_settled` fires once the run is fully settled (no
   auto-retry, compaction, or queued follow-up left), so the wizard never pops
   mid-retry or mid-continuation. With credit, it stays silent and arms to fire
   when the engaged window's credit is exhausted; the exhaustion pop offers the
