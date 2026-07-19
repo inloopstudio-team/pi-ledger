@@ -72,6 +72,19 @@ const TPS_TELEMETRY_EVENT = 'tps:telemetry';
 /** Custom entry type written by @monotykamary/pi-tps into the session JSONL. */
 const TPS_CUSTOM_TYPE = 'tps';
 
+/** Custom events emitted by @monotykamary/pi-retry around its retry loop:
+ *  'started' (with a retryId) when the loop spins up, 'completed' when it
+ *  exits on success, 'cancelled' when it exits on abort/session-change.
+ *  pi-ledger subscribes so the engagement wizard does not pop mid-retry —
+ *  agent_settled can fire during a pi-retry backoff sleep (before pi-retry has
+ *  re-prompted), and popping then would bill the backoff as human time
+ *  (violating scale-to-zero: a slow/queued provider is a retry, not billable).
+ *  The prompt is deferred until the retry settles. Mirrors localterm's
+ *  agent-notify handshake. */
+const PI_RETRY_STARTED_EVENT = 'pi-retry:started';
+const PI_RETRY_COMPLETED_EVENT = 'pi-retry:completed';
+const PI_RETRY_CANCELLED_EVENT = 'pi-retry:cancelled';
+
 /** Minimum gap between streaming updates to count as an inference stall (ms). */
 const STALL_THRESHOLD_MS = 500;
 
@@ -847,6 +860,17 @@ function reveal(text: string): string {
   return ` data-reveal="${esc(text)}">`;
 }
 
+/** Pull the 'retryId' out of a @monotykamary/pi-retry event payload, or
+ *  'undefined' if it is absent/malformed. Used to match a 'completed'/
+ *  'cancelled' event back to its 'started' so pi-ledger only acts on its own
+ *  retry. Mirrors localterm's retry-event-id util. Pure.
+ *  @internal Exported for testing only. */
+export function retryEventId(event: unknown): number | undefined {
+  if (typeof event !== 'object' || event === null || !('retryId' in event)) return undefined;
+  const id = (event as { retryId?: unknown }).retryId;
+  return typeof id === 'number' ? id : undefined;
+}
+
 /**
  * Build a self-contained HTML receipt. White-on-white, Geist Mono, with
  * values that stream in autoregressively (char-by-char) on load.
@@ -1203,6 +1227,25 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   let idleKeystrokes = 0;
 
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // pi-retry awareness: when @monotykamary/pi-retry is installed it emits
+  // pi-retry:started/completed/cancelled around its (possibly multi-attempt)
+  // retry loop. agent_settled can fire during a retry's backoff sleep —
+  // before pi-retry has decided whether to re-prompt — so without gating the
+  // wizard would pop mid-retry (billing the backoff as human time, violating
+  // scale-to-zero). We capture the active retryId and DEFER the settled
+  // prompt until the retry settles: pop only on 'completed', never on
+  // 'cancelled', and never while a retry is in flight. Mirrors localterm's
+  // agent-notify handshake.
+  let retryActiveId: number | undefined;
+  // The run settled (agent_settled fired, no rolling credit) but a retry was
+  // in flight, so the engagement prompt is pending until the retry completes.
+  // Cleared on pop, on agent_start (a new run supersedes the stale settled
+  // state), on retry cancelled, and at session boundaries.
+  let pendingSettledWizard: { ctx: ExtensionContext } | null = null;
+  // Unsubscribers for the pi-retry event capture (a session-scoped resource);
+  // torn down at session_shutdown. The factory re-binds on the next session.
+  let retryUnsubs: Array<() => void> = [];
 
   // Latest ctx (event-bus listeners for tps:telemetry don't receive one).
   let lastCtx: ExtensionContext | null = null;
@@ -1903,6 +1946,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // rule as an unclosed idle window: uncommitted, so not restored.
     pendingSteers = [];
     dequeuedBuffer = null;
+    // Reset pi-retry capture state — a fresh session has no in-flight retry and
+    // no deferred prompt (an unclosed prior session's retry could otherwise
+    // leak across the session boundary on a per-process extension instance).
+    retryActiveId = undefined;
+    pendingSettledWizard = null;
     // Wrap the input editor so keystrokes stage for billing: during a run they
     // feed a steer/followUp burst (committed on submit via `input`); between
     // turns the FIRST keystroke engages an idle window at its onset. Extends
@@ -1944,6 +1992,20 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // at shutdown was never committed, so it's abandoned and bills 0 (idle
     // with no output is wasted). Persisted as a close for replay cleanliness.
     closeHumanWindow(lastCtx, false);
+    // Tear down the pi-retry event capture (a session-scoped resource): the
+    // factory re-binds subscriptions on the next session, so unbind here to
+    // avoid leaking listeners across the session boundary. Reset the capture
+    // state too — no in-flight retry survives a session teardown.
+    for (const unsub of retryUnsubs) {
+      try {
+        unsub();
+      } catch {
+        // best-effort — ignore a stale bus
+      }
+    }
+    retryUnsubs = [];
+    retryActiveId = undefined;
+    pendingSettledWizard = null;
   });
 
   // ── Agent timing (tool execution) ─────────────────────────────────────
@@ -2043,6 +2105,41 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // at turn_end. Exactly one segment is written per turn regardless of
   // extension load order — a 'fallback' may be corrected by a later 'tps'
   // entry for the same turnIndex (rehydrate keeps the last per turnIndex).
+
+  // ── pi-retry capture ─────────────────────────────────────────────────
+  // @monotykamary/pi-retry emits started/completed/cancelled around its
+  // (possibly multi-attempt) retry loop. agent_settled can land during a
+  // retry's backoff sleep — before pi-retry has re-prompted — so without this
+  // capture the engagement wizard would pop mid-retry, billing the backoff as
+  // human time (violating scale-to-zero: a slow/queued provider is a retry,
+  // not billable). Defer the settled prompt until the retry settles: pop on
+  // 'completed' (if still no credit), never on 'cancelled', never while one is
+  // in flight. Unsubscribed at session_shutdown (a session-scoped resource);
+  // the factory re-binds on the next session. Mirrors localterm's agent-notify.
+  retryUnsubs.push(
+    pi.events.on(PI_RETRY_STARTED_EVENT, (event: unknown) => {
+      retryActiveId = retryEventId(event);
+    })
+  );
+  retryUnsubs.push(
+    pi.events.on(PI_RETRY_COMPLETED_EVENT, (event: unknown) => {
+      if (retryEventId(event) !== retryActiveId) return;
+      retryActiveId = undefined;
+      const pending = pendingSettledWizard;
+      if (!pending) return;
+      pendingSettledWizard = null;
+      // Credit may have changed since settle (e.g. a mid-backoff /ledger-extend);
+      // with none, pop now that the retry has settled. With credit, stay quiet.
+      if (extensionBudgetMs <= 0) armWizardNow(pending.ctx);
+    })
+  );
+  retryUnsubs.push(
+    pi.events.on(PI_RETRY_CANCELLED_EVENT, (event: unknown) => {
+      if (retryEventId(event) !== retryActiveId) return;
+      retryActiveId = undefined;
+      pendingSettledWizard = null; // abort/session-change → no prompt
+    })
+  );
 
   pi.events.on(TPS_TELEMETRY_EVENT, (payload: unknown) => {
     const t = payload as TpsTelemetry | null;
@@ -2159,6 +2256,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // If the human never engaged (no keystroke, no extension), there's no
     // window to close and the turn handoff bills nothing.
     closeHumanWindow(ctx, true);
+    // A new run supersedes any deferred settled prompt (a retry turn, a queued
+    // follow-up, or a fresh prompt all re-settle later — agent_settled
+    // re-evaluates then). Keeps a pi-retry that completes after a retry
+    // turn's agent_end from popping on a stale 'settled' until that run settles.
+    pendingSettledWizard = null;
   });
 
   pi.on('agent_end', (_event, ctx) => {
@@ -2208,7 +2310,22 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // after a retry storm exhausts — the last errored agent_end no longer
     // suppresses it, since the run has now settled and the human must take
     // over.
-    if (extensionBudgetMs <= 0) armWizardNow(ctx);
+    if (extensionBudgetMs <= 0) {
+      // @monotykamary/pi-retry (if installed) drives its own retry loop with
+      // backoff sleeps outside processEvents; pi-core's settlement detection
+      // can fire this agent_settled during that backoff — before pi-retry has
+      // decided whether to re-prompt. Popping then would bill the backoff as
+      // human time (violating scale-to-zero: a slow/queued provider is a
+      // retry, not billable). Defer: if a pi-retry is in flight, stage the
+      // prompt and pop when the retry settles (on pi-retry:completed); a
+      // cancelled retry never pops. With no pi-retry (or none active), pop now
+      // as before.
+      if (retryActiveId !== undefined) {
+        pendingSettledWizard = { ctx };
+      } else {
+        armWizardNow(ctx);
+      }
+    }
   });
 
   // The `input` event fires for every interactive submit that isn't a slash

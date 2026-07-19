@@ -191,7 +191,11 @@ Idle with no output is wasted time.
   falls back to a `select` dialog; with **auto-extend** on, it skips the prompt
   and provisions a block silently. `agent_settled` fires once the run is fully settled (no
   auto-retry, compaction, or queued follow-up left), so the wizard never pops
-  mid-retry or mid-continuation. With credit, it stays silent and arms to fire
+  mid-retry or mid-continuation. When [@monotykamary/pi-retry](https://github.com/monotykamary/pi-retry) is installed, its
+  backoff sleep can make `agent_settled` fire mid-retry; pi-ledger captures
+  pi-retry's `started`/`completed`/`cancelled` events and defers the prompt
+  until the retry genuinely settles — it pops on `completed`, never on
+  `cancelled`, never while one is in flight. With credit, it stays silent and arms to fire
   when the engaged window's credit is exhausted; the exhaustion pop offers the
   next extension (the `extend + extend + extend` chain).
 - `/ledger-extend [m]` opens the wizard manually — with or without an open
@@ -396,7 +400,7 @@ current moment, including the in-progress open human window, from the sidecar
 
 ```bash
 pnpm install
-pnpm test            # vitest run (129 tests)
+pnpm test            # vitest run (140 tests)
 pnpm run typecheck   # tsc --noEmit
 pnpm run lint:dead   # knip
 ```

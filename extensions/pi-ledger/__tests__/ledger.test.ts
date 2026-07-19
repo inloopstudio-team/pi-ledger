@@ -23,6 +23,7 @@ import {
   fmtMoney,
   rehydrateFromSidecar,
   resolveExtensionBudget,
+  retryEventId,
   sidecarPathFor,
   type LedgerSettings,
   type ReceiptData,
@@ -2524,5 +2525,129 @@ describe('rehydrateFromSidecar — skip-billing guard', () => {
 
   it('defaults billingPaused to false for an empty sidecar', () => {
     expect(rehydrateFromSidecar([]).billingPaused).toBe(false);
+  });
+});
+
+// ─── pi-retry capture (wizard gating) ────────────────────────────────────────
+// The engagement prompt (no rolling credit) lives at agent_settled. When
+// @monotykamary/pi-retry is installed, agent_settled can fire during a retry's
+// backoff sleep — before pi-retry has decided whether to re-prompt. pi-ledger
+// captures pi-retry's started/completed/cancelled events and DEFERS the prompt
+// until the retry settles, so the backoff is never billed as human time.
+// Mirrors localterm's agent-notify contract.
+
+describe('pi-retry capture (wizard gating)', () => {
+  let fixture: TestFixture;
+  let cacheDir: string;
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
+    process.env.XDG_CACHE_HOME = cacheDir;
+    fixture = createTestFixture();
+    await activateExtension(fixture);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.XDG_CACHE_HOME;
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  const STARTED = 'pi-retry:started';
+  const COMPLETED = 'pi-retry:completed';
+  const CANCELLED = 'pi-retry:cancelled';
+
+  it('pops the wizard at agent_settled when no pi-retry is active', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // no credit → pop
+  });
+
+  it('defers the wizard while a pi-retry is in flight; pops on completed', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.emitEvent(STARTED, { retryId: 1 });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // retry in flight → defer
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    fixture.emitEvent(COMPLETED, { retryId: 1 }); // retry settled → pop the deferred prompt
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // still engagement-gated
+  });
+
+  it('waits for the final agent_settled when retry completion arrives first', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.emitEvent(STARTED, { retryId: 2 });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // retry in flight → defer
+    // the retry turn fires (a new run supersedes the stale deferred prompt)
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    // retry completes BEFORE the run settles → pending was cleared by agent_start → no pop
+    fixture.emitEvent(COMPLETED, { retryId: 2 });
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    fixture.run('agent_settled', { type: 'agent_settled' }); // now settled, no retry active → pop
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('never pops when a pi-retry is cancelled', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.emitEvent(STARTED, { retryId: 3 });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // retry in flight → defer
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    fixture.emitEvent(CANCELLED, { retryId: 3 }); // abort/session-change → drop the prompt
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+  });
+
+  it('ignores a completed event that does not match the active retry', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.emitEvent(STARTED, { retryId: 4 });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // defer (active id 4)
+    fixture.emitEvent(COMPLETED, { retryId: 999 }); // stray → ignored
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    fixture.emitEvent(COMPLETED, { retryId: 4 }); // matching → pop
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a completed with no prior started as a no-op', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.emitEvent(COMPLETED, { retryId: 7 }); // no retry active → stray event
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+  });
+
+  it('defers auto-extend too while a pi-retry is in flight; extends on completed', () => {
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, autoExtend: true }, timestamp: 0 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate → autoExtend on
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.emitEvent(STARTED, { retryId: 5 });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // retry in flight → defer auto-extend
+    expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-open')).toHaveLength(0);
+    fixture.emitEvent(COMPLETED, { retryId: 5 }); // settled → auto-extend provisions a block + engages
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open).toBeDefined();
+    expect(open!.engagedVia).toBe('extension'); // auto-extend engages via extension
+  });
+});
+
+describe('retryEventId', () => {
+  it('returns the retryId of a pi-retry event', () => {
+    expect(retryEventId({ retryId: 42 })).toBe(42);
+  });
+  it('returns undefined when retryId is absent or malformed', () => {
+    expect(retryEventId(undefined)).toBeUndefined();
+    expect(retryEventId(null)).toBeUndefined();
+    expect(retryEventId({})).toBeUndefined();
+    expect(retryEventId({ retryId: 'oops' })).toBeUndefined();
   });
 });
