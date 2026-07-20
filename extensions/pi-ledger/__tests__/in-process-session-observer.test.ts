@@ -66,6 +66,7 @@ function createFakeAgentSessionClass() {
     unsubscribeCalls = 0;
     promptFailure: unknown;
     subscribeFailure: unknown;
+    unsubscribeFailure: unknown;
     promptEvent?: FakeSessionEvent;
     lastPromptResult?: Promise<void>;
     onUnsubscribe?: () => void;
@@ -97,6 +98,7 @@ function createFakeAgentSessionClass() {
         this.unsubscribeCalls += 1;
         this.listeners.delete(listener);
         this.onUnsubscribe?.();
+        if (this.unsubscribeFailure) throw this.unsubscribeFailure;
       };
     }
 
@@ -401,6 +403,30 @@ describe('in-process AgentSession observer', () => {
     const session = new FakeAgentSession('child-reload');
     await session.prompt('one listener');
     expect(session.subscribeCalls).toBe(1);
+  });
+
+  it('reattaches after an unsubscribe callback removes its listener and then throws', async () => {
+    const FakeAgentSession = createFakeAgentSessionClass();
+    const errors = vi.fn();
+    const first = installFor(FakeAgentSession, { onError: errors });
+    const session = new FakeAgentSession('child-throwing-unsubscribe');
+    await session.prompt('attach first listener');
+    const unsubscribeError = new Error('unsubscribe failed after removal');
+    session.unsubscribeFailure = unsubscribeError;
+
+    first.uninstall();
+
+    expect(session.listeners).toHaveLength(0);
+    expect(errors).toHaveBeenCalledWith({ phase: 'uninstall', error: unsubscribeError });
+    session.unsubscribeFailure = undefined;
+    const usage = vi.fn();
+    installFor(FakeAgentSession, { onAssistantUsage: usage });
+    await session.prompt('reattach listener');
+    session.emit(assistantEnd());
+
+    expect(session.subscribeCalls).toBe(2);
+    expect(session.listeners).toHaveLength(1);
+    expect(usage).toHaveBeenCalledTimes(1);
   });
 
   it('preserves prompt rejection identity and retries a failed subscription without blocking prompts', async () => {

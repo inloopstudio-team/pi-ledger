@@ -97,9 +97,23 @@ export interface SubprocessTelemetryObserverHandle {
 type DiagnosticListener = (message: unknown, name?: string | symbol) => void;
 type Listener = (...args: unknown[]) => void;
 type Emit = (this: unknown, ...args: unknown[]) => unknown;
+
+const STREAM_PATCH_SYMBOL = Symbol.for('@monotykamary/pi-ledger/subprocess-stdout-emit-patch/v1');
+const STREAM_PATCH_BRAND = '@monotykamary/pi-ledger/subprocess-stdout-emit-patch/v1';
+
 interface StreamLike {
   emit: Emit;
 }
+
+interface StreamEmitPatch {
+  readonly brand: typeof STREAM_PATCH_BRAND;
+  readonly stream: StreamLike;
+  readonly wrapper: Emit;
+  readonly previous: Emit;
+  readonly previousDescriptor?: PropertyDescriptor;
+  active: boolean;
+}
+
 interface ChildLike {
   pid?: number;
   spawnfile?: string | null;
@@ -169,6 +183,53 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function streamEmitPatch(value: unknown): StreamEmitPatch | undefined {
+  if (typeof value !== 'function') return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, STREAM_PATCH_SYMBOL);
+    const candidate = descriptor && 'value' in descriptor ? record(descriptor.value) : undefined;
+    if (
+      candidate?.brand !== STREAM_PATCH_BRAND ||
+      candidate.wrapper !== value ||
+      typeof candidate.previous !== 'function' ||
+      typeof candidate.active !== 'boolean'
+    ) {
+      return undefined;
+    }
+    return candidate as unknown as StreamEmitPatch;
+  } catch {
+    return undefined;
+  }
+}
+
+function peelInactiveStreamPatches(
+  stream: StreamLike,
+  onError: SubprocessTelemetryObserverOptions['onError']
+): void {
+  for (let depth = 0; depth < 64; depth++) {
+    let current: unknown;
+    try {
+      current = Reflect.get(stream, 'emit');
+    } catch (error) {
+      report(onError, 'cleanup', error);
+      return;
+    }
+    const patch = streamEmitPatch(current);
+    if (!patch || patch.stream !== stream || patch.active) return;
+    try {
+      if (patch.previousDescriptor) {
+        Object.defineProperty(stream, 'emit', patch.previousDescriptor);
+      } else if (!Reflect.deleteProperty(stream, 'emit')) {
+        throw new Error('Unable to restore the inherited stdout emit method.');
+      }
+    } catch (error) {
+      report(onError, 'cleanup', error);
+      return;
+    }
+  }
+  report(onError, 'cleanup', new Error('Too many nested stdout emit observer patches.'));
 }
 
 function nonNegative(value: unknown): number {
@@ -533,13 +594,13 @@ export function installSubprocessTelemetryObserver(
         });
         if (done) return;
         const stdout = child.stdout;
-        const original = stdout?.emit;
-        if (stdout && typeof original === 'function') {
+        const previous = stdout?.emit;
+        if (stdout && typeof previous === 'function') {
           parser = new JsonlParser(ref, maxLineBytes, { event: dispatch, now });
-          const descriptor = Object.getOwnPropertyDescriptor(stdout, 'emit');
-          let active = true;
+          const previousDescriptor = Object.getOwnPropertyDescriptor(stdout, 'emit');
+          let patch: StreamEmitPatch;
           const wrapper: Emit = function (this: unknown, ...args: unknown[]): unknown {
-            if (active && this === stdout) {
+            if (patch.active && this === stdout) {
               try {
                 if (args[0] === 'data') parser?.push(args[1]);
                 else if (args[0] === 'end') parser?.finish();
@@ -551,29 +612,38 @@ export function installSubprocessTelemetryObserver(
                 report(options.onError, 'stream', error);
               }
             }
-            return Reflect.apply(original, this, args);
+            return Reflect.apply(previous, this, args);
           };
+          patch = {
+            brand: STREAM_PATCH_BRAND,
+            stream: stdout,
+            wrapper,
+            previous,
+            ...(previousDescriptor ? { previousDescriptor } : {}),
+            active: true,
+          };
+          Object.defineProperty(wrapper, STREAM_PATCH_SYMBOL, {
+            value: patch,
+            enumerable: false,
+            configurable: false,
+            writable: false,
+          });
           Object.defineProperty(stdout, 'emit', {
             value: wrapper,
-            writable: descriptor?.writable ?? true,
-            enumerable: descriptor?.enumerable ?? false,
-            configurable: descriptor?.configurable ?? true,
+            writable: previousDescriptor?.writable ?? true,
+            enumerable: previousDescriptor?.enumerable ?? false,
+            configurable: previousDescriptor?.configurable ?? true,
           });
           restore = (): void => {
-            if (!active) return;
-            active = false;
-            try {
-              if (Reflect.get(stdout, 'emit') !== wrapper) return;
-              if (descriptor) Object.defineProperty(stdout, 'emit', descriptor);
-              else Reflect.deleteProperty(stdout, 'emit');
-            } catch (error) {
-              report(options.onError, 'cleanup', error);
-            }
+            if (!patch.active) return;
+            patch.active = false;
+            peelInactiveStreamPatches(stdout, options.onError);
           };
         }
         Reflect.apply(child.once, child, ['close', closed]);
       } catch (error) {
         report(options.onError, 'attach', error);
+        cleanup();
       }
     };
     cleanups.add(cleanup);

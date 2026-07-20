@@ -420,10 +420,11 @@ function detachSessions(state: PatchState, reportingSubscriber: Subscriber): voi
     if (!observation.subscribed || !observation.unsubscribe) continue;
     try {
       observation.unsubscribe();
-      observation.unsubscribe = undefined;
-      observation.subscribed = false;
     } catch (error) {
       reportSubscriber(reportingSubscriber, 'uninstall', error);
+    } finally {
+      observation.unsubscribe = undefined;
+      observation.subscribed = false;
     }
   }
 }

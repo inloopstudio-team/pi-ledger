@@ -280,6 +280,54 @@ describe('subprocess JSONL observation', () => {
     expect(() => second.unsubscribe()).not.toThrow();
   });
 
+  it('restores the exact emit method after stacked observers uninstall in either order', () => {
+    for (const order of ['first-second', 'second-first'] as const) {
+      const channel = new FakeChannel();
+      const stdout = new EventEmitter();
+      const original = stdout.emit;
+      const hadOwnEmit = Object.hasOwn(stdout, 'emit');
+      const first = installSubprocessTelemetryObserver({ dependencies: { channel } });
+      const second = installSubprocessTelemetryObserver({ dependencies: { channel } });
+      rpcChild(channel, stdout);
+
+      expect(stdout.emit).not.toBe(original);
+      if (order === 'first-second') {
+        first.unsubscribe();
+        second.unsubscribe();
+      } else {
+        second.unsubscribe();
+        first.unsubscribe();
+      }
+      expect(stdout.emit).toBe(original);
+      expect(Object.hasOwn(stdout, 'emit')).toBe(hadOwnEmit);
+    }
+  });
+
+  it('cleans up a child when its stdout emit method cannot be wrapped', () => {
+    const channel = new FakeChannel();
+    const stdout = new EventEmitter();
+    Object.defineProperty(stdout, 'emit', {
+      value: stdout.emit,
+      writable: false,
+      configurable: false,
+    });
+    const child = new FakeChild(stdout);
+    const errors = vi.fn();
+    const handle = installSubprocessTelemetryObserver({
+      dependencies: { channel },
+      onError: errors,
+    });
+
+    channel.publish(child);
+    child.spawn('/usr/local/bin/pi', ['/usr/local/bin/pi', '--mode', 'rpc']);
+
+    expect(errors.mock.calls[0]![0].phase).toBe('attach');
+    expect(child.listenerCount('spawn')).toBe(0);
+    expect(child.listenerCount('error')).toBe(0);
+    expect(child.listenerCount('close')).toBe(0);
+    expect(() => handle.unsubscribe()).not.toThrow();
+  });
+
   it('restores pending observations and degrades when the channel is unavailable', () => {
     const channel = new FakeChannel();
     const pending = new FakeChild();
