@@ -17,6 +17,8 @@ pi-ledger is the billing engine for the **serverless agency** — a dev shop tha
 runs on on-demand agents and bills the way serverless compute is billed:
 **per-invocation, duration-based, scale-to-zero idle**.
 
+> 📝 **Read the story behind it:** [Bill the invocation, not the hour](https://app.inloop.studio/blog/engineering/bill-the-invocation-not-the-hour) — the blog post that introduces the "serverless agency" and the "bill forward progress, not process" thesis pi-ledger is built on.
+
 | Serverless compute     | pi-ledger                                                          |
 | ---------------------- | ------------------------------------------------------------------ |
 | On-demand function     | The agent — each turn is an invocation                             |
