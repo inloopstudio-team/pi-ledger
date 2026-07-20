@@ -201,7 +201,14 @@ export function createTestFixture(): TestFixture {
 
   const mockPi: Partial<ExtensionAPI> = {
     on: vi.fn((event: string, handler: (...args: unknown[]) => unknown) => {
-      handlers[event] = handler;
+      const previous = handlers[event];
+      handlers[event] = previous
+        ? (...args: unknown[]) => {
+            const previousResult = previous(...args);
+            const result = handler(...args);
+            return result === undefined ? previousResult : result;
+          }
+        : handler;
       return mockPi as ExtensionAPI;
     }) as unknown as ExtensionAPI['on'],
     appendEntry: appendEntrySpy,

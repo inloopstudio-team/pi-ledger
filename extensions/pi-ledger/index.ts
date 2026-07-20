@@ -63,6 +63,7 @@ import {
   type SettingItem,
   type TUI,
 } from '@earendil-works/pi-tui';
+import { installNestedAgentTelemetryHarvester } from './nested-agent-telemetry.js';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -1114,6 +1115,8 @@ function fmtNumber(n: number): string {
 // ─── Extension ──────────────────────────────────────────────────────────────
 
 export default function ledgerExtension(pi: ExtensionAPI) {
+  installNestedAgentTelemetryHarvester(pi);
+
   let settings: LedgerSettings = { ...DEFAULT_SETTINGS };
 
   const totals: Totals = {
