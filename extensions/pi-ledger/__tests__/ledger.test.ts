@@ -952,6 +952,71 @@ describe('extension integration', () => {
     expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('keystroke');
   });
 
+  it('keeps the TUI wizard single-flight across overlapping triggers', async () => {
+    let resolveWizard!: (choice: string) => void;
+    fixture.customSpy.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveWizard = resolve;
+        })
+    );
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    await fixture.commands['ledger-extend']!.handler('', fixture.mockCtx);
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+
+    resolveWizard('dismiss');
+    await vi.advanceTimersByTimeAsync(0);
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    expect(fixture.customSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not stack another wizard after the idle-credit timer fires', async () => {
+    fixture.setCustomResult('extend');
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    await vi.advanceTimersByTimeAsync(0); // extend and arm the 20m exhaustion timer
+
+    let resolveWizard!: (choice: string) => void;
+    fixture.customSpy.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveWizard = resolve;
+        })
+    );
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(fixture.customSpy).toHaveBeenCalledTimes(2);
+
+    await fixture.commands['ledger-extend']!.handler('', fixture.mockCtx);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(fixture.customSpy).toHaveBeenCalledTimes(2);
+
+    resolveWizard('dismiss');
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('keeps the RPC wizard single-flight while its selection is unresolved', async () => {
+    Object.assign(fixture.mockCtx, { mode: 'rpc' });
+    let resolveWizard!: (choice: string | undefined) => void;
+    fixture.selectSpy.mockImplementation(
+      () =>
+        new Promise<string | undefined>((resolve) => {
+          resolveWizard = resolve;
+        })
+    );
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    expect(fixture.selectSpy).toHaveBeenCalledTimes(1);
+
+    resolveWizard(undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    expect(fixture.selectSpy).toHaveBeenCalledTimes(2);
+  });
+
   // ── Retry/queue turns (pi-retry backoff) are not human idle ─────────────
 
   it('does not open a human window during a provider-error retry (agent_settled not fired)', async () => {
@@ -1212,6 +1277,7 @@ describe('extension integration', () => {
     fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // resume → pop
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(0); // dismiss before exercising the next session reason
     fixture.customSpy.mockClear();
     fixture.run('session_start', { type: 'session_start', reason: 'reload' }); // reload → pop
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);

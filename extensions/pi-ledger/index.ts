@@ -1230,6 +1230,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   let idleKeystrokes = 0;
 
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
+  // A rendered dialog outlives the timer that opened it. Keep the TUI/RPC
+  // prompt single-flight so overlapping lifecycle, retry, and command triggers
+  // cannot replace it while its unresolved promise remains alive.
+  let wizardOpen = false;
 
   // pi-retry awareness: when @monotykamary/pi-retry is installed it emits
   // pi-retry:started/completed/cancelled around its (possibly multi-attempt)
@@ -1783,6 +1787,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   function showWizard(ctx: ExtensionContext, extendMins: number = settings.pomodoroMinutes) {
     wizardTimer = null;
+    if (wizardOpen) return;
+    wizardOpen = true;
     const pomodoro = extendMins;
     // Works with or without an open window. With no window this is the
     // engagement prompt (agent_end no-credit / /resume): extend engages one.
@@ -1814,6 +1820,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
           const choice =
             picked === extendLabel ? 'extend' : picked === stopLabel ? 'stop' : 'dismiss';
           applyWizardChoice(ctx, choice as 'extend' | 'stop' | 'dismiss', pomodoro);
+        })
+        .finally(() => {
+          wizardOpen = false;
         });
       return;
     }
@@ -1883,6 +1892,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       })
       .then((choice) => {
         applyWizardChoice(ctx, choice as 'extend' | 'stop' | 'dismiss', pomodoro);
+      })
+      .finally(() => {
+        wizardOpen = false;
       });
   }
 
