@@ -69,14 +69,16 @@ session), append exactly one:
 
 ## Identity
 
-- Secret key: `~/.config/pi-ledger/identity.secret` — base64 64-byte Ed25519
-  secret key, file mode 0600. Auto-generated on first signed append.
+- Secret key: `~/.config/pi-ledger/identity.secret` — base64 of the 32-byte
+  Ed25519 seed (the JWK `d` field; the raw public key `x` is re-derived from
+  it), file mode 0600. Auto-generated on the first signed append, or when
+  `/ledger-settings` displays the identity for registration.
 - Public descriptor: `~/.config/pi-ledger/identity.json` —
   `{ "kid": "<16 hex>", "publicKey": "<base64 32 bytes>" }`.
 - `kid` = first 8 bytes of `sha256(publicKey)` as hex (16 chars).
 - `/ledger-settings` displays `kid` and the full public key for registration.
-- Headless/CI override: env `PI_LEDGER_IDENTITY_B64` (base64 of the secret key
-  bytes) replaces the on-disk identity; `kid` is derived the same way. The
+- Headless/CI override: env `PI_LEDGER_IDENTITY_B64` (base64 of the 32-byte
+  seed) replaces the on-disk identity; `kid` is derived the same way. The
   agency registers the CI fleet's public key in app.inloop.studio so
   runner-produced sessions attest as agency infrastructure.
 
