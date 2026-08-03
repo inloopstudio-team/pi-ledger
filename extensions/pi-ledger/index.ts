@@ -32,8 +32,17 @@
  */
 
 import { execSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  randomUUID,
+  sign as cryptoSign,
+  verify as cryptoVerify,
+  type KeyObject,
+} from 'node:crypto';
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -278,14 +287,68 @@ export interface BillingPauseEvent {
   timestamp: number;
 }
 
+/** The session seal (notarization): one signed close over the hash-chain head,
+ *  appended at session_shutdown — and as a checkpoint (`checkpoint: true`) when
+ *  /ledger-receipt renders a still-open session. `head` deliberately duplicates
+ *  `prev` (both are the digest of the previous event) so the seal verifies
+ *  without re-walking the chain; `headSig` is the base64 Ed25519 signature over
+ *  `"pi-ledger-seal:v1:<sessionId>:<head>"` (UTF-8), made by the key `kid`
+ *  identifies. Replay ignores this kind (tolerant by kind). */
+export interface SessionCloseEvent {
+  kind: 'session-close';
+  sessionId: string;
+  head: string;
+  headSig: string;
+  kid: string;
+  checkpoint?: boolean;
+  timestamp: number;
+}
+
+/** Hash-chain fields stamped on every event of a notarized sidecar: `seq` is
+ *  the 0-based position in the session's log and `prev` the 64-hex sha256 of
+ *  the previous event exactly as written (its digest includes its own seq/prev);
+ *  the genesis event uses 64 zeros. Absent on legacy (pre-notarization) logs —
+ *  a log whose tail lacks chain fields stays uniformly unchained: new appends
+ *  omit them, and no seal is written. */
+export interface ChainFields {
+  seq?: number;
+  prev?: string;
+}
+
 /** The sidecar event log: per-session, append-only, survives compaction. */
 export type SidecarEvent =
-  | SettingsEvent
-  | BillingPauseEvent
-  | AgentEvent
-  | HumanOpenEvent
-  | HumanCloseEvent
-  | SteerEvent;
+  | (SettingsEvent & ChainFields)
+  | (BillingPauseEvent & ChainFields)
+  | (AgentEvent & ChainFields)
+  | (HumanOpenEvent & ChainFields)
+  | (HumanCloseEvent & ChainFields)
+  | (SteerEvent & ChainFields)
+  | (SessionCloseEvent & ChainFields);
+
+/** Notarization status of a session's sidecar (consumed by /ledger, the
+ *  receipt, and — for delivered logs — by app.inloop.studio's parser). */
+export type ChainStatus =
+  /** chain intact, close signature verifies against the signing key */
+  | 'sealed'
+  /** chain intact, no final close event yet (session still running) */
+  | 'open'
+  /** events lack seq/prev (pre-notarization sessions) */
+  | 'legacy'
+  /** any seq/prev mismatch, duplicate seq, or signature failure */
+  | 'tampered';
+
+/** Result of verifying a sidecar's hash chain (+ final seal signature). */
+export interface ChainVerification {
+  status: ChainStatus;
+  /** seq of the last chained event (-1 = none / legacy). */
+  lastSeq: number;
+  /** Digest of the chain tip (the last event); genesis zeros when empty/legacy. */
+  head: string;
+  /** The final (last, non-checkpoint) session-close, if any. */
+  lastClose: (SessionCloseEvent & ChainFields) | null;
+  /** Whether lastClose's signature verified (absent when there is no close). */
+  sigValid?: boolean;
+}
 
 /** The slice of pi-tps's `tps:telemetry` payload that we read. */
 interface TpsTelemetry {
@@ -340,6 +403,18 @@ export interface Billing {
   totalHours: number;
 }
 
+/** The notarization audit block shown in the receipt footer: the full session
+ *  id (the seal signature message binds it), the signing key id, the signed
+ *  chain head, the seal signature, and the verification status — the block a
+ *  client can independently re-verify. */
+export interface ReceiptSeal {
+  status: ChainStatus;
+  sessionId: string;
+  kid?: string;
+  head?: string;
+  signature?: string;
+}
+
 export interface ReceiptData {
   project: string;
   author: string;
@@ -381,6 +456,8 @@ export interface ReceiptData {
   extensionsGranted?: number;
   extensionCreditMs?: number;
   extensionConsumedMs?: number;
+  // Notarization audit block (absent only for hand-built/test ReceiptData).
+  seal?: ReceiptSeal;
 }
 
 // ─── Pure helpers (exported for testing) ────────────────────────────────────
@@ -734,6 +811,146 @@ export function sidecarPathFor(sessionId: string): string {
   return join(base, 'pi-ledger', 'sessions', `${sessionId}.jsonl`);
 }
 
+// ─── Notarization (hash chain + Ed25519 session seal) ───────────────────────
+
+/** `prev` of the genesis event: 64 hex zeros. */
+export const GENESIS_PREV = '0'.repeat(64);
+
+/** PKCS#8 DER prefix wrapping a raw 32-byte Ed25519 seed (OneAsymmetricKey
+ *  with the id-Ed25519 algorithm OID); the seed bytes follow directly. */
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep); // arrays keep order
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value).sort()) {
+      const v = (value as Record<string, unknown>)[k];
+      if (v === undefined) continue; // mirrors JSON.stringify (drops undefined)
+      out[k] = sortKeysDeep(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** The canonical form of an event: `JSON.stringify` of a recursively
+ *  key-sorted deep copy (arrays keep order, numbers stay JSON numbers — note
+ *  `JSON.stringify` prints integral floats as integers, e.g. 1.0 → "1", which
+ *  the Ruby verifier replicates — no extra number formatting here). Pure. */
+export function canonicalJson(event: unknown): string {
+  return JSON.stringify(sortKeysDeep(event));
+}
+
+/** `sha256_hex(canonical(event))` — computed over the COMPLETE event object,
+ *  including its seq/prev fields (the digest of event N is what event N+1 puts
+ *  in `prev`). Pure. */
+export function digestEvent(event: unknown): string {
+  return createHash('sha256').update(canonicalJson(event), 'utf8').digest('hex');
+}
+
+/** The exact message a session seal signs (UTF-8). Frozen by the effort
+ *  protocol — app.inloop.studio's verifier reconstructs it byte-for-byte. */
+export function sealMessage(sessionId: string, head: string): string {
+  return `pi-ledger-seal:v1:${sessionId}:${head}`;
+}
+
+/** `kid` = first 8 bytes of sha256(raw public key bytes) as 16 hex chars. Pure. */
+export function kidFromPublicKey(rawPublicKey: Buffer): string {
+  return createHash('sha256').update(rawPublicKey).digest('hex').slice(0, 16);
+}
+
+/** The local signing identity: `publicKey` is the base64 of the raw 32-byte
+ *  Ed25519 public key (registered in app.inloop.studio admin). */
+export interface IdentityMaterial {
+  kid: string;
+  publicKey: string;
+  privateKey: KeyObject;
+}
+
+/** Rebuild the Ed25519 identity from its 32-byte seed (the JWK `d` field — the
+ *  raw public key `x` is re-derived via the PKCS#8 wrapper). Pure. */
+export function identityFromSeed(seed: Buffer): IdentityMaterial {
+  if (seed.length !== 32) throw new RangeError('Ed25519 seed must be 32 bytes');
+  const privateKey = createPrivateKey({
+    key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const jwk = privateKey.export({ format: 'jwk' });
+  const rawPublic = Buffer.from(jwk.x as string, 'base64url');
+  return { kid: kidFromPublicKey(rawPublic), publicKey: rawPublic.toString('base64'), privateKey };
+}
+
+function verifySealSignature(close: SessionCloseEvent, publicKeyRaw: Buffer): boolean {
+  try {
+    const pub = createPublicKey({
+      format: 'jwk',
+      key: { kty: 'OKP', crv: 'Ed25519', x: publicKeyRaw.toString('base64url') },
+    });
+    return cryptoVerify(
+      null,
+      Buffer.from(sealMessage(close.sessionId, close.head), 'utf8'),
+      pub,
+      Buffer.from(close.headSig, 'base64')
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Verify a sidecar log's notarization: per-event chain linkage (seq strictly
+ *  0-based monotonic, prev == digest of the previous event as written) plus,
+ *  when a final (non-checkpoint) session-close exists, its Ed25519 signature.
+ *  `key` is the identity expected to have sealed the log; a close whose kid is
+ *  unknown (identity lost, or sealed by another meter) is unverifiable and
+ *  reports tampered — never silently 'sealed'. Pure. */
+export function verifySidecarChain(
+  events: SidecarEvent[],
+  key?: { kid: string; publicKeyRaw: Buffer } | null
+): ChainVerification {
+  if (events.length === 0) {
+    return { status: 'open', lastSeq: -1, head: GENESIS_PREV, lastClose: null };
+  }
+  const tip = events[events.length - 1]!;
+  if (typeof tip.seq !== 'number' || typeof tip.prev !== 'string') {
+    // The tail lacks chain fields → pre-notarization log; by design such a
+    // session stays uniformly legacy (new appends never start a chain mid-log).
+    return { status: 'legacy', lastSeq: -1, head: GENESIS_PREV, lastClose: null };
+  }
+  let prev = GENESIS_PREV;
+  let seq = 0;
+  let lastClose: (SessionCloseEvent & ChainFields) | null = null;
+  for (const e of events) {
+    // Chained tail but an unchained event inside → insertion / mixed log.
+    if (typeof e.seq !== 'number' || typeof e.prev !== 'string') {
+      return { status: 'tampered', lastSeq: seq - 1, head: prev, lastClose: null };
+    }
+    // seq strictly monotonic (gaps = dropped lines, duplicates = inserted
+    // lines), each event linking to the previous event's digest (any byte
+    // edit or reorder breaks this).
+    if (e.seq !== seq || e.prev !== prev) {
+      return { status: 'tampered', lastSeq: seq - 1, head: prev, lastClose: null };
+    }
+    prev = digestEvent(e);
+    seq += 1;
+    if (e.kind === 'session-close' && !e.checkpoint) lastClose = e;
+  }
+  if (!lastClose) return { status: 'open', lastSeq: seq - 1, head: prev, lastClose: null };
+  const sigValid =
+    lastClose.head === lastClose.prev &&
+    !!key &&
+    key.kid === lastClose.kid &&
+    verifySealSignature(lastClose, key.publicKeyRaw);
+  return {
+    status: sigValid ? 'sealed' : 'tampered',
+    lastSeq: seq - 1,
+    head: prev,
+    lastClose,
+    sigValid,
+  };
+}
+
 /** A pi-tps `tps` entry as it appears in the session JSONL. */
 export interface TpsMarker {
   timing: { generationMs: number; stallMs: number; totalMs: number };
@@ -988,6 +1205,16 @@ export function buildReceiptHtml(d: ReceiptData): string {
     footer.push(`Session span ${hrs(spanMs)} · billed ${hrs(billedMs)}`);
   }
   footer.push(`generated ${fmtDate(d.generatedAt)} · pi-ledger`);
+  // Notarization audit block: session id (full — the seal signature binds it),
+  // kid, signed head, signature, and verification status — independently
+  // re-verifiable by the client. A tampered log is flagged in-band.
+  if (d.seal) {
+    footer.push(`seal ${d.seal.status}${d.seal.status === 'tampered' ? ' ⚠ chain broken' : ''}`);
+    footer.push(`session ${d.seal.sessionId}`);
+    if (d.seal.kid) footer.push(`kid ${d.seal.kid}`);
+    if (d.seal.head) footer.push(`head ${d.seal.head}`);
+    if (d.seal.signature) footer.push(`sig ${d.seal.signature}`);
+  }
   const footerHtml = footer
     .map((f) => `    <div class="foot r-block r-hidden"><span${reveal(f)}</span></div>`)
     .join('\n');
@@ -1029,7 +1256,7 @@ export function buildReceiptHtml(d: ReceiptData): string {
   .subtotal .amt { font-weight: 700; }
   .total { display: flex; justify-content: space-between; align-items: baseline; margin-top: 8px; padding-top: 14px; border-top: 1px solid #ececec; font-size: 17px; }
   .total .amt { font-weight: 700; }
-  .foot { margin-top: 22px; font-size: 10px; color: #c2c2c2; text-align: center; }
+  .foot { margin-top: 22px; font-size: 10px; color: #c2c2c2; text-align: center; overflow-wrap: anywhere; }
   .cursor { display: inline-block; width: 7px; height: 1em; vertical-align: -0.12em; background: #111; margin-left: 2px; animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   .r-hidden { display: none !important; }
@@ -1280,15 +1507,170 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   function sidecarPath(): string {
     return sidecarPathFor(sessionId);
   }
+
+  // Session notarization (hash chain + Ed25519 seal). `chainMode` is decided
+  // eagerly by rehydrate's full verification, or lazily from the on-disk tail
+  // on the first append: a legacy log (pre-notarization tail, no seq/prev)
+  // stays uniformly unchained — new appends omit chain fields and no seal is
+  // written — while a chained log continues from (chainSeq, chainDigest).
+  let chainMode: 'chained' | 'legacy' | null = null;
+  let chainSeq = -1; // seq of the last chained event (-1 = none yet)
+  let chainDigest = GENESIS_PREV; // digest of the chain tip (the previous event)
+  let chainStatus: ChainStatus = 'open'; // verification status (/ledger, receipt)
+  let latestSeal: (SessionCloseEvent & ChainFields) | null = null; // newest session-close seen/appended
+  // Signing identity (Ed25519). Materialized on the first SIGNED append (or
+  // when /ledger-settings displays it for registration) — never by read-only
+  // chain verification.
+  let identity: IdentityMaterial | null = null;
+
+  function identityDir(): string {
+    const base = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+    return join(base, 'pi-ledger');
+  }
+
+  /** Load (or, unless `create` is false, generate) the Ed25519 identity.
+   *  `PI_LEDGER_IDENTITY_B64` (base64 32-byte seed) overrides the on-disk
+   *  identity entirely (headless/CI fleet); an invalid override stays unsigned
+   *  rather than silently falling back to the wrong key. Secret file:
+   *  `identity.secret` (base64 seed, mode 0600); public descriptor:
+   *  `identity.json` ({kid, publicKey}). */
+  function getIdentity(create = true): IdentityMaterial | null {
+    if (identity) return identity;
+    try {
+      const envB64 = process.env.PI_LEDGER_IDENTITY_B64;
+      if (envB64) {
+        const seed = Buffer.from(envB64, 'base64');
+        if (seed.length !== 32) return null; // invalid override → unsigned
+        identity = identityFromSeed(seed);
+        return identity;
+      }
+      const dir = identityDir();
+      const secretPath = join(dir, 'identity.secret');
+      let seed: Buffer | null = null;
+      try {
+        const parsed = Buffer.from(readFileSync(secretPath, 'utf8').trim(), 'base64');
+        if (parsed.length === 32) seed = parsed;
+      } catch {
+        // missing/unreadable → generate below when allowed
+      }
+      if (!seed && !create) return null;
+      if (!seed) {
+        const { privateKey } = generateKeyPairSync('ed25519');
+        const jwk = privateKey.export({ format: 'jwk' });
+        seed = Buffer.from(jwk.d as string, 'base64url'); // the 32-byte seed
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(secretPath, seed.toString('base64'), { mode: 0o600 });
+        try {
+          chmodSync(secretPath, 0o600);
+        } catch {
+          // best-effort
+        }
+      }
+      identity = identityFromSeed(seed);
+      if (create) {
+        // Publish the public descriptor (also heals a deleted identity.json).
+        writeFileSync(
+          join(dir, 'identity.json'),
+          JSON.stringify({ kid: identity.kid, publicKey: identity.publicKey }) + '\n'
+        );
+      }
+      return identity;
+    } catch {
+      return null; // identity is best-effort: metering never fails on it
+    }
+  }
+
+  /** Decide chainMode lazily (first append before any rehydrate): read the
+   *  sidecar's LAST line only — chained tail → continue the chain
+   *  (recomputing the tip's digest); unchained tail → the whole log is legacy. */
+  function initChainFromDisk(): void {
+    chainMode = 'chained';
+    chainSeq = -1;
+    chainDigest = GENESIS_PREV;
+    chainStatus = 'open';
+    let raw: string;
+    try {
+      raw = readFileSync(sidecarPath(), 'utf8');
+    } catch {
+      return; // no sidecar yet → fresh chain
+    }
+    let lastLine = '';
+    for (const l of raw.split('\n')) if (l.trim()) lastLine = l;
+    if (!lastLine) return; // empty log → fresh chain
+    try {
+      const tail = JSON.parse(lastLine) as SidecarEvent;
+      if (typeof tail.seq === 'number' && typeof tail.prev === 'string') {
+        chainSeq = tail.seq;
+        chainDigest = digestEvent(tail);
+        if (tail.kind === 'session-close') latestSeal = tail;
+      } else {
+        chainMode = 'legacy';
+        chainStatus = 'legacy';
+      }
+    } catch {
+      // corrupt tail: don't start a chain mid-log
+      chainMode = 'legacy';
+      chainStatus = 'legacy';
+    }
+  }
+
+  /** Append the notarization seal: one signed session-close over the current
+   *  chain head. `checkpoint` marks an audit snapshot of an OPEN session (from
+   *  /ledger-receipt); the chain then continues normally — seq keeps
+   *  incrementing from the checkpoint and a later real close re-seals the new
+   *  head. Legacy logs are never sealed. */
+  function appendSessionClose(checkpoint: boolean): void {
+    if (chainMode === null) initChainFromDisk();
+    if (chainMode !== 'chained') return;
+    const id = getIdentity(); // materializes the identity (first signed append)
+    if (!id) return;
+    // The seal binds the tip as it was BEFORE this event: head = digest of the
+    // previous event (genesis zeros for an empty log), which appendSidecar
+    // stamps as this event's `prev` too (head === prev by design, so a verifier
+    // can check the seal without re-walking the chain).
+    const head = chainDigest;
+    const headSig = cryptoSign(
+      null,
+      Buffer.from(sealMessage(sessionId, head), 'utf8'),
+      id.privateKey
+    ).toString('base64');
+    const close: SessionCloseEvent = {
+      kind: 'session-close',
+      sessionId,
+      head,
+      headSig,
+      kid: id.kid,
+      timestamp: Date.now(),
+    };
+    if (checkpoint) close.checkpoint = true;
+    appendSidecar(close);
+    latestSeal = close;
+    if (!checkpoint) chainStatus = 'sealed';
+  }
+
   function appendSidecar(event: SidecarEvent): void {
     if (sessionId === 'unknown' && lastCtx) {
       const id = lastCtx.sessionManager.getSessionId?.();
       if (typeof id === 'string') sessionId = id;
     }
     try {
+      if (chainMode === null) initChainFromDisk();
+      let out = event;
+      if (chainMode === 'chained') {
+        // Stamp seq/prev (all kinds, including settings/correction/seal
+        // events); the tip digest is taken over the event exactly as written
+        // (seq/prev included), so insertion, deletion, reordering, or any byte
+        // edit breaks the chain.
+        const seq = chainSeq + 1;
+        out = { ...event, seq, prev: chainDigest };
+        chainSeq = seq;
+        chainDigest = digestEvent(JSON.parse(JSON.stringify(out)));
+        // Any append after a seal reopens the chain (the seal is no longer the tip).
+        if (chainStatus === 'sealed') chainStatus = 'open';
+      }
       const p = sidecarPath();
       mkdirSync(join(p, '..'), { recursive: true });
-      appendFileSync(p, JSON.stringify(event) + '\n');
+      appendFileSync(p, JSON.stringify(out) + '\n');
     } catch {
       // ignore — best-effort persistence
     }
@@ -1908,9 +2290,45 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   // ── Rehydration ────────────────────────────────────────────────────────
 
+  /** Notarization on load: verify chain linkage per event (events arrive in
+   *  order, so this is a cheap single pass) plus the final seal's signature,
+   *  and prime the append path (continue the chain, or keep a legacy log
+   *  uniformly unchained). */
+  function verifyChain(events: SidecarEvent[]): void {
+    latestSeal = null;
+    for (let i = events.length - 1; i >= 0 && !latestSeal; i--) {
+      const e = events[i]!;
+      if (e.kind === 'session-close') latestSeal = e;
+    }
+    if (events.length === 0) {
+      chainMode = null; // undetermined — the first append reads the (empty) tail
+      chainSeq = -1;
+      chainDigest = GENESIS_PREV;
+      chainStatus = 'open';
+      return;
+    }
+    // Verification is read-only: never materialize an identity just to verify
+    // (created on the first signed append, per the notarization contract).
+    const id = getIdentity(false);
+    const v = verifySidecarChain(
+      events,
+      id ? { kid: id.kid, publicKeyRaw: Buffer.from(id.publicKey, 'base64') } : null
+    );
+    chainStatus = v.status;
+    if (v.status === 'legacy') {
+      chainMode = 'legacy';
+    } else {
+      chainMode = 'chained';
+      chainSeq = v.lastSeq;
+      chainDigest = v.head;
+    }
+    if (v.lastClose) latestSeal = v.lastClose;
+  }
+
   function rehydrate(ctx: ExtensionContext) {
     sessionId = ctx.sessionManager.getSessionId?.() ?? 'unknown';
     const events = readSidecar();
+    verifyChain(events);
     // Restore from the sidecar only if it has events. During a live session the
     // in-memory totals are already current (every event updates them); never
     // overwrite them with an empty read (which would reset the status to $0).
@@ -2021,6 +2439,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     retryUnsubs = [];
     retryActiveId = undefined;
     pendingSettledWizard = null;
+    // Notarization: seal the session — one signed session-close over the final
+    // chain head, appended AFTER all other shutdown bookkeeping so the seal's
+    // head covers the complete log. Legacy logs stay unsealed.
+    appendSessionClose(false);
   });
 
   // ── Agent timing (tool execution) ─────────────────────────────────────
@@ -2383,7 +2805,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       const msg =
         `agent ${fmtHours(t.agentMs)} (${t.agentTurns} turns) @ ${fmtMoney(settings.agentRatePerHour, settings.currency)}/h = ${fmtMoney(b.agentCost, settings.currency)}` +
         ` · human ${fmtHours(t.humanMs)} (${t.humanWindows} windows) @ ${fmtMoney(settings.humanRatePerHour, settings.currency)}/h = ${fmtMoney(b.humanCost, settings.currency)}` +
-        ` · total ${fmtMoney(b.total, settings.currency)}`;
+        ` · total ${fmtMoney(b.total, settings.currency)}` +
+        (chainStatus === 'tampered' ? ' · ⚠ chain broken (sidecar failed notarization)' : '');
       ctx.ui.notify(msg, 'info');
       if (totals.agentTurns === 0 && totals.humanWindows === 0) {
         const tps = extractTpsEntries(ctx.sessionManager.getBranch());
@@ -2441,6 +2864,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         if (pick === undefined) return; // dismissed
         const item = items.find((i) => pick.startsWith(`${i.label}:`));
         if (!item) return;
+        if (item.readOnly) {
+          // Identity rows display the notarization key for registration; pick
+          // one to echo the full value (e.g. to copy the public key).
+          ctx.ui.notify(`${item.label}: ${item.current}`, 'info');
+          return;
+        }
         let value: string | undefined;
         if (item.values) {
           value = await ctx.ui.select(item.label, item.values);
@@ -2525,6 +2954,24 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       }
 
       const sessionId = ctx.sessionManager.getSessionId?.() ?? 'unknown';
+      // Notarization: a receipt for a still-OPEN chained session appends a
+      // checkpoint seal first, so the audit block attests the current chain
+      // head. The checkpoint never disrupts later appends — the chain
+      // continues (seq increments) and a real close at shutdown re-seals the
+      // new head. Legacy logs render an unattested footer.
+      if (chainStatus === 'open') appendSessionClose(true);
+      let seal: ReceiptSeal | undefined;
+      if (chainMode === 'legacy') {
+        seal = { status: 'legacy', sessionId };
+      } else if (chainMode === 'chained') {
+        seal = {
+          status: chainStatus,
+          sessionId,
+          kid: latestSeal?.kid,
+          head: latestSeal?.head,
+          signature: latestSeal?.headSig,
+        };
+      }
       const data: ReceiptData = {
         project: effectiveProject(ctx),
         author: effectiveAuthor(),
@@ -2563,6 +3010,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         extensionsGranted: t.extensionsGranted,
         extensionCreditMs: t.extensionCreditMs,
         extensionConsumedMs: t.extensionConsumedMs,
+        seal,
       };
       const html = buildReceiptHtml(data);
 
@@ -2593,6 +3041,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     label: string;
     current: string;
     values?: string[];
+    /** Display-only (notarization identity): picking echoes the value. */
+    readOnly?: boolean;
   }
 
   function rpcSettingItems(ctx: ExtensionCommandContext): RpcSettingItem[] {
@@ -2624,6 +3074,18 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         label: 'Auto-extend',
         current: settings.autoExtend ? 'on' : 'off',
         values: ['on', 'off'],
+      },
+      {
+        id: 'identityKid',
+        label: 'Identity key id',
+        current: getIdentity()?.kid ?? '(unavailable)',
+        readOnly: true,
+      },
+      {
+        id: 'identityPublicKey',
+        label: 'Identity public key',
+        current: getIdentity()?.publicKey ?? '(unavailable)',
+        readOnly: true,
       },
     ];
   }
@@ -2693,6 +3155,20 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         description:
           'Auto-provision a pomodoro block silently (no prompt) when credit runs out — for GUI/headless sessions',
         values: ['on', 'off'],
+      },
+      // Notarization identity (read-only rows): register the public key in
+      // app.inloop.studio admin so delivered logs verify as sealed.
+      {
+        id: 'identityKid',
+        label: 'Identity key id',
+        currentValue: getIdentity()?.kid ?? '(unavailable)',
+        description: 'Signing identity (kid) of this meter — shown on sealed session receipts',
+      },
+      {
+        id: 'identityPublicKey',
+        label: 'Identity public key',
+        currentValue: getIdentity()?.publicKey ?? '(unavailable)',
+        description: 'Ed25519 public key (base64) — register it in app.inloop.studio admin',
       },
     ];
   }

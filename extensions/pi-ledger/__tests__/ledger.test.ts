@@ -731,10 +731,13 @@ describe('extension integration', () => {
   let fixture: TestFixture;
 
   let cacheDir: string;
+  let configDir: string;
   beforeEach(async () => {
     vi.useFakeTimers();
     cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
     process.env.XDG_CACHE_HOME = cacheDir;
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-config-'));
+    process.env.XDG_CONFIG_HOME = configDir;
     fixture = createTestFixture();
     await activateExtension(fixture);
   });
@@ -742,7 +745,9 @@ describe('extension integration', () => {
   afterEach(() => {
     vi.useRealTimers();
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
     fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
   });
 
   it('registers the four commands', () => {
@@ -2016,11 +2021,14 @@ describe('computeBurstMs', () => {
 describe('steering composition (human types while the agent runs)', () => {
   let fixture: TestFixture;
   let cacheDir: string;
+  let configDir: string;
 
   beforeEach(async () => {
     vi.useFakeTimers();
     cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
     process.env.XDG_CACHE_HOME = cacheDir;
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-config-'));
+    process.env.XDG_CONFIG_HOME = configDir;
     fixture = createTestFixture();
     await activateExtension(fixture);
   });
@@ -2028,7 +2036,9 @@ describe('steering composition (human types while the agent runs)', () => {
   afterEach(() => {
     vi.useRealTimers();
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
     fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
   });
 
   it('installs an editor wrapper at session_start (TUI) to observe keystrokes', () => {
@@ -2471,11 +2481,14 @@ function plainInput(source: 'interactive' | 'extension' = 'interactive') {
 describe('skip-billing guard (choosing "Stop billing" blocks agent messages)', () => {
   let fixture: TestFixture;
   let cacheDir: string;
+  let configDir: string;
 
   beforeEach(async () => {
     vi.useFakeTimers();
     cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
     process.env.XDG_CACHE_HOME = cacheDir;
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-config-'));
+    process.env.XDG_CONFIG_HOME = configDir;
     fixture = createTestFixture();
     await activateExtension(fixture);
   });
@@ -2483,7 +2496,9 @@ describe('skip-billing guard (choosing "Stop billing" blocks agent messages)', (
   afterEach(() => {
     vi.useRealTimers();
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
     fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
   });
 
   /** Pop the engagement wizard (agent_settled, no credit) and flush the choice. */
@@ -2605,11 +2620,14 @@ describe('rehydrateFromSidecar — skip-billing guard', () => {
 describe('pi-retry capture (wizard gating)', () => {
   let fixture: TestFixture;
   let cacheDir: string;
+  let configDir: string;
 
   beforeEach(async () => {
     vi.useFakeTimers();
     cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
     process.env.XDG_CACHE_HOME = cacheDir;
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-config-'));
+    process.env.XDG_CONFIG_HOME = configDir;
     fixture = createTestFixture();
     await activateExtension(fixture);
   });
@@ -2617,7 +2635,9 @@ describe('pi-retry capture (wizard gating)', () => {
   afterEach(() => {
     vi.useRealTimers();
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
     fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
   });
 
   const STARTED = 'pi-retry:started';
