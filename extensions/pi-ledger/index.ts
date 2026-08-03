@@ -20,10 +20,14 @@
  * submit, bills nothing (idle with no output is wasted). Capped by a
  * budget (rolling extension credit). A non-blocking wizard prompts
  * engagement (agent_settled with no credit, /resume) and offers +pomodoro
- * extensions; `/ledger-extend` does the same manually. Extensions are ROLLING
- * credit — provisioned pomodoro blocks survive across agent turns, so the
- * wizard stays silent while credit remains and only re-pops when it's
- * exhausted.
+ * extensions; `/ledger-extend` does the same manually. The wizard asks only at
+ * TRUE IDLENESS — prompts never land mid-typing: while genuine keystrokes are
+ * recent the no-credit prompt defers until hands leave the keyboard, and an
+ * exhaustion boundary hit while typing rolls a block silently (observed
+ * presence = engagement). Silence never creates the FIRST credit; only an
+ * explicit extend can. Extensions are ROLLING credit — provisioned pomodoro
+ * blocks survive across agent turns, so the wizard stays silent while credit
+ * remains and only re-pops when it's exhausted (and the human is idle).
  *
  * Commands: /ledger, /ledger-settings, /ledger-extend [m], /ledger-receipt
  *
@@ -113,6 +117,14 @@ const STEER_GAP_MS = 3000;
  *  fabricated by holding a key. Human typing — varied keys, or same-key gaps at
  *  or above this threshold (e.g. deliberate double letters) — is unaffected. */
 const AUTO_REPEAT_MS = 50;
+
+/** Presence window (ms) for wizard gating. A genuine (post-held-key-collapse)
+ *  keystroke within this window counts as ENGAGED: an exhaustion boundary
+ *  reached while engaged rolls a pomodoro block silently instead of popping
+ *  mid-typing, and the no-credit engagement prompt defers until the human has
+ *  been hands-off for this long. Long enough to cover typing bursts and short
+ *  reading pauses; a walk-away is always ≥ this before the pop lands. */
+const ENGAGED_ACTIVITY_MS = 90_000;
 
 const MS_PER_HOUR = 3_600_000;
 const MS_PER_MINUTE = 60_000;
@@ -1462,6 +1474,20 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // cannot replace it while its unresolved promise remains alive.
   let wizardOpen = false;
 
+  // Deferred no-credit engagement prompt: armed at settle/resume, pops only
+  // once the human has been hands-off for ENGAGED_ACTIVITY_MS; further typing
+  // slides it, agent_start / a granted credit / a new session disarms it (the
+  // next settle re-arms). Never grants anything — it can only POP the wizard.
+  let consentTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Presence: the last GENUINE keystroke's timestamp (post held-key collapse,
+  // so a held key can't fake presence), spanning idle and in-run typing. Unlike
+  // lastKeyTime it is NOT reset per-run — a settle asks "when did the human
+  // last act", which includes prompts typed before the run. null = no typing
+  // observed this process (RPC/GUI mode never wraps the editor, so it stays
+  // null there and prompts fire immediately, as before). Reset at session_start.
+  let lastGenuineActivityAt: number | null = null;
+
   // pi-retry awareness: when @monotykamary/pi-retry is installed it emits
   // pi-retry:started/completed/cancelled around its (possibly multi-attempt)
   // retry loop. agent_settled can fire during a retry's backoff sleep —
@@ -1903,9 +1929,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       extensionBudgetMs,
       timestamp: openedAt,
     });
-    // Arm the wizard to fire when this window's budget is exhausted (from the
+    // Arm the wizard for when this window's budget is exhausted (from the
     // onset) — never pop now: the human is engaging, and an immediate pop would
-    // interrupt. The exhaustion pop offers the next extension.
+    // interrupt typing. At the boundary, recent typing rolls a block silently
+    // and only true idleness pops the next-extension prompt.
     armWizardForBoundary(ctx);
     updateStatus(ctx);
   }
@@ -1928,6 +1955,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     lastKey = data;
     lastKeyTime = now;
     if (autoRepeat) return;
+    lastGenuineActivityAt = now; // genuine typing = presence; held keys don't refresh it
     if (agentRunning) {
       steerStaging.push(now);
     } else if (lastCtx) {
@@ -2041,16 +2069,25 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     }
   }
 
+  function clearConsentTimer() {
+    if (consentTimer) {
+      clearTimeout(consentTimer);
+      consentTimer = null;
+    }
+  }
+
   function disarmWizard() {
     clearWizardTimer();
+    clearConsentTimer();
   }
 
   function armWizardForBoundary(ctx: ExtensionContext) {
     clearWizardTimer();
     if (!humanWindow || !settings.autoWizard) return;
-    // No credit provisioned → nothing to exhaust; the agent_end / resume prompt
-    // already offered engagement, so don't re-pop on the first keystroke (that
-    // would intercept typing). Only arm the exhaustion pop when there's credit.
+    // No credit provisioned → nothing to exhaust; the agent_settled / resume
+    // engagement prompt (itself idle-gated) offers engagement, so don't re-pop
+    // on the first keystroke (that would intercept typing). Only arm the
+    // exhaustion boundary when there's credit.
     if (humanWindow.grantedBudgetMs <= 0) return;
     const elapsed = Date.now() - humanWindow.openedAt;
     const delay = humanWindow.grantedBudgetMs - elapsed;
@@ -2063,10 +2100,32 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     }
     if (!canPromptWizard(ctx)) return;
     if (delay <= 0) {
-      showWizard(ctx);
+      onExhaustionBoundary(ctx);
       return;
     }
-    wizardTimer = setTimeout(() => showWizard(ctx), delay);
+    wizardTimer = setTimeout(() => onExhaustionBoundary(ctx), delay);
+  }
+
+  /** Presence = a genuine keystroke within the presence window. */
+  function isEngaged(): boolean {
+    return (
+      lastGenuineActivityAt !== null && Date.now() - lastGenuineActivityAt < ENGAGED_ACTIVITY_MS
+    );
+  }
+
+  /** The open window's credit ran out. Engaged (typing within the presence
+   *  window) → roll a pomodoro block SILENTLY: presence is the engagement
+   *  signal already, and popping mid-typing would steal the editor. True
+   *  idleness → pop the wizard (extend / stop billing). Silence only ever
+   *  ROLLS a grant the human already made — the first credit is always an
+   *  explicit extend (the wizard's extend or /ledger-extend). */
+  function onExhaustionBoundary(ctx: ExtensionContext) {
+    wizardTimer = null;
+    if (isEngaged()) {
+      autoExtendNow(ctx); // silent roll; extendHumanTime re-arms the next boundary
+      return;
+    }
+    showWizard(ctx);
   }
 
   /** A wizard prompt can be shown where a dialog renders: the TUI (custom
@@ -2081,6 +2140,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *  none is open. Shared by the wizard's "Extend" choice and `autoExtend` —
    *  both provision a rolling pomodoro block (credit survives across turns). */
   function extendHumanTime(ctx: ExtensionContext, mins: number) {
+    // Credit granted — a pending (deferred) engagement prompt is moot.
+    clearConsentTimer();
     // Extending resumes billing: clear the skip-billing guard so agent messages
     // reach the model again (the documented way to resume after "Stop billing").
     if (billingPaused) {
@@ -2150,21 +2211,34 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     notify(ctx, `Extended billable human time by ${pomodoro}m.`, 'info');
   }
 
-  /** Show the wizard immediately — to prompt engagement at `agent_end` (no
-   *  credit) or on `/resume` (no window yet), or as a re-offer. Works with or
-   *  without an open window: the extend action engages one if none is open.
-   *  With `autoExtend`, skip the prompt and provision a block silently (any
-   *  mode, including headless); otherwise prompt only where a dialog can show
-   *  (TUI custom render, or an RPC `select` dialog for GUI clients). */
-  function armWizardNow(ctx: ExtensionContext) {
+  /** The no-credit engagement prompt (agent_settled with no rolling credit,
+   *  /resume, or a re-offer after a retry settles). Pops only at TRUE IDLENESS:
+   *  if the human typed within the presence window they're mid-flow — composing
+   *  the next prompt, steering, or still reading with intent — so defer and
+   *  re-check once hands have been off the keyboard for ENGAGED_ACTIVITY_MS.
+   *  Further typing slides the timer; agent_start or a granted credit disarms
+   *  it (the next settle re-evaluates). Already idle past the window, or never
+   *  typed → pop now. The deferral path NEVER grants credit — the first credit
+   *  is always an explicit extend, so an actively-typing session stays at a $0
+   *  billing cap until consent. With `autoExtend`, skip the prompt and
+   *  provision a block silently (any mode, including headless); otherwise
+   *  prompt only where a dialog can show (TUI custom render, or an RPC
+   *  `select` dialog for GUI clients). */
+  function armEngagementPrompt(ctx: ExtensionContext) {
     clearWizardTimer();
+    clearConsentTimer();
     if (!settings.autoWizard) return;
     if (settings.autoExtend) {
       autoExtendNow(ctx);
       return;
     }
     if (!canPromptWizard(ctx)) return;
-    showWizard(ctx);
+    const idleFor = lastGenuineActivityAt === null ? Infinity : Date.now() - lastGenuineActivityAt;
+    if (idleFor >= ENGAGED_ACTIVITY_MS) {
+      showWizard(ctx);
+      return;
+    }
+    consentTimer = setTimeout(() => armEngagementPrompt(ctx), ENGAGED_ACTIVITY_MS - idleFor);
   }
 
   function showWizard(ctx: ExtensionContext, extendMins: number = settings.pomodoroMinutes) {
@@ -2374,6 +2448,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     lastKey = null;
     lastKeyTime = 0;
     idleKeystrokes = 0;
+    // A reload leaves no live timers: rehydrate abandoned any open window, so
+    // its boundary is stale, and any pending consent prompt re-evaluates below
+    // (resume/reload) or at the next settle. Presence is per-process — nothing
+    // has been typed yet in this one.
+    disarmWizard();
+    lastGenuineActivityAt = null;
     // A pending/dequeued composition is in-memory only — on a fresh load/reload
     // it was never delivered (no agent outcome), so abandon it (bills 0). Same
     // rule as an unclosed idle window: uncommitted, so not restored.
@@ -2401,7 +2481,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // /reload) pop the wizard to prompt that engagement, so review time can be
     // billed via an extension. (Startup/new start typing right away — no pop.)
     if ((event.reason === 'resume' || event.reason === 'reload') && settings.autoWizard) {
-      armWizardNow(ctx);
+      armEngagementPrompt(ctx);
     }
   });
 
@@ -2567,7 +2647,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       pendingSettledWizard = null;
       // Credit may have changed since settle (e.g. a mid-backoff /ledger-extend);
       // with none, pop now that the retry has settled. With credit, stay quiet.
-      if (extensionBudgetMs <= 0) armWizardNow(pending.ctx);
+      if (extensionBudgetMs <= 0) armEngagementPrompt(pending.ctx);
     })
   );
   retryUnsubs.push(
@@ -2755,12 +2835,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       // human time (violating scale-to-zero: a slow/queued provider is a
       // retry, not billable). Defer: if a pi-retry is in flight, stage the
       // prompt and pop when the retry settles (on pi-retry:completed); a
-      // cancelled retry never pops. With no pi-retry (or none active), pop now
-      // as before.
+      // cancelled retry never pops. With no pi-retry (or none active), prompt
+      // as before — idle-gated now, so an actively-typing human isn't interrupted.
       if (retryActiveId !== undefined) {
         pendingSettledWizard = { ctx };
       } else {
-        armWizardNow(ctx);
+        armEngagementPrompt(ctx);
       }
     }
   });

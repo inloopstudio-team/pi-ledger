@@ -2737,3 +2737,129 @@ describe('retryEventId', () => {
     expect(retryEventId({ retryId: 'oops' })).toBeUndefined();
   });
 });
+
+describe('presence-gated wizard (idle-gated prompts, engaged silent roll)', () => {
+  let fixture: TestFixture;
+  let cacheDir: string;
+  let configDir: string;
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-test-'));
+    process.env.XDG_CACHE_HOME = cacheDir;
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-ledger-config-'));
+    process.env.XDG_CONFIG_HOME = configDir;
+    fixture = createTestFixture();
+    await activateExtension(fixture);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  });
+
+  // ENGAGED_ACTIVITY_MS in the extension — the presence window.
+  const PRESENCE = 90_000;
+
+  it('defers the no-credit engagement pop while typing; pops once idle past the presence window', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('k'); // typed mid-run, just before the handoff
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    // mid-flow → the prompt defers instead of interrupting
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000); // 30s hands-off, still inside the window
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(60_000); // 90s idle total → true idleness → pop
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    // the pop prompts engagement; nothing was granted or engaged silently
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
+  });
+
+  it('slides the deferred pop on each keystroke (typing never gets interrupted)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('k'); // t0
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // deferred; deadline t0 + 90s
+    await vi.advanceTimersByTimeAsync(60_000); // t0+60s
+    fixture.sendEditorKey('k'); // still composing → the deadline slides
+    await vi.advanceTimersByTimeAsync(60_000); // 120s since settle, only 60s since the key
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000); // 90s idle now → pop
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('a new run disarms the deferred pop; the next settle re-evaluates', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('k');
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // deferred
+    fixture.run('agent_start', { type: 'agent_start' }); // the human submitted → run supersedes
+    await vi.advanceTimersByTimeAsync(PRESENCE * 2); // the deferred pop was disarmed
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // presence is stale now → pop
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('deferred silence never grants credit — the first credit is always an explicit extend', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('k'); // active at settle → the deferral path
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    await vi.advanceTimersByTimeAsync(PRESENCE * 2); // the pop fired (dismissed by default)
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard
+    // silence granted nothing: no window, no credit, no extension blocks
+    expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-open')).toHaveLength(0);
+    const r = rehydrateFromSidecar(fixture.readSidecarEvents());
+    expect(r.extensionBudgetMs).toBe(0);
+    expect(r.totals.extensionsGranted).toBe(0);
+  });
+
+  it('rolls a block silently when the exhaustion boundary lands mid-typing; pops on true idleness', async () => {
+    fixture.setCustomResult('extend');
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // no activity → consent pop now
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(0); // flush extend → 20m window, boundary at +20m
+    await vi.advanceTimersByTimeAsync(19 * 60_000); // 19m in — 1m before the boundary
+    fixture.sendEditorKey('k'); // mid-flow typing
+    await vi.advanceTimersByTimeAsync(60_000); // the boundary fires exactly here
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // NO pop — silent roll instead
+    expect(
+      fixture.notifySpy.mock.calls.some(
+        (c) => typeof c[0] === 'string' && c[0].includes('Auto-extended')
+      )
+    ).toBe(true);
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open!.grantedBudgetMs).toBe(40 * 60_000); // +20m rolled onto the open window
+    // the roll re-armed a boundary at +40m; presence is 21m stale there → idle pop
+    fixture.customSpy.mockClear();
+    await vi.advanceTimersByTimeAsync(21 * 60_000);
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('a held key refreshes presence once (auto-repeat collapse) — it cannot hold the wizard off', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_start', { type: 'agent_start' });
+    fixture.sendEditorKey('a'); // t0: the keydown — the one genuine keystroke (presence = t0)
+    for (let i = 0; i < 99; i++) {
+      await vi.advanceTimersByTimeAsync(10); // auto-repeat at 10ms intervals
+      fixture.sendEditorKey('a'); // same data, < AUTO_REPEAT_MS apart → collapsed
+    } // the hold ends ≈ t0+990ms
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // deferral armed: idleFor ≈ 1s
+    // 90s after the KEYDOWN (not after the last collapsed repeat) the pop fires.
+    await vi.advanceTimersByTimeAsync(89_500); // > 90s since the keydown, < 90s since the hold ended
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+  });
+});
