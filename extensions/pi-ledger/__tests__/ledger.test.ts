@@ -21,6 +21,7 @@ import {
   extractTpsEntries,
   fmtHours,
   fmtMoney,
+  frameOverlayLines,
   rehydrateFromSidecar,
   resolveExtensionBudget,
   retryEventId,
@@ -955,6 +956,48 @@ describe('extension integration', () => {
     expect(seg.extensions).toBe(0);
     expect(seg.committed).toBe(true);
     expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('keystroke');
+  });
+
+  it('renders the TUI wizard above live overlays and captures navigation keys', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+
+    const [factory, options] = fixture.customSpy.mock.calls[0]! as any;
+    const focus = vi.fn();
+    expect(options).toMatchObject({ overlay: true, onHandle: expect.any(Function) });
+    options.onHandle({ focus });
+    expect(focus).toHaveBeenCalledOnce();
+
+    let inputListener!: (data: string) => { consume?: boolean } | undefined;
+    const removeInputListener = vi.fn();
+    const requestRender = vi.fn();
+    const done = vi.fn();
+    const component = factory(
+      {
+        addInputListener: (listener: typeof inputListener) => {
+          inputListener = listener;
+          return removeInputListener;
+        },
+        requestRender,
+      },
+      { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+      {},
+      done
+    );
+    expect(inputListener('\x1b[B')).toEqual({ consume: true });
+    expect(inputListener('\x1b[1;1:3B')).toEqual({ consume: true }); // Kitty key release
+    expect(inputListener('\r')).toEqual({ consume: true });
+    expect(done).toHaveBeenCalledWith('stop');
+    component.dispose();
+    expect(removeInputListener).toHaveBeenCalledOnce();
+
+    const lines = frameOverlayLines(['wizard content'], 40, (border) => border);
+    expect(lines[0]).toBe(`┌${'─'.repeat(38)}┐`);
+    expect(lines.at(-1)).toBe(`└${'─'.repeat(38)}┘`);
+    for (const line of lines.slice(1, -1)) {
+      expect(line.startsWith('│')).toBe(true);
+      expect(line.endsWith('│')).toBe(true);
+    }
   });
 
   it('keeps the TUI wizard single-flight across overlapping triggers', async () => {

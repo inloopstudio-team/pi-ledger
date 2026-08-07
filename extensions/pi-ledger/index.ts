@@ -67,10 +67,13 @@ import {
 import {
   Container,
   Input,
+  isKeyRelease,
   SelectList,
   SettingsList,
   Spacer,
   Text,
+  truncateToWidth,
+  visibleWidth,
   type EditorTheme,
   type SelectItem,
   type SettingItem,
@@ -561,6 +564,25 @@ export function fmtHours(ms: number): string {
 export function fmtMoney(amount: number, currency: string): string {
   const sym = CURRENCY_SYMBOL[currency] ?? '';
   return `${sym}${amount.toFixed(2)}`;
+}
+
+export function frameOverlayLines(
+  lines: string[],
+  width: number,
+  styleBorder: (border: string) => string
+): string[] {
+  if (width < 2) return [styleBorder('│')];
+  const innerWidth = width - 2;
+  const side = styleBorder('│');
+  const content = lines.map((line) => {
+    const clipped = truncateToWidth(line, innerWidth, '');
+    return `${side}${clipped}${' '.repeat(innerWidth - visibleWidth(clipped))}${side}`;
+  });
+  return [
+    styleBorder(`┌${'─'.repeat(innerWidth)}┐`),
+    ...content,
+    styleBorder(`└${'─'.repeat(innerWidth)}┘`),
+  ];
 }
 
 function fmtRate(rate: number): string {
@@ -2283,69 +2305,88 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       return;
     }
 
+    // Keep the wizard visible above any live overlay. A temporary raw-input
+    // listener gives the wizard deterministic key ownership even if another
+    // overlay or the editor races to reclaim component focus during resume.
     ctx.ui
-      .custom<string>((tui, theme, _kb, done) => {
-        const container = new Container();
-        container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
-        container.addChild(new Spacer(1));
-        container.addChild(
-          new Text(theme.fg('accent', theme.bold('⏱  Extend billable human time?')), 1, 0)
-        );
-        container.addChild(new Spacer(1));
-        container.addChild(
-          new Text(
-            theme.fg('muted', `Idle after the agent. Add a ${pomodoro}m pomodoro block?`),
-            1,
-            0
-          )
-        );
-        // Show any rolling credit still provisioned (and unconsumed so far) so
-        // the user knows extending ADDS to existing capacity, not replaces it.
-        if (remainingProvisioned > 0) {
+      .custom<string>(
+        (tui, theme, _kb, done) => {
+          const container = new Container();
+          container.addChild(new Spacer(1));
+          container.addChild(
+            new Text(theme.fg('accent', theme.bold('⏱  Extend billable human time?')), 1, 0)
+          );
           container.addChild(new Spacer(1));
           container.addChild(
             new Text(
-              theme.fg(
-                'dim',
-                `${Math.max(1, Math.round(remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more.`
-              ),
+              theme.fg('muted', `Idle after the agent. Add a ${pomodoro}m pomodoro block?`),
               1,
               0
             )
           );
-        }
-        container.addChild(new Spacer(1));
-        const items: SelectItem[] = [
-          {
-            value: 'extend',
-            label: `Extend +${pomodoro}m`,
-            description: 'Add a pomodoro to billable human time',
-          },
-          {
-            value: 'stop',
-            label: 'Stop billing',
-            description: 'Pause the agent until you extend via /ledger-extend',
-          },
-        ];
-        const list = new SelectList(items, 5, getSelectListTheme());
-        list.onSelect = (item) => done(item.value);
-        list.onCancel = () => done('dismiss'); // esc dismiss = no change (not "Stop billing")
-        container.addChild(list);
-        container.addChild(new Spacer(1));
-        container.addChild(
-          new Text(theme.fg('dim', '↑↓ navigate · enter select · esc dismiss'), 1, 0)
-        );
-        container.addChild(new Spacer(1));
-        container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
-        return {
-          render: (w: number) => container.render(w),
-          invalidate: () => container.invalidate(),
-          handleInput: (data: string) => {
+          // Show any rolling credit still provisioned (and unconsumed so far) so
+          // the user knows extending ADDS to existing capacity, not replaces it.
+          if (remainingProvisioned > 0) {
+            container.addChild(new Spacer(1));
+            container.addChild(
+              new Text(
+                theme.fg(
+                  'dim',
+                  `${Math.max(1, Math.round(remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more.`
+                ),
+                1,
+                0
+              )
+            );
+          }
+          container.addChild(new Spacer(1));
+          const items: SelectItem[] = [
+            {
+              value: 'extend',
+              label: `Extend +${pomodoro}m`,
+              description: 'Add a pomodoro to billable human time',
+            },
+            {
+              value: 'stop',
+              label: 'Stop billing',
+              description: 'Pause the agent until you extend via /ledger-extend',
+            },
+          ];
+          const list = new SelectList(items, 5, getSelectListTheme());
+          list.onSelect = (item) => done(item.value);
+          list.onCancel = () => done('dismiss'); // esc dismiss = no change (not "Stop billing")
+          const removeInputListener = tui.addInputListener((data) => {
+            // Raw listeners run before TUI's focused-component release filter.
+            // Ignore Kitty key-release packets or one arrow press moves twice.
+            if (isKeyRelease(data)) return { consume: true };
             list.handleInput(data);
             tui.requestRender();
-          },
-        };
-      })
+            return { consume: true };
+          });
+          container.addChild(list);
+          container.addChild(new Spacer(1));
+          container.addChild(
+            new Text(theme.fg('dim', '↑↓ navigate · enter select · esc dismiss'), 1, 0)
+          );
+          container.addChild(new Spacer(1));
+          return {
+            render: (w: number) =>
+              frameOverlayLines(w < 2 ? [] : container.render(w - 2), w, (border) =>
+                theme.fg('accent', border)
+              ),
+            invalidate: () => container.invalidate(),
+            handleInput: (data: string) => {
+              list.handleInput(data);
+              tui.requestRender();
+            },
+            dispose: removeInputListener,
+          };
+        },
+        {
+          overlay: true,
+          onHandle: (handle) => handle.focus(),
+        }
+      )
       .then((choice) => {
         applyWizardChoice(ctx, choice as 'extend' | 'stop' | 'dismiss', pomodoro);
       })
