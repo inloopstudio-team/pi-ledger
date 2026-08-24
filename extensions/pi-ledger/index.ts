@@ -129,6 +129,38 @@ const AUTO_REPEAT_MS = 50;
  *  reading pauses; a walk-away is always ≥ this before the pop lands. */
 const ENGAGED_ACTIVITY_MS = 90_000;
 
+/** pi-queue-steer(-factory) interop: the queue extension parks rows OUTSIDE
+ *  pi-core's native queues, so a session with queued work still ends in a
+ *  genuine agent_settled. It publishes its backlog snapshot on this pi.events
+ *  channel on every change and mirrors the latest one on globalThis under
+ *  __tmustierPiQueueSteerState (synchronous reads, immune to listener
+ *  registration order). While it reports undispatched rows the no-credit
+ *  wizard holds back at settle, and re-offers when the backlog drains. */
+const QUEUE_STEER_STATE_EVENT = 'queue-steer:state';
+
+/** Grace (ms) between a queue-steer drain event and re-offering a suppressed
+ *  wizard: a drain that FEEDS a run (dispatch from idle/settle) fires
+ *  agent_start within milliseconds (or leaves native follow-ups pending), so
+ *  the delay lets the run win instead of popping the prompt into it. */
+const QUEUE_STEER_REARM_MS = 1500;
+
+/** The read side of the queue-steer snapshot: every field optional/unknown so
+ *  a missing or older publisher degrades to 0 pending. All row states count
+ *  (paused, edit-held, blocking control rows) — any parked backlog means the
+ *  session has queued work in flight. */
+interface QueueSteerSnapshot {
+  pending?: unknown;
+  paused?: unknown;
+  blocked?: unknown;
+}
+
+declare global {
+  // Written by pi-queue-steer(-factory) on every queue change; survives
+  // in-process runtime swaps, so it stays accurate across an extension reload.
+
+  var __tmustierPiQueueSteerState: QueueSteerSnapshot | undefined;
+}
+
 const MS_PER_HOUR = 3_600_000;
 const MS_PER_MINUTE = 60_000;
 
@@ -1529,6 +1561,16 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // torn down at session_shutdown. The factory re-binds on the next session.
   let retryUnsubs: Array<() => void> = [];
 
+  // pi-queue-steer backlog hold (see QUEUE_STEER_STATE_EVENT): the last
+  // events-reported pending count (fallback for the globalThis mirror).
+  let queueSteerEventPending: number | null = null;
+  // True when a settle (or resume/reload) suppressed the no-credit wizard
+  // because queue-steer reported a parked backlog. Re-offered — grace-deferred
+  // by QUEUE_STEER_REARM_MS — when the backlog drains without a new run (rows
+  // deleted by hand, an unpause that dispatches nothing, a failed dispatch).
+  let queueSteerSuppressed = false;
+  let queueSteerRearmTimer: ReturnType<typeof setTimeout> | null = null;
+
   // Latest ctx (event-bus listeners for tps:telemetry don't receive one).
   let lastCtx: ExtensionContext | null = null;
 
@@ -2233,6 +2275,24 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     notify(ctx, `Extended billable human time by ${pomodoro}m.`, 'info');
   }
 
+  /** Clear a pending queue-steer drain re-offer (see QUEUE_STEER_REARM_MS). */
+  function clearQueueSteerRearm() {
+    if (queueSteerRearmTimer) {
+      clearTimeout(queueSteerRearmTimer);
+      queueSteerRearmTimer = null;
+    }
+  }
+
+  /** Undispatched rows pi-queue-steer reports right now (0 when the queue
+   *  extension is absent). The globalThis mirror wins — it is always current,
+   *  regardless of extension load order; the events-tracked count is the
+   *  fallback for an events-only publisher. */
+  function queueSteerPending(): number {
+    const mirrored = globalThis.__tmustierPiQueueSteerState;
+    if (typeof mirrored?.pending === 'number') return mirrored.pending;
+    return queueSteerEventPending ?? 0;
+  }
+
   /** The no-credit engagement prompt (agent_settled with no rolling credit,
    *  /resume, or a re-offer after a retry settles). Pops only at TRUE IDLENESS:
    *  if the human typed within the presence window they're mid-flow — composing
@@ -2505,6 +2565,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // leak across the session boundary on a per-process extension instance).
     retryActiveId = undefined;
     pendingSettledWizard = null;
+    // Queue-steer hold state is per-session too: a fresh session re-reads the
+    // live mirror at its first settle (or resume/reload prompt gate below).
+    queueSteerEventPending = null;
+    queueSteerSuppressed = false;
+    clearQueueSteerRearm();
     // Wrap the input editor so keystrokes stage for billing: during a run they
     // feed a steer/followUp burst (committed on submit via `input`); between
     // turns the FIRST keystroke engages an idle window at its onset. Extends
@@ -2522,7 +2587,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // /reload) pop the wizard to prompt that engagement, so review time can be
     // billed via an extension. (Startup/new start typing right away — no pop.)
     if ((event.reason === 'resume' || event.reason === 'reload') && settings.autoWizard) {
-      armEngagementPrompt(ctx);
+      if (queueSteerPending() > 0) {
+        // A parked queue-steer backlog survived the swap (restored rows):
+        // hold the prompt exactly as at agent_settled; the drain re-offers it.
+        queueSteerSuppressed = true;
+      } else {
+        armEngagementPrompt(ctx);
+      }
     }
   });
 
@@ -2699,6 +2770,35 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     })
   );
 
+  // pi-queue-steer backlog feed (see QUEUE_STEER_STATE_EVENT). Tracks the
+  // parked-row count as a fallback for the settle gate and re-offers a
+  // suppressed wizard when the backlog drains without starting a run. The
+  // re-offer is grace-deferred (QUEUE_STEER_REARM_MS): a drain that FEEDS a
+  // run (dispatch at an agent boundary or from idle) produces agent_start
+  // within the window — or leaves native follow-ups pending — and a parked
+  // backlog that refills re-reads non-zero at fire time, so the prompt only
+  // lands on a genuinely idle, queue-empty session.
+  pi.events.on(QUEUE_STEER_STATE_EVENT, (data: unknown) => {
+    const snapshot = (data ?? {}) as QueueSteerSnapshot;
+    if (typeof snapshot.pending === 'number') queueSteerEventPending = snapshot.pending;
+    if (queueSteerPending() > 0 || !queueSteerSuppressed) return;
+    clearQueueSteerRearm();
+    queueSteerRearmTimer = setTimeout(() => {
+      queueSteerRearmTimer = null;
+      // A backlog that refilled during the grace keeps the suppression; the
+      // next drain event re-arms.
+      if (queueSteerPending() > 0) return;
+      queueSteerSuppressed = false;
+      if (agentRunning || wizardOpen || extensionBudgetMs > 0 || !lastCtx) return;
+      if (lastCtx.hasPendingMessages()) return; // the drain fed a native follow-up
+      if (retryActiveId !== undefined) {
+        pendingSettledWizard = { ctx: lastCtx };
+      } else {
+        armEngagementPrompt(lastCtx);
+      }
+    }, QUEUE_STEER_REARM_MS);
+  });
+
   pi.events.on(TPS_TELEMETRY_EVENT, (payload: unknown) => {
     const t = payload as TpsTelemetry | null;
     if (!t || !t.timing || !t.tokens || !t.model) return;
@@ -2819,6 +2919,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // re-evaluates then). Keeps a pi-retry that completes after a retry
     // turn's agent_end from popping on a stale 'settled' until that run settles.
     pendingSettledWizard = null;
+    // A queue-steer backlog that starts running re-settles at its end — the
+    // drain re-offer only matters while the session stays parked and idle.
+    queueSteerSuppressed = false;
+    clearQueueSteerRearm();
   });
 
   pi.on('agent_end', (_event, ctx) => {
@@ -2878,7 +2982,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       // prompt and pop when the retry settles (on pi-retry:completed); a
       // cancelled retry never pops. With no pi-retry (or none active), prompt
       // as before — idle-gated now, so an actively-typing human isn't interrupted.
-      if (retryActiveId !== undefined) {
+      if (queueSteerPending() > 0) {
+        // pi-queue-steer parks rows outside pi-core's native queues (a paused
+        // backlog, a blocking control row, one-at-a-time rows awaiting their
+        // boundary): the session still has queued work, so this settle is a
+        // pause, not a human handoff. Hold the wizard; the queue-steer drain
+        // event re-offers it if the backlog empties without starting a run.
+        queueSteerSuppressed = true;
+      } else if (retryActiveId !== undefined) {
         pendingSettledWizard = { ctx };
       } else {
         armEngagementPrompt(ctx);
