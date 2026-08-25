@@ -45,6 +45,7 @@ const DEFAULTS: LedgerSettings = {
   currency: 'USD',
   autoWizard: true,
   autoExtend: false,
+  resumeGraceMinutes: 1,
 };
 
 const KIND_BY_CUSTOM_TYPE: Record<string, SidecarEvent['kind']> = {
@@ -221,6 +222,14 @@ describe('applySettingValue', () => {
     expect(applySettingValue(DEFAULTS, 'autoWizard', 'on').autoWizard).toBe(true);
     expect(applySettingValue(DEFAULTS, 'autoExtend', 'on').autoExtend).toBe(true);
     expect(applySettingValue(DEFAULTS, 'autoExtend', 'off').autoExtend).toBe(false);
+  });
+  it('parses the resume grace (0 disables; negatives rejected)', () => {
+    expect(applySettingValue(DEFAULTS, 'resumeGraceMinutes', '0').resumeGraceMinutes).toBe(0);
+    expect(applySettingValue(DEFAULTS, 'resumeGraceMinutes', '2.6').resumeGraceMinutes).toBe(3);
+    expect(
+      applySettingValue({ ...DEFAULTS, resumeGraceMinutes: 1 }, 'resumeGraceMinutes', '-1')
+        .resumeGraceMinutes
+    ).toBe(1); // reject negative → keeps old
   });
   it('ignores non-numeric input for numeric fields', () => {
     expect(
@@ -1321,17 +1330,113 @@ describe('extension integration', () => {
     expect(fixture.customSpy).toHaveBeenCalledTimes(1); // no credit → pop immediately
   });
 
-  it('pops the wizard on /resume (and /reload) to prompt engagement for review', async () => {
+  it('grants a 1m resume grace instead of popping the wizard (the pop lands at the grace boundary)', async () => {
     fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
-    fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // resume → pop
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // resume → grace, no immediate pop
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    const grace = fixture.lastSidecarEvent('human-open');
+    expect(grace).toBeDefined();
+    expect(grace!.engagedVia).toBe('grace');
+    expect(grace!.grantedBudgetMs).toBe(60_000);
+    expect(grace!.extensionBudgetMs).toBe(60_000);
+
+    await vi.advanceTimersByTimeAsync(60_000); // grace exhausted, human idle → pop
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // dismiss before exercising the next session reason
+
     fixture.customSpy.mockClear();
-    fixture.run('session_start', { type: 'session_start', reason: 'reload' }); // reload → pop
+    fixture.run('session_start', { type: 'session_start', reason: 'reload' }); // grace credit remains → resume prompt, no second grace
     expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    const opens = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
+    expect(opens).toHaveLength(1); // still just the original grace window
+
     fixture.customSpy.mockClear();
-    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // startup → no pop
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // startup → no grace, no pop
     expect(fixture.customSpy).not.toHaveBeenCalled();
+  });
+
+  it('pops the wizard immediately on /resume when the resume grace is disabled (0)', async () => {
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, resumeGraceMinutes: 0 }, timestamp: 0 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // resume → pop (no grace)
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no grace window
+  });
+
+  it('bills the resume grace as committed human time when the next prompt submits', async () => {
+    fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    await vi.advanceTimersByTimeAsync(30_000); // 30s of re-orientation
+    fixture.run('agent_start', { type: 'agent_start' }); // submit → commit
+    const close = fixture.lastSidecarEvent('human-close');
+    expect(close).toBeDefined();
+    expect(close!.committed).toBe(true);
+    expect(close!.billedMs).toBe(30_000); // min(30s idle, 1m grace)
+    expect(close!.extensionBudgetMs).toBe(30_000); // leftover grace rolls forward
+    await fixture.commands['ledger'].handler('', fixture.mockCtx);
+    const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
+    expect(msg).toContain('human 0.01h (1 windows)'); // 30s grace billed as human time
+  });
+
+  it('caps the grace bill at the grace block — review beyond 1m needs an extension', async () => {
+    fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    await vi.advanceTimersByTimeAsync(90_000); // 90s review: at 60s the exhausted grace pops the wizard (idle)
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(0); // dismiss (no extension)
+    fixture.run('agent_start', { type: 'agent_start' }); // commit
+    const close = fixture.lastSidecarEvent('human-close');
+    expect(close!.billedMs).toBe(60_000); // capped at the 1m grace block
+    expect(close!.extensionBudgetMs).toBe(0); // grace fully consumed
+  });
+
+  it('abandons the grace with no submit — resume-and-walk-away bills 0 (scale-to-zero)', async () => {
+    fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    fixture.run('session_shutdown', { type: 'session_shutdown' }); // exit without submitting
+    const close = fixture.lastSidecarEvent('human-close');
+    expect(close).toBeDefined();
+    expect(close!.committed).toBe(false);
+    expect(close!.billedMs).toBe(0); // idle with no output is wasted
+  });
+
+  it('skips the grace while billing is paused ("Stop billing" survives the resume)', async () => {
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      { kind: 'billing-pause', paused: true, timestamp: 1 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no grace credit
+    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // the resume prompt still pops (unchanged)
+  });
+
+  it('skips the grace when rolling credit remains — engaged review bills against it as before', async () => {
+    seedCredit(fixture, 18 * 60_000); // 18m rolling credit from a prior window
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    const opens = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
+    expect(opens).toHaveLength(1); // only the seeded one — no grace
+    fixture.sendEditorKey('k'); // engage → window opens capped at the rolling credit (not grace)
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open!.engagedVia).toBe('keystroke');
+    expect(open!.grantedBudgetMs).toBe(18 * 60_000);
+  });
+
+  it('honors a custom grace length (and applies to /reload too)', async () => {
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, resumeGraceMinutes: 2 }, timestamp: 0 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'reload' });
+    expect(fixture.customSpy).not.toHaveBeenCalled();
+    const grace = fixture.lastSidecarEvent('human-open');
+    expect(grace!.engagedVia).toBe('grace');
+    expect(grace!.grantedBudgetMs).toBe(2 * 60_000);
+    expect(
+      fixture.notifySpy.mock.calls.some(
+        ([m]) => typeof m === 'string' && m.includes('Resume grace: 2m')
+      )
+    ).toBe(true);
   });
 
   it('suppresses the wizard at agent_end when rolling credit is rehydrated', async () => {
@@ -1491,6 +1596,7 @@ describe('extension integration', () => {
           humanRatePerHour: 50,
           project: 'app',
           author: 'tom',
+          resumeGraceMinutes: 0, // pin the engagement-gated window invariant this test checks
         },
         timestamp: 0,
       },
@@ -1897,7 +2003,8 @@ describe('extension integration', () => {
   it('does not open a second initial window when rehydrate restores an open one (crashed prior process)', async () => {
     const openedAt = 5_000_000;
     fixture.seedSidecar([
-      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      // grace disabled: this test pins rehydrate semantics (no new window at all)
+      { kind: 'settings', settings: { ...DEFAULTS, resumeGraceMinutes: 0 }, timestamp: 0 },
       {
         kind: 'human-open',
         openedAt,
@@ -2384,7 +2491,8 @@ describe('steering composition (human types while the agent runs)', () => {
 
   it('rehydrates steer events into human time and rolling credit', async () => {
     fixture.seedSidecar([
-      { kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 },
+      // grace disabled: pin the engagement-gated window count (just the steer)
+      { kind: 'settings', settings: { ...DEFAULTS, resumeGraceMinutes: 0 }, timestamp: 0 },
       {
         kind: 'steer',
         startedAt: 1000,

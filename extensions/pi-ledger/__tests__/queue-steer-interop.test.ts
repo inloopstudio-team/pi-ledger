@@ -139,6 +139,9 @@ describe('queue-steer interop', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     await vi.advanceTimersByTimeAsync(0);
     expect(fixture.customSpy).not.toHaveBeenCalled();
+    // no resume grace either — a parked backlog means queued work is in
+    // flight, and an unattended dispatch would bill the grace with no human
+    expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-open')).toHaveLength(0);
 
     setMirror({ pending: 0, paused: false, blocked: false });
     fixture.emitEvent('queue-steer:state', { pending: 0, paused: false, blocked: false });

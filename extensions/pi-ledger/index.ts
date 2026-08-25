@@ -18,16 +18,21 @@
  * extension) after agent_end, committed when their next submit produces agent
  * work (agent_start) — so idle with no engagement, or engagement with no
  * submit, bills nothing (idle with no output is wasted). Capped by a
- * budget (rolling extension credit). A non-blocking wizard prompts
- * engagement (agent_settled with no credit, /resume) and offers +pomodoro
- * extensions; `/ledger-extend` does the same manually. The wizard asks only at
- * TRUE IDLENESS — prompts never land mid-typing: while genuine keystrokes are
+ * budget (rolling extension credit). On /resume (or /reload) with no credit
+ * left, a small RESUME GRACE (default 1m, `resumeGraceMinutes`) is
+ * provisioned instead of prompting immediately: transcript re-orientation
+ * counts as (committed) human time, and the engagement prompt lands at the
+ * grace boundary. A non-blocking wizard prompts engagement (agent_settled
+ * with no credit, or that grace boundary) and offers +pomodoro extensions;
+ * `/ledger-extend` does the same manually. The wizard asks only at TRUE
+ * IDLENESS — prompts never land mid-typing: while genuine keystrokes are
  * recent the no-credit prompt defers until hands leave the keyboard, and an
  * exhaustion boundary hit while typing rolls a block silently (observed
  * presence = engagement). Silence never creates the FIRST credit; only an
- * explicit extend can. Extensions are ROLLING credit — provisioned pomodoro
- * blocks survive across agent turns, so the wizard stays silent while credit
- * remains and only re-pops when it's exhausted (and the human is idle).
+ * explicit extend (or the configured resume grace) can. Extensions are
+ * ROLLING credit — provisioned pomodoro blocks survive across agent turns,
+ * so the wizard stays silent while credit remains and only re-pops when it's
+ * exhausted (and the human is idle).
  *
  * Commands: /ledger, /ledger-settings, /ledger-extend [m], /ledger-receipt
  *
@@ -185,6 +190,7 @@ const DEFAULT_SETTINGS: LedgerSettings = {
   currency: 'USD',
   autoWizard: true,
   autoExtend: false,
+  resumeGraceMinutes: 1,
 };
 
 // ─── Data types ─────────────────────────────────────────────────────────────
@@ -206,6 +212,12 @@ export interface LedgerSettings {
    *  idle that's committed by a later submit, capped at the block (scale-to-zero
    *  with provisioned capacity), so walking away never over-bills. */
   autoExtend: boolean;
+  /** Billable human-time block (minutes) provisioned on /resume (and /reload)
+   *  when no rolling credit remains — transcript re-orientation counts,
+   *  committed by the next submit like any idle window; the engagement prompt
+   *  lands at the grace boundary instead of popping at the resume moment.
+   *  0 disables (prompt on resume, as before). */
+  resumeGraceMinutes: number;
 }
 
 /** Persisted per agent turn (replayed on rehydrate). */
@@ -241,11 +253,12 @@ export interface HumanOpenEvent {
   openedAt: number;
   grantedBudgetMs: number;
   extensions: number;
-  /** How the window engaged: "keystroke" (first key typed) or "extension"
+  /** How the window engaged: "keystroke" (first key typed), "extension"
    *  (the wizard's extend / `/ledger-extend` — which both grant capacity and
-   *  count as engagement). Optional on legacy events; backfilled to
-   *  "keystroke" on replay. */
-  engagedVia?: 'keystroke' | 'extension';
+   *  count as engagement), or "grace" (the /resume · /reload re-orientation
+   *  grace — standing-config credit, onset = the resume moment). Optional on
+   *  legacy events; backfilled to "keystroke" on replay. */
+  engagedVia?: 'keystroke' | 'extension' | 'grace';
   /** Remaining rolling extension budget at the time of this event. Optional
    *  on legacy events; backfilled from `grantedBudgetMs` on replay. */
   extensionBudgetMs?: number;
@@ -685,6 +698,11 @@ export function applySettingValue(
     case 'autoExtend':
       next.autoExtend = value === 'on';
       break;
+    case 'resumeGraceMinutes': {
+      const n = parseNumber(value);
+      if (n !== null && n >= 0) next.resumeGraceMinutes = Math.round(n);
+      break;
+    }
   }
   return next;
 }
@@ -706,7 +724,7 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
     openedAt: number;
     grantedBudgetMs: number;
     extensions: number;
-    engagedVia: 'keystroke' | 'extension';
+    engagedVia: 'keystroke' | 'extension' | 'grace';
   } | null;
   extensionBudgetMs: number;
   billingPaused: boolean;
@@ -825,7 +843,7 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
     openedAt: number;
     grantedBudgetMs: number;
     extensions: number;
-    engagedVia: 'keystroke' | 'extension';
+    engagedVia: 'keystroke' | 'extension' | 'grace';
   } | null = null;
   for (const e of events) {
     if (e.kind === 'human-open' && !closedOpenedAts.has(e.openedAt)) {
@@ -1452,7 +1470,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     openedAt: number;
     grantedBudgetMs: number;
     extensions: number;
-    engagedVia: 'keystroke' | 'extension';
+    engagedVia: 'keystroke' | 'extension' | 'grace';
   } | null = null;
 
   // Rolling billable-human-time budget: provisioned pomodoro credit that
@@ -1962,11 +1980,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *  window bills wall-clock from this onset (capturing thinking, not just
    *  keystrokes), capped at `extensionBudgetMs` (rolling credit), but ONLY when
    *  committed by a submitted prompt at `agent_start` — abandoned idle bills 0.
-   *  `engagedVia` records how the human signaled presence (audit). `extendMs`
-   *  provisions a pomodoro block on open (the engagement-via-extension case). */
+   *  `engagedVia` records how the human signaled presence (audit): 'keystroke',
+   *  'extension', or 'grace' (the resume grace — onset is the resume moment,
+   *  standing-config engagement rather than an observed signal). `extendMs`
+   *  provisions a pomodoro block on open (the extension/grace cases). */
   function openIdleWindow(
     ctx: ExtensionContext,
-    engagedVia: 'keystroke' | 'extension',
+    engagedVia: 'keystroke' | 'extension' | 'grace',
     extendMs = 0
   ) {
     if (humanWindow) return; // safety: never open a second window
@@ -2245,6 +2265,26 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   function autoExtendNow(ctx: ExtensionContext, mins: number = settings.pomodoroMinutes) {
     extendHumanTime(ctx, mins);
     notify(ctx, `Auto-extended billable human time by ${mins}m.`, 'info');
+  }
+
+  /** The /resume (and /reload) grace: provision `resumeGraceMinutes` of
+   *  billable human time so re-orientation — reading the transcript, regaining
+   *  context — counts, without making the human extend first. Engages a window
+   *  at the resume moment (onset = now) capped at the grace block (rolling
+   *  credit, so any unspent remainder carries forward like any grant). It
+   *  bills only when committed by the human's next submit (agent_start);
+   *  resume-and-walk-away abandons it (bills 0). openIdleWindow arms the
+   *  exhaustion boundary, which is where the engagement prompt now lands —
+   *  deferred from the resume moment by the grace. This is the one
+   *  standing-config credit grant; `resumeGraceMinutes: 0` restores
+   *  prompt-first engagement. */
+  function grantResumeGrace(ctx: ExtensionContext) {
+    openIdleWindow(ctx, 'grace', settings.resumeGraceMinutes * MS_PER_MINUTE);
+    notify(
+      ctx,
+      `Resume grace: ${settings.resumeGraceMinutes}m of billable human time for re-orientation.`,
+      'info'
+    );
   }
 
   /** Apply the wizard's choice: 'extend' grants capacity (shared path),
@@ -2581,17 +2621,31 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         (tui, theme, kb) => new LedgerEditor(tui, theme, kb, noteKeystroke, revertSteerToEditor)
       );
     }
-    // No initial window is opened here — engagement is gated on the first
-    // keystroke/extension, so pre-engagement time (reading the transcript,
-    // thinking) bills nothing unless the human extends. On /resume (or
-    // /reload) pop the wizard to prompt that engagement, so review time can be
-    // billed via an extension. (Startup/new start typing right away — no pop.)
-    if ((event.reason === 'resume' || event.reason === 'reload') && settings.autoWizard) {
-      if (queueSteerPending() > 0) {
+    // No initial window is opened here for a fresh session — engagement is
+    // gated on the first keystroke/extension, so pre-engagement time (reading
+    // the transcript, thinking) bills nothing unless the human extends. On
+    // /resume (or /reload) the session IS continued work: with no rolling
+    // credit left, the RESUME GRACE provisions a small billable human-time
+    // block so re-orientation (reading the transcript, regaining context)
+    // counts as human time when the next submit commits — and the engagement
+    // prompt lands at the grace boundary instead of popping immediately.
+    // Grace disabled → prompt on resume, as before. (Startup/new start typing
+    // right away — no grace, no pop.)
+    if (event.reason === 'resume' || event.reason === 'reload') {
+      if (settings.autoWizard && queueSteerPending() > 0) {
         // A parked queue-steer backlog survived the swap (restored rows):
         // hold the prompt exactly as at agent_settled; the drain re-offers it.
+        // No grace either — queued work is in flight, and an unattended
+        // dispatch would commit (bill) the grace with no human present.
         queueSteerSuppressed = true;
-      } else {
+      } else if (
+        settings.autoWizard &&
+        settings.resumeGraceMinutes > 0 &&
+        !billingPaused && // "Stop billing" must survive the resume
+        extensionBudgetMs <= 0 // rolling credit already bills engaged review
+      ) {
+        grantResumeGrace(ctx);
+      } else if (settings.autoWizard) {
         armEngagementPrompt(ctx);
       }
     }
@@ -3286,6 +3340,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         label: 'Pomodoro minutes',
         current: String(settings.pomodoroMinutes),
       },
+      {
+        id: 'resumeGraceMinutes',
+        label: 'Resume grace (min)',
+        current: String(settings.resumeGraceMinutes),
+      },
       { id: 'referenceTps', label: 'Reference TPS', current: fmtTps(settings.referenceTps) },
       { id: 'project', label: 'Project', current: settings.project || basename(ctx.cwd) },
       { id: 'author', label: 'Author', current: settings.author || defaultAuthor() },
@@ -3344,6 +3403,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         currentValue: String(settings.pomodoroMinutes),
         description: 'Minutes added per extension (wizard · /ledger-extend)',
         submenu: numberSubmenu(theme, 'Pomodoro minutes'),
+      },
+      {
+        id: 'resumeGraceMinutes',
+        label: 'Resume grace (min)',
+        currentValue: String(settings.resumeGraceMinutes),
+        description:
+          'Billable human-time block provisioned on /resume · /reload (0 = prompt instead)',
+        submenu: numberSubmenu(theme, 'Resume grace minutes'),
       },
       {
         id: 'referenceTps',
