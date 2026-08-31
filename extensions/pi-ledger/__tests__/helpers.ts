@@ -66,7 +66,7 @@ export interface TestFixture {
   wizardSpy: ReturnType<typeof vi.fn>;
   /** Send a keystroke into the editor wrapper installed via setEditorComponent. */
   sendEditorKey: (data: string) => void;
-  /** Fire a registered wizard shortcut ('extend' | 'stop') as the TUI would. */
+  /** Answer the docked wizard via intercepted editor keys (↑/↓/enter). */
   pressWizardShortcut: (choice: 'extend' | 'stop') => void;
   emitEvent: (event: string, payload: unknown) => void;
   /** Invoke a lifecycle handler registered via pi.on(name, fn) with (event, ctx). */
@@ -248,17 +248,26 @@ export function createTestFixture(): TestFixture {
   inputSpy.mockImplementation(() => Promise.resolve(inputResult));
   // ctx.ui.setWidget: forward every call to widgetSpy; wizardSpy records only
   // the calls that install prompt lines (a clear passes undefined), so pop
-  // assertions keep their old customSpy semantics.
+  // assertions keep their old customSpy semantics. Consecutive installs count
+  // as ONE pop — a selection move re-installs the box without re-popping it.
+  let showingWizard = false;
   widgetSpy.mockImplementation((_key: string, lines: unknown) => {
-    if (lines !== undefined) wizardSpy(_key, lines);
+    if (lines !== undefined) {
+      if (!showingWizard) wizardSpy(_key, lines);
+      showingWizard = _key === 'pi-ledger-wizard';
+    } else {
+      showingWizard = false;
+    }
   });
-  // Fire a wizard shortcut the way pi's CustomEditor dispatches extension
-  // shortcuts (synchronously, before the editor sees the key).
+  // Answer the docked wizard the way the TUI does: the LedgerEditor wrapper
+  // intercepts ↑/↓/enter while the box shows. Move to the target row
+  // (absolute — up selects row 0, down row 1) and confirm with enter.
   const pressWizardShortcut = (choice: 'extend' | 'stop') => {
-    const key = choice === 'extend' ? 'ctrl+e' : 'ctrl+w';
-    const shortcut = shortcuts[key];
-    if (!shortcut) throw new Error(`wizard shortcut ${key} not registered`);
-    void shortcut.handler();
+    const UP = '\x1b[A';
+    const DOWN = '\x1b[B';
+    if (!editorFactory) throw new Error('wizard editor not installed');
+    sendEditorKey(choice === 'extend' ? UP : DOWN);
+    sendEditorKey('\r');
   };
 
   const sidecarFile = () => sidecarPathFor(TEST_SESSION_ID);

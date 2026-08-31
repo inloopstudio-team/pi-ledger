@@ -966,7 +966,7 @@ describe('extension integration', () => {
     expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('keystroke');
   });
 
-  it('docks the TUI wizard as a themed widget box answered by shortcuts', () => {
+  it('docks the TUI wizard as an interactive widget box (↑/↓/enter)', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_settled', { type: 'agent_settled' });
     expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
@@ -978,9 +978,10 @@ describe('extension integration', () => {
     )! as [string, unknown];
     expect(widgetKey).toBe('pi-ledger-wizard');
     expect(typeof factory).toBe('function');
+    const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
     const component = (
       factory as (tui: unknown, theme: unknown) => { render: (w: number) => string[] }
-    )({}, { fg: (_c: string, s: string) => s, bold: (s: string) => s });
+    )({}, theme);
     const lines = component.render(72);
     expect(lines[0]).toMatch(/^┌ pi-ledger · extend\? · 20m pomodoro ─+┐$/);
     expect(lines.at(-1)).toMatch(/^└─+┘$/);
@@ -988,13 +989,26 @@ describe('extension integration', () => {
       expect(line.startsWith('│')).toBe(true);
       expect(line.endsWith('│')).toBe(true);
     }
+    // Row 0 starts selected (▶); row 1 is unselected.
     expect(lines.some((l) => l.includes('▶ Extend +20m'))).toBe(true);
-    expect(lines.some((l) => l.includes('○ Stop billing'))).toBe(true);
-    expect(lines.some((l) => l.includes('ctrl+e extend · ctrl+w stop billing'))).toBe(true);
+    expect(lines.some((l) => l.includes('Stop billing'))).toBe(true);
+    expect(lines.every((l) => !l.includes('○'))).toBe(true);
+    expect(lines.some((l) => l.includes('↑/↓ select · enter confirm · esc dismiss'))).toBe(true);
 
-    // The choice rides the registered shortcuts (the editor keeps input; no
-    // SelectList). Answering clears the widget.
-    fixture.pressWizardShortcut('extend');
+    // ↓ moves the cursor to Stop billing; the widget re-renders with the
+    // marker moved.
+    fixture.sendEditorKey('\x1b[B');
+    const moved = (
+      fixture.widgetSpy.mock.calls.findLast(([, l]) => l !== undefined)?.[1] as (
+        tui: unknown,
+        theme: unknown
+      ) => { render: (w: number) => string[] }
+    )({}, theme).render(72);
+    expect(moved.some((l) => l.includes('▶ Stop billing'))).toBe(true);
+    expect(moved.every((l) => !l.includes('▶ Extend'))).toBe(true);
+
+    // enter answers the selected row; answering clears the widget.
+    fixture.sendEditorKey('\r');
     expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
   });
 
@@ -1054,37 +1068,47 @@ describe('extension integration', () => {
     expect(fixture.selectSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('a docked prompt ignores its own shortcut keys in noteKeystroke (the shortcut hook answers)', () => {
+  it('a docked prompt passes non-box keys through (nothing intercepts them)', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // pop
     expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
 
-    // ctrl+e is skipped by the dismissal path (the extension-shortcut hook
-    // owns it, so it stages no keystroke and opens no idle window). In the
-    // headless fixture the hook itself is exercised via pressWizardShortcut.
-    fixture.sendEditorKey('\x05'); // ctrl+e: skipped, box stays
+    // ctrl+e is no longer a wizard key — it's an ordinary editor keystroke.
+    // The box neither answers nor drops: non-box keys pass straight through
+    // (and the keystroke engages a $0 idle window, as typing always does).
+    fixture.sendEditorKey('\x05'); // ctrl+e
     expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
-    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
+    const typed = fixture.lastSidecarEvent('human-open');
+    expect(typed).toBeDefined();
+    expect(typed!.engagedVia).toBe('keystroke');
+    expect(typed!.grantedBudgetMs).toBe(0);
 
-    fixture.pressWizardShortcut('extend'); // the real answer path
+    // enter answers the selected row (Extend) — the box clears and the
+    // already-open $0 window gains the +20m provisioned budget.
+    fixture.pressWizardShortcut('extend'); // ↑ (already row 0) + enter
     expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
     const open = fixture.lastSidecarEvent('human-open');
     expect(open).toBeDefined();
-    expect(open!.engagedVia).toBe('extension');
+    expect(open!.extensionBudgetMs).toBe(20 * 60_000);
   });
 
-  it('any other keystroke dismisses the docked prompt (typing = engagement)', async () => {
+  it('typing keeps the docked prompt docked; only escape drops it', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // pop
-    fixture.sendEditorKey('k'); // dismiss: the box steps aside, typing engages
-    expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
+    // Typing passes through (and engages a $0 idle window) but the box STAYS.
+    fixture.sendEditorKey('k');
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     // engagement opened a $0 idle window (typing never self-grants credit)
     const open = fixture.lastSidecarEvent('human-open');
     expect(open).toBeDefined();
     expect(open!.engagedVia).toBe('keystroke');
     expect(open!.grantedBudgetMs).toBe(0);
+
+    // escape dismisses the box without answering.
+    fixture.sendEditorKey('\x1b');
+    expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
     // the next settle re-arms the deferral, which fires once hands have been
     // off the keyboard for ENGAGED_ACTIVITY_MS — and re-pops, since no credit
     // was granted
@@ -1243,6 +1267,7 @@ describe('extension integration', () => {
   });
 
   it('extends the budget when the wizard is accepted', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // pops → shortcut-extended (+20m, engages, re-armed at 20m)
     fixture.pressWizardShortcut('extend');

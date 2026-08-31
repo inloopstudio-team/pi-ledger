@@ -24,6 +24,9 @@
       },
     },
   },
+  "trustedDependencies": [
+    "simple-git-hooks",
+  ],
   "overrides": {
     "@earendil-works/pi-ai": "0.80.6",
     "brace-expansion": "5.0.6",
