@@ -250,10 +250,10 @@ Agent timing prefers pi-tps's `tps:telemetry` (`generationMs`, `stallMs`, `token
 ## Testing
 
 ```bash
-pnpm install
-pnpm test            # vitest run (208 tests)
-pnpm run typecheck   # tsc --noEmit
-pnpm run lint:dead   # knip
+bun install
+bun run test         # vitest run (227 tests)
+bun run typecheck    # tsc --noEmit
+bun run lint:dead    # knip
 ```
 
 ## License
