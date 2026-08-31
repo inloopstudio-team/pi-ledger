@@ -21,7 +21,6 @@ import {
   extractTpsEntries,
   fmtHours,
   fmtMoney,
-  frameOverlayLines,
   rehydrateFromSidecar,
   resolveExtensionBudget,
   retryEventId,
@@ -952,7 +951,7 @@ describe('extension integration', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // install the editor (no pop)
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // per-run cleanup; no pop here
     fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → wizard pops (engagement prompt)
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard promise
     fixture.sendEditorKey('k'); // ENGAGE the idle window at onset (no credit → cap 0)
     await vi.advanceTimersByTimeAsync(5000); // 5s idle, but cap is 0
@@ -967,91 +966,72 @@ describe('extension integration', () => {
     expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('keystroke');
   });
 
-  it('renders the TUI wizard above live overlays and captures navigation keys', () => {
+  it('docks the TUI wizard as a themed widget box answered by shortcuts', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_settled', { type: 'agent_settled' });
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
 
-    const [factory, options] = fixture.customSpy.mock.calls[0]! as any;
-    const focus = vi.fn();
-    expect(options).toMatchObject({ overlay: true, onHandle: expect.any(Function) });
-    options.onHandle({ focus });
-    expect(focus).toHaveBeenCalledOnce();
-
-    let inputListener!: (data: string) => { consume?: boolean } | undefined;
-    const removeInputListener = vi.fn();
-    const requestRender = vi.fn();
-    const done = vi.fn();
-    const component = factory(
-      {
-        addInputListener: (listener: typeof inputListener) => {
-          inputListener = listener;
-          return removeInputListener;
-        },
-        requestRender,
-      },
-      { fg: (_color: string, text: string) => text, bold: (text: string) => text },
-      {},
-      done
-    );
-    expect(inputListener('\x1b[B')).toEqual({ consume: true });
-    expect(inputListener('\x1b[1;1:3B')).toEqual({ consume: true }); // Kitty key release
-    expect(inputListener('\r')).toEqual({ consume: true });
-    expect(done).toHaveBeenCalledWith('stop');
-    component.dispose();
-    expect(removeInputListener).toHaveBeenCalledOnce();
-
-    const lines = frameOverlayLines(['wizard content'], 40, (border) => border);
-    expect(lines[0]).toBe(`┌${'─'.repeat(38)}┐`);
-    expect(lines.at(-1)).toBe(`└${'─'.repeat(38)}┘`);
+    // The prompt is a widget component (not a modal custom() overlay): the
+    // factory receives (tui, theme) and renders queue-steer-style box lines.
+    const [widgetKey, factory] = fixture.widgetSpy.mock.calls.find(
+      ([, lines]) => lines !== undefined
+    )! as [string, unknown];
+    expect(widgetKey).toBe('pi-ledger-wizard');
+    expect(typeof factory).toBe('function');
+    const component = (
+      factory as (tui: unknown, theme: unknown) => { render: (w: number) => string[] }
+    )({}, { fg: (_c: string, s: string) => s, bold: (s: string) => s });
+    const lines = component.render(72);
+    expect(lines[0]).toMatch(/^┌ pi-ledger · extend\? · 20m pomodoro ─+┐$/);
+    expect(lines.at(-1)).toMatch(/^└─+┘$/);
     for (const line of lines.slice(1, -1)) {
       expect(line.startsWith('│')).toBe(true);
       expect(line.endsWith('│')).toBe(true);
     }
+    expect(lines.some((l) => l.includes('▶ Extend +20m'))).toBe(true);
+    expect(lines.some((l) => l.includes('○ Stop billing'))).toBe(true);
+    expect(lines.some((l) => l.includes('ctrl+e extend · ctrl+w stop billing'))).toBe(true);
+
+    // The choice rides the registered shortcuts (the editor keeps input; no
+    // SelectList). Answering clears the widget.
+    fixture.pressWizardShortcut('extend');
+    expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
   });
 
   it('keeps the TUI wizard single-flight across overlapping triggers', async () => {
-    let resolveWizard!: (choice: string) => void;
-    fixture.customSpy.mockImplementation(
-      () =>
-        new Promise<string>((resolve) => {
-          resolveWizard = resolve;
-        })
-    );
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.run('agent_settled', { type: 'agent_settled' });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // pop
+    fixture.run('agent_settled', { type: 'agent_settled' }); // still showing → no second pop
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
 
-    fixture.run('agent_settled', { type: 'agent_settled' });
-    await fixture.commands['ledger-extend']!.handler('', fixture.mockCtx);
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    // /ledger-extend while the docked prompt shows is absorbed by it too
+    // (single-flight, as before): it neither stacks a second prompt nor
+    // touches the showing one.
+    await fixture.commands['ledger-extend'].handler('', fixture.mockCtx);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.widgetSpy.mock.calls.at(-1)).not.toEqual(['pi-ledger-wizard', undefined]);
 
-    resolveWizard('dismiss');
-    await vi.advanceTimersByTimeAsync(0);
+    // answering the showing prompt clears the box; the granted credit then
+    // suppresses the next settle
+    fixture.pressWizardShortcut('extend');
+    expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).toHaveBeenCalledTimes(2);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('does not stack another wizard after the idle-credit timer fires', async () => {
-    fixture.setCustomResult('extend');
+  it('does not stack wizards after the idle-credit timer fires', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.run('agent_settled', { type: 'agent_settled' });
-    await vi.advanceTimersByTimeAsync(0); // extend and arm the 20m exhaustion timer
+    fixture.run('agent_settled', { type: 'agent_settled' }); // pop → extend
+    fixture.pressWizardShortcut('extend'); // arms the 20m exhaustion timer
 
-    let resolveWizard!: (choice: string) => void;
-    fixture.customSpy.mockImplementation(
-      () =>
-        new Promise<string>((resolve) => {
-          resolveWizard = resolve;
-        })
-    );
     await vi.advanceTimersByTimeAsync(20 * 60_000);
-    expect(fixture.customSpy).toHaveBeenCalledTimes(2);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(2); // exhaustion boundary → re-offer
 
-    await fixture.commands['ledger-extend']!.handler('', fixture.mockCtx);
-    await vi.advanceTimersByTimeAsync(60 * 60_000);
-    expect(fixture.customSpy).toHaveBeenCalledTimes(2);
-
-    resolveWizard('dismiss');
-    await vi.advanceTimersByTimeAsync(0);
+    // while that prompt shows, /ledger-extend is absorbed (single-flight) and
+    // the consumed boundary does not re-arm itself — no third box stacks up
+    await fixture.commands['ledger-extend'].handler('', fixture.mockCtx);
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(2);
   });
 
   it('keeps the RPC wizard single-flight while its selection is unresolved', async () => {
@@ -1074,6 +1054,45 @@ describe('extension integration', () => {
     expect(fixture.selectSpy).toHaveBeenCalledTimes(2);
   });
 
+  it('a docked prompt ignores its own shortcut keys in noteKeystroke (the shortcut hook answers)', () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // pop
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+
+    // ctrl+e is skipped by the dismissal path (the extension-shortcut hook
+    // owns it, so it stages no keystroke and opens no idle window). In the
+    // headless fixture the hook itself is exercised via pressWizardShortcut.
+    fixture.sendEditorKey('\x05'); // ctrl+e: skipped, box stays
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
+
+    fixture.pressWizardShortcut('extend'); // the real answer path
+    expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open).toBeDefined();
+    expect(open!.engagedVia).toBe('extension');
+  });
+
+  it('any other keystroke dismisses the docked prompt (typing = engagement)', async () => {
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // pop
+    fixture.sendEditorKey('k'); // dismiss: the box steps aside, typing engages
+    expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
+    // engagement opened a $0 idle window (typing never self-grants credit)
+    const open = fixture.lastSidecarEvent('human-open');
+    expect(open).toBeDefined();
+    expect(open!.engagedVia).toBe('keystroke');
+    expect(open!.grantedBudgetMs).toBe(0);
+    // the next settle re-arms the deferral, which fires once hands have been
+    // off the keyboard for ENGAGED_ACTIVITY_MS — and re-pops, since no credit
+    // was granted
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(2);
+  });
+
   // ── Retry/queue turns (pi-retry backoff) are not human idle ─────────────
 
   it('does not open a human window during a provider-error retry (agent_settled not fired)', async () => {
@@ -1083,7 +1102,7 @@ describe('extension integration', () => {
     });
     // the engagement wizard now pops at agent_settled, which hasn't fired (a
     // retry is in flight) → no wizard, no human-open, no engagement
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
     // the retry's backoff sleep is NOT billed: agent_start has no window to close
     await vi.advanceTimersByTimeAsync(60_000); // a full minute of backoff
@@ -1148,7 +1167,7 @@ describe('extension integration', () => {
       messages: [{ role: 'assistant', stopReason: 'error' }],
     }); // final exhaustion — no retry left
     fixture.run('agent_settled', { type: 'agent_settled' }); // the storm has settled
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // engagement prompt re-offered
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // engagement prompt re-offered
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // still engagement-gated
   });
 
@@ -1162,14 +1181,14 @@ describe('extension integration', () => {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'stop' }],
     }); // a follow-up is queued → not settled
-    expect(fixture.customSpy).not.toHaveBeenCalled(); // no spurious pop during the continuation
+    expect(fixture.wizardSpy).not.toHaveBeenCalled(); // no spurious pop during the continuation
     fixture.run('agent_start', { type: 'agent_start' }); // the follow-up run auto-starts
     fixture.run('agent_end', {
       type: 'agent_end',
       messages: [{ role: 'assistant', stopReason: 'stop' }],
     }); // follow-up done; nothing left
     fixture.run('agent_settled', { type: 'agent_settled' }); // now settled
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // pops exactly once, at settle
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // pops exactly once, at settle
   });
 
   it('pops the wizard for a normal (stop) turn at agent_settled; a keystroke then engages the window', async () => {
@@ -1179,7 +1198,7 @@ describe('extension integration', () => {
       messages: [{ role: 'assistant', stopReason: 'stop' }],
     });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops (engagement prompt)
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // wizard pops (engagement prompt)
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no window until engaged
     fixture.sendEditorKey('k'); // engage → opens the idle window
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
@@ -1192,7 +1211,7 @@ describe('extension integration', () => {
       messages: [{ role: 'assistant', stopReason: 'aborted' }],
     });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops (not a retry in flight)
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // wizard pops (not a retry in flight)
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no window until engaged
     fixture.sendEditorKey('k');
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
@@ -1202,19 +1221,18 @@ describe('extension integration', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // wizard pops
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // wizard pops
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
     fixture.sendEditorKey('k');
     expect(fixture.lastSidecarEvent('human-open')).toBeDefined();
   });
 
-  it('bills 0 for engaged idle after the wizard is dismissed (no credit)', async () => {
+  it('bills 0 for engaged idle after the wizard is answered "stop" (no credit)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.setCustomResult('stop');
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
-    fixture.run('agent_settled', { type: 'agent_settled' }); // wizard pops, dismissed ('stop' → no engagement)
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard
+    fixture.run('agent_settled', { type: 'agent_settled' }); // wizard pops → stop billing
+    fixture.pressWizardShortcut('stop');
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     fixture.sendEditorKey('k'); // engage the idle window at onset (no credit → cap 0)
     await vi.advanceTimersByTimeAsync(90_000); // 90s engaged idle, no credit
     fixture.run('agent_start', { type: 'agent_start' }); // commit
@@ -1225,10 +1243,10 @@ describe('extension integration', () => {
   });
 
   it('extends the budget when the wizard is accepted', async () => {
-    fixture.setCustomResult('extend');
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
-    fixture.run('agent_settled', { type: 'agent_settled' }); // wizard pops immediately, accepted → +20m, engages, re-armed at 20m
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    fixture.run('agent_settled', { type: 'agent_settled' }); // pops → shortcut-extended (+20m, engages, re-armed at 20m)
+    fixture.pressWizardShortcut('extend');
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(360_000); // 6m idle, under 20m budget → re-armed wizard not fired
     fixture.run('agent_start', { type: 'agent_start' });
 
@@ -1240,14 +1258,15 @@ describe('extension integration', () => {
 
   it('bills the thinking span for extend + extend + extend + type-and-go (the nuance pattern)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.setCustomResult('extend'); // every wizard pop → extend (engages + grants capacity)
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → 1st pop → engage + +20m
-    await vi.advanceTimersByTimeAsync(0); // flush the 1st extend → openIdleWindow('extension', 20m), cap 20m
+    fixture.pressWizardShortcut('extend'); // openIdleWindow('extension', 20m), cap 20m
     // idle to the first exhaustion (20m credit) → 2nd pop → +20m (cap 40m)
     await vi.advanceTimersByTimeAsync(20 * 60_000);
+    fixture.pressWizardShortcut('extend');
     // idle to the next exhaustion (another 20m) → 3rd pop → +20m (cap 60m)
     await vi.advanceTimersByTimeAsync(20 * 60_000);
+    fixture.pressWizardShortcut('extend');
     // 10m more thinking (under the 60m cap), then type and go (submit → agent_start commits)
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     fixture.run('agent_start', { type: 'agent_start' });
@@ -1274,11 +1293,11 @@ describe('extension integration', () => {
 
   it('suppresses the wizard at the next agent_settled while rolling extension credit remains', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.setCustomResult('extend');
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // pops → +20m, engages via extension
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(120_000); // 2m idle (under 20m cap); flushes the extend
+    fixture.pressWizardShortcut('extend');
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(120_000); // 2m idle (under 20m cap)
     fixture.run('agent_start', { type: 'agent_start' }); // commit: 2m billed, 2m ext consumed → 18m left
 
     const seg1 = lastEntry(fixture, 'ledger-human');
@@ -1286,10 +1305,10 @@ describe('extension integration', () => {
     expect(seg1.extensionBudgetMs).toBe(18 * 60_000);
 
     // next settle: 18m credit remains → wizard is NOT shown (no pop, no auto-open)
-    fixture.customSpy.mockClear();
+    fixture.wizardSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     // the idle window opens only on engagement; engage via keystroke → cap = 18m credit
     fixture.sendEditorKey('k');
     const open = fixture.lastSidecarEvent('human-open');
@@ -1299,27 +1318,27 @@ describe('extension integration', () => {
 
   it('rolls unused extension credit across multiple agent turns', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.setCustomResult('extend');
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // pops → +20m, engages via extension
-    await vi.advanceTimersByTimeAsync(120_000); // 2m idle (flushes the extend)
+    fixture.pressWizardShortcut('extend');
+    await vi.advanceTimersByTimeAsync(120_000); // 2m idle
     fixture.run('agent_start', { type: 'agent_start' }); // commit → 2m billed, 2m consumed → 18m left
 
     // turn 2: 18m credit remains → no pop at agent_settled; engage via keystroke
-    fixture.customSpy.mockClear();
+    fixture.wizardSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     fixture.sendEditorKey('k'); // engage the new window (cap = 18m credit)
     await vi.advanceTimersByTimeAsync(120_000); // 2m idle
     fixture.run('agent_start', { type: 'agent_start' }); // commit → 2m consumed → 16m left
     expect(lastEntry(fixture, 'ledger-human').extensionBudgetMs).toBe(16 * 60_000);
 
     // turn 3: still 16m credit → still suppressed
-    fixture.customSpy.mockClear();
+    fixture.wizardSpy.mockClear();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
   });
 
   it('pops the wizard at agent_settled when no rolling credit remains', async () => {
@@ -1327,13 +1346,13 @@ describe('extension integration', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate settings; no pop (startup)
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // no credit → pop immediately
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // no credit → pop immediately
   });
 
   it('grants a 1m resume grace instead of popping the wizard (the pop lands at the grace boundary)', async () => {
     fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // resume → grace, no immediate pop
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     const grace = fixture.lastSidecarEvent('human-open');
     expect(grace).toBeDefined();
     expect(grace!.engagedVia).toBe('grace');
@@ -1341,18 +1360,18 @@ describe('extension integration', () => {
     expect(grace!.extensionBudgetMs).toBe(60_000);
 
     await vi.advanceTimersByTimeAsync(60_000); // grace exhausted, human idle → pop
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // dismiss before exercising the next session reason
 
-    fixture.customSpy.mockClear();
+    fixture.wizardSpy.mockClear();
     fixture.run('session_start', { type: 'session_start', reason: 'reload' }); // grace credit remains → resume prompt, no second grace
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     const opens = fixture.readSidecarEvents().filter((e) => e.kind === 'human-open');
     expect(opens).toHaveLength(1); // still just the original grace window
 
-    fixture.customSpy.mockClear();
+    fixture.wizardSpy.mockClear();
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // startup → no grace, no pop
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
   });
 
   it('pops the wizard immediately on /resume when the resume grace is disabled (0)', async () => {
@@ -1360,7 +1379,7 @@ describe('extension integration', () => {
       { kind: 'settings', settings: { ...DEFAULTS, resumeGraceMinutes: 0 }, timestamp: 0 },
     ]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // resume → pop (no grace)
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no grace window
   });
 
@@ -1383,7 +1402,7 @@ describe('extension integration', () => {
     fixture.seedSidecar([{ kind: 'settings', settings: { ...DEFAULTS }, timestamp: 0 }]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     await vi.advanceTimersByTimeAsync(90_000); // 90s review: at 60s the exhausted grace pops the wizard (idle)
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // dismiss (no extension)
     fixture.run('agent_start', { type: 'agent_start' }); // commit
     const close = fixture.lastSidecarEvent('human-close');
@@ -1409,7 +1428,7 @@ describe('extension integration', () => {
     ]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // no grace credit
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // the resume prompt still pops (unchanged)
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // the resume prompt still pops (unchanged)
   });
 
   it('skips the grace when rolling credit remains — engaged review bills against it as before', async () => {
@@ -1428,7 +1447,7 @@ describe('extension integration', () => {
       { kind: 'settings', settings: { ...DEFAULTS, resumeGraceMinutes: 2 }, timestamp: 0 },
     ]);
     fixture.run('session_start', { type: 'session_start', reason: 'reload' });
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     const grace = fixture.lastSidecarEvent('human-open');
     expect(grace!.engagedVia).toBe('grace');
     expect(grace!.grantedBudgetMs).toBe(2 * 60_000);
@@ -1466,7 +1485,7 @@ describe('extension integration', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate 18m credit; no pop
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).not.toHaveBeenCalled(); // 18m credit → suppressed
+    expect(fixture.wizardSpy).not.toHaveBeenCalled(); // 18m credit → suppressed
     fixture.sendEditorKey('k'); // engage → open window with cap = 18m credit
     const open = fixture.lastSidecarEvent('human-open');
     expect(open!.grantedBudgetMs).toBe(18 * 60_000); // 18m credit
@@ -1477,14 +1496,14 @@ describe('extension integration', () => {
     fixture.seedSidecar([
       { kind: 'settings', settings: { ...DEFAULTS, autoWizard: false }, timestamp: 0 },
     ]);
-    fixture.setCustomResult('extend');
     fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // apply autoWizard: false
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // autoWizard off → no auto-pop
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
 
-    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // opens the wizard → confirm → +5m
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // opens the wizard
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+    fixture.pressWizardShortcut('extend'); // confirm → +5m
 
     await vi.advanceTimersByTimeAsync(100_000); // 100s idle, under 5m budget
     fixture.run('agent_start', { type: 'agent_start' });
@@ -1497,29 +1516,38 @@ describe('extension integration', () => {
 
   it('/ledger-extend opens the wizard with no window open (engage via extension)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.setCustomResult('extend');
-    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // no window → wizard → extend engages
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(0); // flush the extend → openIdleWindow('extension', 5m)
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // no window → wizard pops
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+    fixture.pressWizardShortcut('extend'); // extend engages → openIdleWindow('extension', 5m)
     const open = fixture.lastSidecarEvent('human-open');
     expect(open).toBeDefined();
     expect(open!.engagedVia).toBe('extension');
     expect(open!.grantedBudgetMs).toBe(5 * 60_000); // 5m credit
   });
 
-  it('shows a `select` dialog (not the TUI custom wizard) in RPC mode at agent_settled', async () => {
+  it('shows the docked widget box plus the `select` dialog in RPC mode at agent_settled', async () => {
     (fixture.mockCtx as unknown as { mode: string }).mode = 'rpc';
     fixture.setSelectResult('Extend +20m');
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // no credit -> RPC select pops
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    // The same docked box goes over the wire as plain string lines, and the
+    // select dialog still round-trips so the GUI can capture the choice.
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+    const [, lines] = fixture.widgetSpy.mock.calls.find(([, l]) => l !== undefined)! as [
+      string,
+      unknown,
+    ];
+    expect(Array.isArray(lines)).toBe(true);
+    expect((lines as string[]).some((l) => l.includes('▶ Extend +20m'))).toBe(true);
     expect(fixture.selectSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // flush the select resolve -> applyWizardChoice('extend')
     const open = fixture.lastSidecarEvent('human-open');
     expect(open).toBeDefined();
     expect(open!.engagedVia).toBe('extension');
     expect(open!.grantedBudgetMs).toBe(20 * 60_000); // +20m block
+    // answering the dialog clears the widget
+    expect(fixture.widgetSpy.mock.calls.at(-1)).toEqual(['pi-ledger-wizard', undefined]);
   });
 
   it('auto-extends a pomodoro block silently (no dialog) when credit runs out', async () => {
@@ -1529,7 +1557,7 @@ describe('extension integration', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' }); // rehydrate autoExtend; no pop
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // no credit -> auto-extend (no pop)
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     expect(fixture.selectSpy).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(0); // flush
     const open = fixture.lastSidecarEvent('human-open');
@@ -1550,7 +1578,7 @@ describe('extension integration', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     const open = fixture.lastSidecarEvent('human-open');
     expect(open).toBeDefined();
     expect(open!.grantedBudgetMs).toBe(20 * 60_000);
@@ -1564,7 +1592,9 @@ describe('extension integration', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     fixture.setSelectResult('Stop billing');
     await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    // the box also goes over the RPC wire as plain lines; the choice still
+    // rides the select dialog round-trip
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     expect(fixture.selectSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // flush -> applyWizardChoice('stop')
     const pause = fixture.lastSidecarEvent('billing-pause');
@@ -1578,7 +1608,7 @@ describe('extension integration', () => {
     fixture.setSelectResult('Agent rate: 60');
     fixture.setInputResult('120');
     await fixture.commands['ledger-settings'].handler('', fixture.mockCtx);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     expect(fixture.selectSpy).toHaveBeenCalledTimes(1);
     expect(fixture.inputSpy).toHaveBeenCalledTimes(1);
     const settingsEvt = fixture.lastSidecarEvent('settings');
@@ -1678,10 +1708,9 @@ describe('extension integration', () => {
 
   it('counts the in-progress open human window in /ledger (entire session up to now)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.setCustomResult('extend');
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → wizard → extend +20m (engages)
-    await vi.advanceTimersByTimeAsync(0); // flush the extend → open window, cap 20m
+    fixture.pressWizardShortcut('extend');
     await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window still open (uncommitted)
     await fixture.commands['ledger'].handler('', fixture.mockCtx);
     const msg = fixture.notifySpy.mock.calls.at(-1)![0] as string;
@@ -1896,10 +1925,9 @@ describe('extension integration', () => {
 
   it('session_tree keeps the open human window idle (the growing-idle case)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.setCustomResult('extend');
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → wizard → extend +20m (engages)
-    await vi.advanceTimersByTimeAsync(0); // flush the extend → open window, cap 20m
+    fixture.pressWizardShortcut('extend');
     await vi.advanceTimersByTimeAsync(30_000); // 30s idle, window open
     fixture.run('session_tree', { type: 'session_tree' }); // /tree → "go back"
     // status keeps the open window's idle — not reset to $0
@@ -1922,7 +1950,7 @@ describe('extension integration', () => {
   it('engages an initial human window on first keystroke; with no credit it bills 0 (no wizard at startup)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     // no window opens at session_start — engagement is gated on the first keystroke
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
     fixture.sendEditorKey('k'); // first keystroke ENGAGES the initial window at onset
     const open = fixture.lastSidecarEvent('human-open');
@@ -1971,10 +1999,9 @@ describe('extension integration', () => {
 
   it('records 0 idle keystrokes when the window engaged via extension (no typing)', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    fixture.setCustomResult('extend');
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // pop → extend engages (no keystroke)
-    await vi.advanceTimersByTimeAsync(0); // flush the extend → openIdleWindow('extension')
+    fixture.pressWizardShortcut('extend'); // openIdleWindow('extension')
     await vi.advanceTimersByTimeAsync(10_000); // idle, no typing
     fixture.run('agent_start', { type: 'agent_start' }); // commit
 
@@ -2057,15 +2084,15 @@ describe('extension integration', () => {
     expect(open!.grantedBudgetMs).toBe(18 * 60_000);
     expect(open!.extensionBudgetMs).toBe(18 * 60_000);
     // silent — the wizard never auto-pops at startup
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
   });
 
   it('/ledger-extend extends the initial window before the first prompt is submitted', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    expect(fixture.customSpy).not.toHaveBeenCalled(); // initial window is silent
-    fixture.setCustomResult('extend');
-    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // manually provision +5m
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).not.toHaveBeenCalled(); // initial window is silent
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // pops the wizard
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+    fixture.pressWizardShortcut('extend'); // manually provision +5m
     await vi.advanceTimersByTimeAsync(4 * 60_000); // 4m composing (under the 5m cap)
     fixture.run('agent_start', { type: 'agent_start' });
 
@@ -2077,12 +2104,12 @@ describe('extension integration', () => {
 
   it('the silent initial window does not suppress the wizard at the following agent_settled', async () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
-    expect(fixture.customSpy).not.toHaveBeenCalled(); // initial window silent
+    expect(fixture.wizardSpy).not.toHaveBeenCalled(); // initial window silent
     fixture.run('agent_start', { type: 'agent_start' }); // first prompt → close initial (~0 billed)
     fixture.run('agent_end', { type: 'agent_end', messages: [] }); // per-run cleanup; no pop
     fixture.run('agent_settled', { type: 'agent_settled' }); // post-turn window → wizard pops
     // the wizard pops at agent_settled (where it belongs), not at session_start
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2652,12 +2679,15 @@ describe('skip-billing guard (choosing "Stop billing" blocks agent messages)', (
     fs.rmSync(configDir, { recursive: true, force: true });
   });
 
-  /** Pop the engagement wizard (agent_settled, no credit) and flush the choice. */
+  /** Pop the engagement wizard (agent_settled, no credit) and answer it:
+   *  extend/stop via the wizard shortcuts, dismiss via typing (any key steps
+   *  the docked box aside — typing IS the engagement signal). */
   async function chooseWizard(choice: 'stop' | 'extend' | 'dismiss') {
-    fixture.setCustomResult(choice);
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
-    await vi.advanceTimersByTimeAsync(0); // flush the wizard .then
+    if (choice === 'dismiss') fixture.sendEditorKey('k');
+    else fixture.pressWizardShortcut(choice);
+    await vi.advanceTimersByTimeAsync(0);
   }
 
   it('choosing "Stop billing" blocks interactive prompts to the agent', async () => {
@@ -2708,9 +2738,9 @@ describe('skip-billing guard (choosing "Stop billing" blocks agent messages)', (
     await chooseWizard('stop'); // pause
     expect(fixture.run('input', plainInput())).toEqual({ action: 'handled' });
 
-    fixture.setCustomResult('extend');
-    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx);
-    await vi.advanceTimersByTimeAsync(0); // flush the extend → clears pause + grants 5m
+    await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx); // pops the wizard
+    fixture.pressWizardShortcut('extend'); // clears pause + grants 5m
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(fixture.lastSidecarEvent('billing-pause')!.paused).toBe(false);
     expect(fixture.run('input', plainInput())).toBeUndefined(); // unblocked
@@ -2728,9 +2758,9 @@ describe('skip-billing guard (choosing "Stop billing" blocks agent messages)', (
     ]);
     fixture.run('session_start', { type: 'session_start', reason: 'resume' }); // autoWizard off → no pop
     // pause via /ledger-extend → "Stop" (the wizard opens regardless of autoWizard)
-    fixture.setCustomResult('stop');
     await fixture.commands['ledger-extend'].handler('5', fixture.mockCtx);
-    await vi.advanceTimersByTimeAsync(0); // flush → pause (billing-pause: true)
+    fixture.pressWizardShortcut('stop'); // pause (billing-pause: true)
+    await vi.advanceTimersByTimeAsync(0);
     expect(fixture.run('input', plainInput())).toEqual({ action: 'handled' });
 
     // reload: rehydrate restores the pause from the sidecar; autoWizard off → no re-pop
@@ -2798,9 +2828,9 @@ describe('pi-retry capture (wizard gating)', () => {
   it('pops the wizard at agent_settled when no pi-retry is active', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     fixture.run('agent_settled', { type: 'agent_settled' });
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // no credit → pop
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // no credit → pop
   });
 
   it('defers the wizard while a pi-retry is in flight; pops on completed', () => {
@@ -2809,9 +2839,9 @@ describe('pi-retry capture (wizard gating)', () => {
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.emitEvent(STARTED, { retryId: 1 });
     fixture.run('agent_settled', { type: 'agent_settled' }); // retry in flight → defer
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     fixture.emitEvent(COMPLETED, { retryId: 1 }); // retry settled → pop the deferred prompt
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined(); // still engagement-gated
   });
 
@@ -2826,9 +2856,9 @@ describe('pi-retry capture (wizard gating)', () => {
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     // retry completes BEFORE the run settles → pending was cleared by agent_start → no pop
     fixture.emitEvent(COMPLETED, { retryId: 2 });
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     fixture.run('agent_settled', { type: 'agent_settled' }); // now settled, no retry active → pop
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('never pops when a pi-retry is cancelled', () => {
@@ -2837,9 +2867,9 @@ describe('pi-retry capture (wizard gating)', () => {
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.emitEvent(STARTED, { retryId: 3 });
     fixture.run('agent_settled', { type: 'agent_settled' }); // retry in flight → defer
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     fixture.emitEvent(CANCELLED, { retryId: 3 }); // abort/session-change → drop the prompt
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
   });
 
   it('ignores a completed event that does not match the active retry', () => {
@@ -2849,15 +2879,15 @@ describe('pi-retry capture (wizard gating)', () => {
     fixture.emitEvent(STARTED, { retryId: 4 });
     fixture.run('agent_settled', { type: 'agent_settled' }); // defer (active id 4)
     fixture.emitEvent(COMPLETED, { retryId: 999 }); // stray → ignored
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     fixture.emitEvent(COMPLETED, { retryId: 4 }); // matching → pop
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('treats a completed with no prior started as a no-op', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.emitEvent(COMPLETED, { retryId: 7 }); // no retry active → stray event
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
   });
 
   it('defers auto-extend too while a pi-retry is in flight; extends on completed', () => {
@@ -2922,11 +2952,11 @@ describe('presence-gated wizard (idle-gated prompts, engaged silent roll)', () =
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
     // mid-flow → the prompt defers instead of interrupting
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(30_000); // 30s hands-off, still inside the window
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(60_000); // 90s idle total → true idleness → pop
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     // the pop prompts engagement; nothing was granted or engaged silently
     expect(fixture.lastSidecarEvent('human-open')).toBeUndefined();
   });
@@ -2940,9 +2970,9 @@ describe('presence-gated wizard (idle-gated prompts, engaged silent roll)', () =
     await vi.advanceTimersByTimeAsync(60_000); // t0+60s
     fixture.sendEditorKey('k'); // still composing → the deadline slides
     await vi.advanceTimersByTimeAsync(60_000); // 120s since settle, only 60s since the key
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(30_000); // 90s idle now → pop
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('a new run disarms the deferred pop; the next settle re-evaluates', async () => {
@@ -2953,10 +2983,10 @@ describe('presence-gated wizard (idle-gated prompts, engaged silent roll)', () =
     fixture.run('agent_settled', { type: 'agent_settled' }); // deferred
     fixture.run('agent_start', { type: 'agent_start' }); // the human submitted → run supersedes
     await vi.advanceTimersByTimeAsync(PRESENCE * 2); // the deferred pop was disarmed
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // presence is stale now → pop
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('deferred silence never grants credit — the first credit is always an explicit extend', async () => {
@@ -2966,7 +2996,7 @@ describe('presence-gated wizard (idle-gated prompts, engaged silent roll)', () =
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' });
     await vi.advanceTimersByTimeAsync(PRESENCE * 2); // the pop fired (dismissed by default)
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(0); // flush the dismissed wizard
     // silence granted nothing: no window, no credit, no extension blocks
     expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-open')).toHaveLength(0);
@@ -2976,16 +3006,15 @@ describe('presence-gated wizard (idle-gated prompts, engaged silent roll)', () =
   });
 
   it('rolls a block silently when the exhaustion boundary lands mid-typing; pops on true idleness', async () => {
-    fixture.setCustomResult('extend');
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_end', { type: 'agent_end', messages: [] });
     fixture.run('agent_settled', { type: 'agent_settled' }); // no activity → consent pop now
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(0); // flush extend → 20m window, boundary at +20m
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+    fixture.pressWizardShortcut('extend'); // 20m window, boundary at +20m
     await vi.advanceTimersByTimeAsync(19 * 60_000); // 19m in — 1m before the boundary
     fixture.sendEditorKey('k'); // mid-flow typing
     await vi.advanceTimersByTimeAsync(60_000); // the boundary fires exactly here
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1); // NO pop — silent roll instead
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1); // NO pop — silent roll instead
     expect(
       fixture.notifySpy.mock.calls.some(
         (c) => typeof c[0] === 'string' && c[0].includes('Auto-extended')
@@ -2994,9 +3023,9 @@ describe('presence-gated wizard (idle-gated prompts, engaged silent roll)', () =
     const open = fixture.lastSidecarEvent('human-open');
     expect(open!.grantedBudgetMs).toBe(40 * 60_000); // +20m rolled onto the open window
     // the roll re-armed a boundary at +40m; presence is 21m stale there → idle pop
-    fixture.customSpy.mockClear();
+    fixture.wizardSpy.mockClear();
     await vi.advanceTimersByTimeAsync(21 * 60_000);
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('a held key refreshes presence once (auto-repeat collapse) — it cannot hold the wizard off', async () => {
@@ -3011,6 +3040,6 @@ describe('presence-gated wizard (idle-gated prompts, engaged silent roll)', () =
     fixture.run('agent_settled', { type: 'agent_settled' }); // deferral armed: idleFor ≈ 1s
     // 90s after the KEYDOWN (not after the last collapsed repeat) the pop fires.
     await vi.advanceTimersByTimeAsync(89_500); // > 90s since the keydown, < 90s since the hold ended
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 });

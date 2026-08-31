@@ -60,8 +60,14 @@ export interface TestFixture {
   inputSpy: ReturnType<typeof vi.fn>;
   registerCommandSpy: ReturnType<typeof vi.fn>;
   setEditorComponentSpy: ReturnType<typeof vi.fn>;
+  /** Every ctx.ui.setWidget call: (widgetKey, lines-or-undefined). */
+  widgetSpy: ReturnType<typeof vi.fn>;
+  /** Wizard "pops" only: setWidget calls that install prompt lines (not clears). */
+  wizardSpy: ReturnType<typeof vi.fn>;
   /** Send a keystroke into the editor wrapper installed via setEditorComponent. */
   sendEditorKey: (data: string) => void;
+  /** Fire a registered wizard shortcut ('extend' | 'stop') as the TUI would. */
+  pressWizardShortcut: (choice: 'extend' | 'stop') => void;
   emitEvent: (event: string, payload: unknown) => void;
   /** Invoke a lifecycle handler registered via pi.on(name, fn) with (event, ctx). */
   run: (name: string, event: unknown) => void;
@@ -131,6 +137,12 @@ export function createTestFixture(): TestFixture {
   const customSpy = vi.fn();
   const selectSpy = vi.fn();
   const inputSpy = vi.fn();
+  // ctx.ui.setWidget: the wizard's docked prompt (and its clears).
+  const widgetSpy = vi.fn();
+  // Pops only — setWidget calls that install prompt lines, not clears — so
+  // assertions like toHaveBeenCalledTimes(1) keep meaning "the wizard popped".
+  const wizardSpy = vi.fn();
+  const shortcuts: Record<string, { handler: (ctx?: unknown) => unknown }> = {};
   const registerCommandSpy = vi.fn((name: string, options: unknown) => {
     commands[name] = options as TestFixture['commands'][string];
   });
@@ -171,6 +183,7 @@ export function createTestFixture(): TestFixture {
       custom: customSpy,
       select: selectSpy,
       input: inputSpy,
+      setWidget: widgetSpy,
       setEditorComponent: setEditorComponentSpy,
     },
     sessionManager: {
@@ -213,6 +226,10 @@ export function createTestFixture(): TestFixture {
     }) as unknown as ExtensionAPI['on'],
     appendEntry: appendEntrySpy,
     registerCommand: registerCommandSpy as unknown as ExtensionAPI['registerCommand'],
+    registerShortcut: vi.fn((key: string, options: { handler: (ctx?: unknown) => unknown }) => {
+      shortcuts[key] = options;
+      return mockPi as ExtensionAPI;
+    }) as unknown as ExtensionAPI['registerShortcut'],
     events: {
       on: vi.fn((event: string, listener: (payload: unknown) => void) => {
         const list = eventListeners.get(event) ?? [];
@@ -229,6 +246,20 @@ export function createTestFixture(): TestFixture {
   customSpy.mockImplementation(() => Promise.resolve(customResult));
   selectSpy.mockImplementation(() => Promise.resolve(selectResult));
   inputSpy.mockImplementation(() => Promise.resolve(inputResult));
+  // ctx.ui.setWidget: forward every call to widgetSpy; wizardSpy records only
+  // the calls that install prompt lines (a clear passes undefined), so pop
+  // assertions keep their old customSpy semantics.
+  widgetSpy.mockImplementation((_key: string, lines: unknown) => {
+    if (lines !== undefined) wizardSpy(_key, lines);
+  });
+  // Fire a wizard shortcut the way pi's CustomEditor dispatches extension
+  // shortcuts (synchronously, before the editor sees the key).
+  const pressWizardShortcut = (choice: 'extend' | 'stop') => {
+    const key = choice === 'extend' ? 'ctrl+e' : 'ctrl+w';
+    const shortcut = shortcuts[key];
+    if (!shortcut) throw new Error(`wizard shortcut ${key} not registered`);
+    void shortcut.handler();
+  };
 
   const sidecarFile = () => sidecarPathFor(TEST_SESSION_ID);
   const seedSidecar = (events: SidecarEvent[]) => {
@@ -277,7 +308,10 @@ export function createTestFixture(): TestFixture {
     inputSpy,
     registerCommandSpy,
     setEditorComponentSpy,
+    widgetSpy,
+    wizardSpy,
     sendEditorKey,
+    pressWizardShortcut,
     emitEvent,
     run,
     setCustomResult,

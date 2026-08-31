@@ -63,24 +63,16 @@ import type {
   KeybindingsManager,
   Theme,
 } from '@earendil-works/pi-coding-agent';
-import {
-  CustomEditor,
-  DynamicBorder,
-  getSelectListTheme,
-  getSettingsListTheme,
-} from '@earendil-works/pi-coding-agent';
+import { CustomEditor, DynamicBorder, getSettingsListTheme } from '@earendil-works/pi-coding-agent';
 import {
   Container,
   Input,
   isKeyRelease,
-  SelectList,
   SettingsList,
-  Spacer,
   Text,
   truncateToWidth,
   visibleWidth,
   type EditorTheme,
-  type SelectItem,
   type SettingItem,
   type TUI,
 } from '@earendil-works/pi-tui';
@@ -90,6 +82,21 @@ import { installNestedAgentTelemetryHarvester } from './nested-agent-telemetry.j
 
 /** Event emitted by @monotykamary/pi-tps after each turn with per-turn telemetry (optional). */
 const TPS_TELEMETRY_EVENT = 'tps:telemetry';
+
+// Engagement wizard widget: a docked prompt box above the editor (setWidget)
+// instead of a modal popup. The box is rendered in every UI mode — the TUI via
+// a themed component, RPC/GUI clients via plain string lines (component
+// factories are ignored on the extension_ui wire; only string[] round-trip).
+const WIZARD_WIDGET_KEY = 'pi-ledger-wizard';
+const WIZARD_EXTEND_KEY = 'ctrl+e';
+const WIZARD_STOP_KEY = 'ctrl+w';
+// Raw terminal bytes for the wizard shortcut keys. While the box is showing,
+// noteKeystroke ignores these so the editor's extension-shortcut hook (checked
+// first inside CustomEditor.handleInput) owns them; every OTHER key dismisses
+// the box (typing = engagement). ctrl+e/ctrl+w are unbound in pi's default
+// keybinding map (ctrl+s collides with app.session.toggleSort).
+const WIZARD_EXTEND_DATA = '\x05';
+const WIZARD_STOP_DATA = '\x17';
 
 /** Custom entry type written by @monotykamary/pi-tps into the session JSONL. */
 const TPS_CUSTOM_TYPE = 'tps';
@@ -609,25 +616,6 @@ export function fmtHours(ms: number): string {
 export function fmtMoney(amount: number, currency: string): string {
   const sym = CURRENCY_SYMBOL[currency] ?? '';
   return `${sym}${amount.toFixed(2)}`;
-}
-
-export function frameOverlayLines(
-  lines: string[],
-  width: number,
-  styleBorder: (border: string) => string
-): string[] {
-  if (width < 2) return [styleBorder('│')];
-  const innerWidth = width - 2;
-  const side = styleBorder('│');
-  const content = lines.map((line) => {
-    const clipped = truncateToWidth(line, innerWidth, '');
-    return `${side}${clipped}${' '.repeat(innerWidth - visibleWidth(clipped))}${side}`;
-  });
-  return [
-    styleBorder(`┌${'─'.repeat(innerWidth)}┐`),
-    ...content,
-    styleBorder(`└${'─'.repeat(innerWidth)}┘`),
-  ];
 }
 
 function fmtRate(rate: number): string {
@@ -1541,10 +1529,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   let idleKeystrokes = 0;
 
   let wizardTimer: ReturnType<typeof setTimeout> | null = null;
-  // A rendered dialog outlives the timer that opened it. Keep the TUI/RPC
+  // The docked wizard widget outlives the timer that opened it. Keep the TUI/RPC
   // prompt single-flight so overlapping lifecycle, retry, and command triggers
-  // cannot replace it while its unresolved promise remains alive.
+  // cannot replace it while it waits for an answer.
   let wizardOpen = false;
+  // TUI answer path: set while the widget shows, fired by the wizard shortcuts
+  // (ctrl+e / ctrl+w). RPC answers arrive through the select() dialog instead.
+  let wizardResolve: ((choice: 'extend' | 'stop' | 'dismiss') => void) | null = null;
 
   // Deferred no-credit engagement prompt: armed at settle/resume, pops only
   // once the human has been hands-off for ENGAGED_ACTIVITY_MS; further typing
@@ -2040,6 +2031,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     lastKeyTime = now;
     if (autoRepeat) return;
     lastGenuineActivityAt = now; // genuine typing = presence; held keys don't refresh it
+    // A docked wizard prompt steps aside on typing: presence is the engagement
+    // signal, and the next settle re-evaluates (and re-pops) on its own. The
+    // wizard's own shortcut keys are skipped — they reach the extension
+    // shortcut hook via CustomEditor right after this, and consuming them here
+    // would answer the prompt with a phantom keystroke instead.
+    if (wizardOpen && !isKeyRelease(data)) {
+      if (data === WIZARD_EXTEND_DATA || data === WIZARD_STOP_DATA) return;
+      closeWizardPrompt(lastCtx);
+    }
     if (agentRunning) {
       steerStaging.push(now);
     } else if (lastCtx) {
@@ -2224,8 +2224,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *  none is open. Shared by the wizard's "Extend" choice and `autoExtend` —
    *  both provision a rolling pomodoro block (credit survives across turns). */
   function extendHumanTime(ctx: ExtensionContext, mins: number) {
-    // Credit granted — a pending (deferred) engagement prompt is moot.
+    // Credit granted — a pending (deferred) engagement prompt is moot, and a
+    // docked wizard prompt is answered (its box steps aside).
     clearConsentTimer();
+    closeWizardPrompt(ctx);
     // Extending resumes billing: clear the skip-billing guard so agent messages
     // reach the model again (the documented way to resume after "Stop billing").
     if (billingPaused) {
@@ -2344,8 +2346,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *  is always an explicit extend, so an actively-typing session stays at a $0
    *  billing cap until consent. With `autoExtend`, skip the prompt and
    *  provision a block silently (any mode, including headless); otherwise
-   *  prompt only where a dialog can show (TUI custom render, or an RPC
-   *  `select` dialog for GUI clients). */
+   *  prompt only where the docked widget can show (TUI component, or an RPC
+   *  client that speaks the extension_ui wire; the choice rides the wizard
+   *  shortcuts in the TUI and the `select` dialog round-trip in RPC). */
   function armEngagementPrompt(ctx: ExtensionContext) {
     clearWizardTimer();
     clearConsentTimer();
@@ -2363,6 +2366,78 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     consentTimer = setTimeout(() => armEngagementPrompt(ctx), ENGAGED_ACTIVITY_MS - idleFor);
   }
 
+  /** Close the docked wizard prompt: clear the widget and drop the answer
+   *  path. Every closer funnels here so wizardOpen stays truthful. */
+  function closeWizardPrompt(ctx: ExtensionContext | null) {
+    wizardResolve = null;
+    if (!wizardOpen) return;
+    wizardOpen = false;
+    if (ctx?.hasUI) ctx.ui.setWidget(WIZARD_WIDGET_KEY, undefined);
+  }
+
+  /** Render the wizard prompt as a queue-steer-style docked box. Pure, so the
+   *  themed TUI component and the plain RPC string[] widget stay in sync.
+   *  Every row is fitted to the box width; `color` re-inks rows for the TUI. */
+  function wizardBoxLines(
+    width: number,
+    opts: { pomodoro: number; remainingProvisioned: number },
+    color?: {
+      border: (s: string) => string;
+      accent: (s: string) => string;
+      muted: (s: string) => string;
+      dim: (s: string) => string;
+    }
+  ): string[] {
+    const c = color ?? {
+      border: (s: string) => s,
+      accent: (s: string) => s,
+      muted: (s: string) => s,
+      dim: (s: string) => s,
+    };
+    const fit = (s: string, w: number) =>
+      truncateToWidth(s, w) + ' '.repeat(Math.max(0, w - visibleWidth(s)));
+    const title = ` pi-ledger · extend? · ${opts.pomodoro}m pomodoro `;
+    const topFill = '─'.repeat(Math.max(0, width - visibleWidth(title) - 2));
+    const cell = Math.max(1, width - 4);
+    const rows: string[] = [];
+    rows.push(c.border(`┌${title}${topFill}┐`));
+    rows.push(
+      `│ ${fit(`${c.accent(`▶ Extend +${opts.pomodoro}m`)}${c.muted(' · add a pomodoro to billable human time')}`, cell)} │`
+    );
+    rows.push(`│ ${fit(c.muted('○ Stop billing · pause the agent until /ledger-extend'), cell)} │`);
+    if (opts.remainingProvisioned > 0) {
+      rows.push(
+        `│ ${fit(c.dim(`${Math.max(1, Math.round(opts.remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more`), cell)} │`
+      );
+    }
+    rows.push(`│ ${fit(c.dim('ctrl+e extend · ctrl+w stop billing · any key dismisses'), cell)} │`);
+    rows.push(c.border(`└${'─'.repeat(Math.max(0, width - 2))}┘`));
+    return rows;
+  }
+
+  /** The themed TUI component behind the docked wizard widget. */
+  class WizardWidget {
+    constructor(
+      private readonly pomodoro: number,
+      private readonly remainingProvisioned: number,
+      private readonly theme: Theme
+    ) {}
+    render(width: number): string[] {
+      const t = this.theme;
+      return wizardBoxLines(
+        Math.max(width, 20),
+        { pomodoro: this.pomodoro, remainingProvisioned: this.remainingProvisioned },
+        {
+          border: (s) => t.fg('accent', s),
+          accent: (s) => t.fg('accent', s),
+          muted: (s) => t.fg('muted', s),
+          dim: (s) => t.fg('dim', s),
+        }
+      );
+    }
+    invalidate() {}
+  }
+
   function showWizard(ctx: ExtensionContext, extendMins: number = settings.pomodoroMinutes) {
     wizardTimer = null;
     if (wizardOpen) return;
@@ -2372,7 +2447,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // engagement prompt (agent_end no-credit / /resume): extend engages one.
     // Snapshot the rolling credit still provisioned (and unconsumed so far) so
     // the user knows extending ADDS to existing capacity, not replaces it.
-    // Captured before the async custom() closure — state can change.
+    // Captured before the async closure — state can change.
     const elapsedNow = humanWindow ? Math.max(0, Date.now() - humanWindow.openedAt) : 0;
     const remainingProvisioned = humanWindow
       ? Math.max(0, extensionBudgetMs - elapsedNow)
@@ -2380,15 +2455,24 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const extendLabel = `Extend +${pomodoro}m`;
     const stopLabel = 'Stop billing';
 
-    // RPC/GUI clients (and any non-TUI dialog surface) get a plain `select`
-    // dialog: the `custom` TUI component only renders in the terminal, but
-    // `select` round-trips through the extension_ui protocol, so a GUI like
-    // vscode-pi renders the same Extend/Stop choice without a TUI.
+    // The prompt is a docked widget box above the editor, not a modal popup:
+    // the editor keeps input, typing steps the box aside (noteKeystroke), and
+    // the choice is a shortcut pair (WIZARD_EXTEND_KEY / WIZARD_STOP_KEY).
+    //
+    // RPC/GUI clients additionally keep the `select` dialog: it round-trips
+    // through the extension_ui protocol and is how a GUI captures the choice
+    // (widgets are fire-and-forget there). The same box goes over the wire as
+    // plain string lines — component factories are ignored in RPC mode — so
+    // the GUI shows the docked prompt too. RPC behavior is additive: a client
+    // that ignores widgets still gets the same dialog as before.
     if (ctx.mode !== 'tui') {
       const credit =
         remainingProvisioned > 0
           ? ` · ${Math.max(1, Math.round(remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more.`
           : '';
+      if (ctx.hasUI) {
+        ctx.ui.setWidget(WIZARD_WIDGET_KEY, wizardBoxLines(64, { pomodoro, remainingProvisioned }));
+      }
       ctx.ui
         .select(
           `⏱ Extend billable human time? Idle after the agent. Add a ${pomodoro}m pomodoro block?${credit}`,
@@ -2397,102 +2481,22 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         .then((picked) => {
           const choice =
             picked === extendLabel ? 'extend' : picked === stopLabel ? 'stop' : 'dismiss';
-          applyWizardChoice(ctx, choice as 'extend' | 'stop' | 'dismiss', pomodoro);
+          applyWizardChoice(ctx, choice, pomodoro);
         })
         .finally(() => {
-          wizardOpen = false;
+          closeWizardPrompt(ctx);
         });
       return;
     }
 
-    // Keep the wizard visible above any live overlay. A temporary raw-input
-    // listener gives the wizard deterministic key ownership even if another
-    // overlay or the editor races to reclaim component focus during resume.
-    ctx.ui
-      .custom<string>(
-        (tui, theme, _kb, done) => {
-          const container = new Container();
-          container.addChild(new Spacer(1));
-          container.addChild(
-            new Text(theme.fg('accent', theme.bold('⏱  Extend billable human time?')), 1, 0)
-          );
-          container.addChild(new Spacer(1));
-          container.addChild(
-            new Text(
-              theme.fg('muted', `Idle after the agent. Add a ${pomodoro}m pomodoro block?`),
-              1,
-              0
-            )
-          );
-          // Show any rolling credit still provisioned (and unconsumed so far) so
-          // the user knows extending ADDS to existing capacity, not replaces it.
-          if (remainingProvisioned > 0) {
-            container.addChild(new Spacer(1));
-            container.addChild(
-              new Text(
-                theme.fg(
-                  'dim',
-                  `${Math.max(1, Math.round(remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more.`
-                ),
-                1,
-                0
-              )
-            );
-          }
-          container.addChild(new Spacer(1));
-          const items: SelectItem[] = [
-            {
-              value: 'extend',
-              label: `Extend +${pomodoro}m`,
-              description: 'Add a pomodoro to billable human time',
-            },
-            {
-              value: 'stop',
-              label: 'Stop billing',
-              description: 'Pause the agent until you extend via /ledger-extend',
-            },
-          ];
-          const list = new SelectList(items, 5, getSelectListTheme());
-          list.onSelect = (item) => done(item.value);
-          list.onCancel = () => done('dismiss'); // esc dismiss = no change (not "Stop billing")
-          const removeInputListener = tui.addInputListener((data) => {
-            // Raw listeners run before TUI's focused-component release filter.
-            // Ignore Kitty key-release packets or one arrow press moves twice.
-            if (isKeyRelease(data)) return { consume: true };
-            list.handleInput(data);
-            tui.requestRender();
-            return { consume: true };
-          });
-          container.addChild(list);
-          container.addChild(new Spacer(1));
-          container.addChild(
-            new Text(theme.fg('dim', '↑↓ navigate · enter select · esc dismiss'), 1, 0)
-          );
-          container.addChild(new Spacer(1));
-          return {
-            render: (w: number) =>
-              frameOverlayLines(w < 2 ? [] : container.render(w - 2), w, (border) =>
-                theme.fg('accent', border)
-              ),
-            invalidate: () => container.invalidate(),
-            handleInput: (data: string) => {
-              list.handleInput(data);
-              tui.requestRender();
-            },
-            dispose: removeInputListener,
-          };
-        },
-        {
-          overlay: true,
-          onHandle: (handle) => handle.focus(),
-        }
-      )
-      .then((choice) => {
-        applyWizardChoice(ctx, choice as 'extend' | 'stop' | 'dismiss', pomodoro);
-      })
-      .finally(() => {
-        wizardOpen = false;
-      });
+    ctx.ui.setWidget(
+      WIZARD_WIDGET_KEY,
+      (_tui, theme) => new WizardWidget(pomodoro, remainingProvisioned, theme)
+    );
+    wizardResolve = (choice) => {
+      closeWizardPrompt(ctx);
+      applyWizardChoice(ctx, choice, pomodoro);
+    };
   }
 
   function notify(
@@ -2594,6 +2598,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // (resume/reload) or at the next settle. Presence is per-process — nothing
     // has been typed yet in this one.
     disarmWizard();
+    closeWizardPrompt(ctx); // a docked prompt never survives a session swap
     lastGenuineActivityAt = null;
     // A pending/dequeued composition is in-memory only — on a fresh load/reload
     // it was never delivered (no agent outcome), so abandon it (bills 0). Same
@@ -2977,6 +2982,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // drain re-offer only matters while the session stays parked and idle.
     queueSteerSuppressed = false;
     clearQueueSteerRearm();
+    // A run starting supersedes the docked prompt (a queued dispatch can start
+    // one without typing); the next settle re-evaluates.
+    closeWizardPrompt(ctx);
   });
 
   pi.on('agent_end', (_event, ctx) => {
@@ -3079,6 +3087,28 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     // delivery (the agent outcome), not here. A no-typing submit (paste / no
     // keystrokes) with no prior dequeue stages nothing and bills nothing.
     stagePendingSteer(ctx, behavior);
+  });
+
+  // ── Wizard shortcuts ──────────────────────────────────────────────────
+
+  // The docked wizard prompt is non-modal — the editor keeps input — so the
+  // choice is a shortcut pair instead of arrow-key + enter on a SelectList.
+  // pi dispatches extension shortcuts inside CustomEditor.handleInput BEFORE
+  // the editor acts, so these work through the LedgerEditor wrapper too, and
+  // they consume the key so it never stages a billing keystroke. The handlers
+  // no-op when no prompt is showing. (ctrl+e/ctrl+w are unbound in pi's
+  // default keybinding map; ctrl+s would collide with app.session.toggleSort.)
+  pi.registerShortcut(WIZARD_EXTEND_KEY, {
+    description: 'pi-ledger: extend billable human time (when the extend prompt is showing)',
+    handler: () => {
+      wizardResolve?.('extend');
+    },
+  });
+  pi.registerShortcut(WIZARD_STOP_KEY, {
+    description: 'pi-ledger: stop billing (when the extend prompt is showing)',
+    handler: () => {
+      wizardResolve?.('stop');
+    },
   });
 
   // ── Commands ──────────────────────────────────────────────────────────

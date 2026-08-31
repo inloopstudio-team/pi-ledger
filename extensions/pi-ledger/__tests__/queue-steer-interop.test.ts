@@ -57,39 +57,39 @@ describe('queue-steer interop', () => {
     setMirror({ pending: 3, paused: true, blocked: false });
     settle();
     await vi.advanceTimersByTimeAsync(0);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
   });
 
   it('re-offers the wizard once the backlog drains and stays empty through the grace window', async () => {
     setMirror({ pending: 2, paused: false, blocked: false });
     settle();
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
 
     // The backlog drains without a run (rows sent/removed by hand): the
     // mirror updates, then the change event lands.
     setMirror({ pending: 0, paused: false, blocked: false });
     fixture.emitEvent('queue-steer:state', { pending: 0, paused: false, blocked: false });
     await vi.advanceTimersByTimeAsync(REARM_MS - 1);
-    expect(fixture.customSpy).not.toHaveBeenCalled(); // still in the grace window
+    expect(fixture.wizardSpy).not.toHaveBeenCalled(); // still in the grace window
     await vi.advanceTimersByTimeAsync(1);
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('tracks the backlog via events alone when no mirror is installed (events-only publisher)', async () => {
     fixture.emitEvent('queue-steer:state', { pending: 2, paused: false, blocked: false });
     settle();
     await vi.advanceTimersByTimeAsync(0);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
 
     fixture.emitEvent('queue-steer:state', { pending: 0, paused: false, blocked: false });
     await vi.advanceTimersByTimeAsync(REARM_MS);
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('cancels the drain re-offer when the drain feeds a run (agent_start wins the race)', async () => {
     setMirror({ pending: 1, paused: false, blocked: false });
     settle();
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
 
     // queue-steer dispatches the row from idle: the drain event fires first,
     // the dispatched prompt starts a run within the grace window.
@@ -97,11 +97,11 @@ describe('queue-steer interop', () => {
     fixture.emitEvent('queue-steer:state', { pending: 0, paused: false, blocked: false });
     fixture.run('agent_start', { type: 'agent_start' });
     await vi.advanceTimersByTimeAsync(REARM_MS + 500);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
 
     // The run settles with the queue now empty: the normal settle path pops.
     settle();
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('skips the re-offer when the drain left native follow-ups pending', async () => {
@@ -111,7 +111,7 @@ describe('queue-steer interop', () => {
     (fixture.mockCtx.hasPendingMessages as ReturnType<typeof vi.fn>).mockReturnValue(true);
     fixture.emitEvent('queue-steer:state', { pending: 0, paused: false, blocked: false });
     await vi.advanceTimersByTimeAsync(REARM_MS + 500);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
   });
 
   it('keeps the suppression when the backlog refills during the grace window (later drain re-arms)', async () => {
@@ -125,12 +125,12 @@ describe('queue-steer interop', () => {
     setMirror({ pending: 1, paused: false, blocked: false });
     fixture.emitEvent('queue-steer:state', { pending: 1, paused: false, blocked: false });
     await vi.advanceTimersByTimeAsync(REARM_MS + 500);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
 
     setMirror({ pending: 0, paused: false, blocked: false });
     fixture.emitEvent('queue-steer:state', { pending: 0, paused: false, blocked: false });
     await vi.advanceTimersByTimeAsync(REARM_MS);
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('holds the resume prompt too when a parked backlog survived the swap', async () => {
@@ -138,7 +138,7 @@ describe('queue-steer interop', () => {
     setMirror({ pending: 4, paused: false, blocked: false });
     fixture.run('session_start', { type: 'session_start', reason: 'resume' });
     await vi.advanceTimersByTimeAsync(0);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
     // no resume grace either — a parked backlog means queued work is in
     // flight, and an unattended dispatch would bill the grace with no human
     expect(fixture.readSidecarEvents().filter((e) => e.kind === 'human-open')).toHaveLength(0);
@@ -146,7 +146,7 @@ describe('queue-steer interop', () => {
     setMirror({ pending: 0, paused: false, blocked: false });
     fixture.emitEvent('queue-steer:state', { pending: 0, paused: false, blocked: false });
     await vi.advanceTimersByTimeAsync(REARM_MS);
-    expect(fixture.customSpy).toHaveBeenCalledTimes(1);
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('does not pop on later settles while items remain parked (no double-rearming)', async () => {
@@ -154,6 +154,6 @@ describe('queue-steer interop', () => {
     settle();
     settle(); // a second settle (e.g. aborted manual row) — still parked
     await vi.advanceTimersByTimeAsync(REARM_MS + 500);
-    expect(fixture.customSpy).not.toHaveBeenCalled();
+    expect(fixture.wizardSpy).not.toHaveBeenCalled();
   });
 });
