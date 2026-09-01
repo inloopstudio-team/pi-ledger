@@ -69,6 +69,7 @@ import {
   Input,
   matchesKey,
   SettingsList,
+  Spacer,
   Text,
   truncateToWidth,
   visibleWidth,
@@ -3231,6 +3232,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
           new Text(theme.fg('accent', theme.bold('pi-ledger · billing settings')), 1, 0)
         );
         container.addChild(new Text(theme.fg('muted', 'billed like serverless'), 1, 0));
+        container.addChild(new Spacer());
 
         let list: SettingsList;
         const items = buildSettingItems(theme, ctx);
@@ -3250,7 +3252,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         );
         container.addChild(list);
         container.addChild(
-          new Text(theme.fg('dim', '↑↓ navigate · / search · enter edit · esc close'), 1, 0)
+          new Text(theme.fg('dim', '↑↓ navigate · / search · enter edit · esc close'), 2, 0)
         );
         container.addChild(new DynamicBorder((s: string) => theme.fg('accent', s)));
         return {
