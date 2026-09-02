@@ -966,6 +966,56 @@ describe('extension integration', () => {
     expect(fixture.lastSidecarEvent('human-open')!.engagedVia).toBe('keystroke');
   });
 
+  it('bills typing done before accepting the extend, committed by the submit', async () => {
+    // The docked wizard lets the human type while the prompt shows. The first
+    // keystroke engages an idle window at its onset (cap 0 — no credit yet);
+    // ACCEPTING the extend bumps that same window's cap retroactively, so the
+    // pre-accept typing bills from the first keystroke — but only when the
+    // next submit produces agent work (agent_start), like every idle window.
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' }); // no credit → wizard pops
+    expect(fixture.wizardSpy).toHaveBeenCalledTimes(1);
+
+    fixture.sendEditorKey('k'); // typing while the box shows → engage at onset (cap 0)
+    await vi.advanceTimersByTimeAsync(30_000); // 30s of composition, still pre-accept
+    fixture.pressWizardShortcut('extend'); // accept +20m → bump the open window's cap
+    await vi.advanceTimersByTimeAsync(5_000); // 5s post-accept idle
+    fixture.run('agent_start', { type: 'agent_start' }); // submit → commit
+
+    const seg = lastEntry(fixture, 'ledger-human');
+    expect(seg.billedMs).toBe(35_000); // 30s pre-accept typing + 5s idle, from onset
+    expect(seg.idleMs).toBe(35_000);
+    expect(seg.committed).toBe(true);
+    expect(seg.grantedBudgetMs).toBe(20 * 60_000);
+    expect(seg.extensions).toBe(1);
+    // The window opened at the first keystroke (engagedVia keystroke), not at
+    // the extend — the extend only provisioned capacity for it.
+    expect(fixture.readSidecarEvents().find((e) => e.kind === 'human-open')!.engagedVia).toBe(
+      'keystroke'
+    );
+  });
+
+  it('bills nothing for pre-accept typing when the extend never happens', async () => {
+    // Same composition, but the human dismisses (esc) and submits anyway: no
+    // credit was ever provisioned, so the window closes with billedMs 0 —
+    // typing without consent never bills, even when committed by a submit.
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    fixture.run('agent_end', { type: 'agent_end', messages: [] });
+    fixture.run('agent_settled', { type: 'agent_settled' });
+    fixture.sendEditorKey('k');
+    await vi.advanceTimersByTimeAsync(30_000);
+    fixture.sendEditorKey('\x1b'); // dismiss the docked prompt
+    await vi.advanceTimersByTimeAsync(5_000);
+    fixture.run('agent_start', { type: 'agent_start' });
+
+    const seg = lastEntry(fixture, 'ledger-human');
+    expect(seg.billedMs).toBe(0);
+    expect(seg.grantedBudgetMs).toBe(0);
+    expect(seg.extensions).toBe(0);
+    expect(seg.committed).toBe(true);
+  });
+
   it('docks the TUI wizard as an interactive widget box (↑/↓/enter)', () => {
     fixture.run('session_start', { type: 'session_start', reason: 'startup' });
     fixture.run('agent_settled', { type: 'agent_settled' });
