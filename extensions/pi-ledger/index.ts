@@ -2398,18 +2398,18 @@ export default function ledgerExtension(pi: ExtensionAPI) {
     const rows: string[] = [];
     rows.push(c.border(`┌${title}${topFill}┐`));
     rows.push(
-      `│ ${row(opts.selected === 0, `Extend +${opts.pomodoro}m`, 'add a pomodoro to billable human time')} │`
+      `${c.border('│')} ${row(opts.selected === 0, `Extend +${opts.pomodoro}m`, 'add a pomodoro to billable human time')} ${c.border('│')}`
     );
     rows.push(
-      `│ ${row(opts.selected === 1, 'Stop billing', 'pause the agent until /ledger-extend')} │`
+      `${c.border('│')} ${row(opts.selected === 1, 'Stop billing', 'pause the agent until /ledger-extend')} ${c.border('│')}`
     );
     if (opts.remainingProvisioned > 0) {
       rows.push(
-        `│ ${fit(c.dim(`${Math.max(1, Math.round(opts.remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more`), cell)} │`
+        `${c.border('│')} ${fit(c.dim(`${Math.max(1, Math.round(opts.remainingProvisioned / MS_PER_MINUTE))}m still provisioned — extending adds more`), cell)} ${c.border('│')}`
       );
     }
     rows.push(
-      `│ ${fit(c.dim('↑/↓ select · enter confirm · esc dismiss · typing keeps the box'), cell)} │`
+      `${c.border('│')} ${fit(c.dim('↑/↓ select · enter confirm · esc dismiss · typing keeps the box'), cell)} ${c.border('│')}`
     );
     rows.push(c.border(`└${'─'.repeat(Math.max(0, width - 2))}┘`));
     return rows;
