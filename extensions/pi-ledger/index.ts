@@ -3591,6 +3591,11 @@ export default function ledgerExtension(pi: ExtensionAPI) {
  *  `onDequeue` callback fired when the human reverts a queued message back to
  *  the editor (alt+up). Both are trivial and never throw, so input is never
  *  blocked. */
+/** Options accepted by the host's CustomEditor, plus Pi 0.85's opt-in. */
+type CustomEditorOptionBag = NonNullable<ConstructorParameters<typeof CustomEditor>[3]> & {
+  embedWorkingStatus?: boolean;
+};
+
 class LedgerEditor extends CustomEditor {
   private readonly kb: KeybindingsManager;
   constructor(
@@ -3601,7 +3606,12 @@ class LedgerEditor extends CustomEditor {
     private readonly onDequeue: () => void,
     private readonly onWizardKey: (data: string, isShowingAutocomplete: () => boolean) => boolean
   ) {
-    super(tui, theme, keybindings);
+    // Pi's default editor embeds the streaming working status in its top
+    // border; a custom editor has to opt back in or Pi falls back to the
+    // standalone working row. Hosts before 0.85 ignore the extra option, and
+    // the pinned 0.80.6 typings predate it, so widen the option bag here.
+    const editorOptions: CustomEditorOptionBag = { embedWorkingStatus: true };
+    super(tui, theme, keybindings, editorOptions);
     this.kb = keybindings;
   }
   override handleInput(data: string): void {
