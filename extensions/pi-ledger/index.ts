@@ -78,6 +78,11 @@ import {
   type TUI,
 } from '@earendil-works/pi-tui';
 import { installNestedAgentTelemetryHarvester } from './nested-agent-telemetry.js';
+import {
+  FABRIC_SHELL_TIMING_EVENT,
+  FabricShellTimeMeter,
+  type BackgroundToolSpan,
+} from './fabric-shell-timing.js';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -243,6 +248,13 @@ export interface AgentEvent {
   timestamp: number;
 }
 
+/** Additional tool wall time outside foreground calls, independent of turn corrections. */
+export interface BackgroundToolEvent extends BackgroundToolSpan {
+  kind: 'background-tool';
+  source: 'pi-fabric';
+  timestamp: number;
+}
+
 /** Opens (and re-records, on each wizard extend) a human idle window.
  *  `extensionBudgetMs` is the rolling billable-human-time budget carried INTO
  *  this window (provisioned pomodoro credit that survives across agent turns);
@@ -379,6 +391,7 @@ export type SidecarEvent =
   | (SettingsEvent & ChainFields)
   | (BillingPauseEvent & ChainFields)
   | (AgentEvent & ChainFields)
+  | (BackgroundToolEvent & ChainFields)
   | (HumanOpenEvent & ChainFields)
   | (HumanCloseEvent & ChainFields)
   | (SteerEvent & ChainFields)
@@ -779,6 +792,9 @@ export function rehydrateFromSidecar(events: SidecarEvent[]): {
       stallMs += e.stallMs;
       if (e.toolMs > 0) toolTurns += 1;
       if (e.stallMs > 0) stalledTurns += 1;
+    } else if (e.kind === 'background-tool') {
+      agentMs += e.toolMs;
+      agentToolMs += e.toolMs;
     } else if (e.kind === 'human-close') {
       closedOpenedAts.add(e.openedAt);
       humanMs += e.billedMs;
@@ -1442,6 +1458,20 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   let toolSpanStart = 0;
   let toolMsThisTurn = 0;
   let currentTurnIndex = 0;
+  const backgroundTools = new FabricShellTimeMeter(
+    () => toolDepth > 0,
+    (span) => {
+      appendSidecar({
+        kind: 'background-tool',
+        source: 'pi-fabric',
+        ...span,
+        timestamp: span.endedAt,
+      });
+      totals.agentMs += span.toolMs;
+      totals.agentToolMs += span.toolMs;
+    }
+  );
+  let stopShellTiming: (() => void) | undefined;
 
   // Current human idle window (null while the agent is working). Its
   // `grantedBudgetMs` is this window's billing cap = the rolling extension
@@ -1836,6 +1866,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
    *
    *  Unlike pi-tps (per-turn), this is the full session up to the moment. */
   function computeDisplayTotals(ctx: ExtensionContext): Totals {
+    backgroundTools.checkpoint();
     const now = Date.now();
     let openIdleMs = 0;
     let openIdleWindows = 0;
@@ -1882,7 +1913,9 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       }
       if (tps.length > 0) {
         const c = convertTpsEntries(tps, settings.referenceTps);
-        return { ...c };
+        // Historical TPS-only generation still counts when the only new
+        // ledger data is detached tool work (which has no model turn).
+        return { ...c, agentMs: c.agentMs + totals.agentToolMs, agentToolMs: totals.agentToolMs };
       }
     }
     return {
@@ -2629,8 +2662,15 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   }
 
   pi.on('session_start', (event, ctx) => {
+    stopShellTiming?.();
+    backgroundTools.close();
+    toolDepth = 0;
     lastCtx = ctx;
     rehydrate(ctx);
+    backgroundTools.startSession(sessionId);
+    stopShellTiming = pi.events.on(FABRIC_SHELL_TIMING_EVENT, (payload: unknown) => {
+      if (backgroundTools.accept(payload)) updateStatus(lastCtx);
+    });
     agentRunning = false;
     steerStaging = [];
     lastKey = null;
@@ -2711,6 +2751,10 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   });
 
   pi.on('session_shutdown', () => {
+    // Flush before sealing; later Fabric cleanup events cannot reopen the log.
+    stopShellTiming?.();
+    stopShellTiming = undefined;
+    backgroundTools.close();
     // Abandon any pending/dequeued steer composition: it never reached the
     // agent (dequeued and not re-sent, or the run was interrupted) — no agent
     // outcome means no bill. Never persisted (a pending was never billed).
@@ -2745,6 +2789,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   pi.on('turn_start', (event, ctx) => {
     lastCtx = ctx;
     currentTurnIndex = event.turnIndex;
+    backgroundTools.checkpoint();
     toolDepth = 0;
     toolSpanStart = 0;
     toolMsThisTurn = 0;
@@ -2761,11 +2806,13 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   });
 
   pi.on('tool_execution_start', () => {
+    backgroundTools.checkpoint();
     if (toolDepth === 0) toolSpanStart = Date.now();
     toolDepth += 1;
   });
 
   pi.on('tool_execution_end', () => {
+    backgroundTools.checkpoint();
     if (toolDepth <= 0) return;
     toolDepth -= 1;
     if (toolDepth === 0 && toolSpanStart) {
@@ -2903,6 +2950,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   });
 
   pi.events.on(TPS_TELEMETRY_EVENT, (payload: unknown) => {
+    backgroundTools.checkpoint();
     const t = payload as TpsTelemetry | null;
     if (!t || !t.timing || !t.tokens || !t.model) return;
     tpsEverSeen = true;
@@ -2962,6 +3010,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
   // Fallback: pi-tps absent for this turn → measure ourselves at turn_end.
   pi.on('turn_end', (event, ctx) => {
     lastCtx = ctx;
+    backgroundTools.checkpoint();
     if (tpsEverSeen) return; // pi-tps present; it handles turns (or intentionally skips)
     if (fb.messageCount === 0 || !fb.model) return;
     const toolMs = toolMsThisTurn;
@@ -3146,7 +3195,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         ` · total ${fmtMoney(b.total, settings.currency)}` +
         (chainStatus === 'tampered' ? ' · ⚠ chain broken (sidecar failed notarization)' : '');
       ctx.ui.notify(msg, 'info');
-      if (totals.agentTurns === 0 && totals.humanWindows === 0) {
+      if (totals.agentTurns === 0 && totals.humanWindows === 0 && totals.agentMs === 0) {
         const tps = extractTpsEntries(ctx.sessionManager.getBranch());
         if (tps.length > 0) {
           ctx.ui.notify(
@@ -3281,7 +3330,8 @@ export default function ledgerExtension(pi: ExtensionAPI) {
       // When pi-ledger has no live data (a resumed pi-tps-only session whose
       // only sidecar event may be the initial human-open), fall back to the
       // first pi-tps marker for the receipt's start date.
-      const noLiveData = totals.agentTurns === 0 && totals.humanWindows === 0;
+      const noLiveData =
+        totals.agentTurns === 0 && totals.humanWindows === 0 && totals.agentMs === 0;
       if ((startedAt === 0 || noLiveData) && tpsEntries.length > 0) {
         startedAt = tpsEntries[0]!.timestamp;
       }
