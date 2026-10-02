@@ -45,6 +45,7 @@ const DEFAULTS: LedgerSettings = {
   autoWizard: true,
   autoExtend: false,
   resumeGraceMinutes: 1,
+  showStatus: true,
 };
 
 const KIND_BY_CUSTOM_TYPE: Record<string, SidecarEvent['kind']> = {
@@ -221,6 +222,8 @@ describe('applySettingValue', () => {
     expect(applySettingValue(DEFAULTS, 'autoWizard', 'on').autoWizard).toBe(true);
     expect(applySettingValue(DEFAULTS, 'autoExtend', 'on').autoExtend).toBe(true);
     expect(applySettingValue(DEFAULTS, 'autoExtend', 'off').autoExtend).toBe(false);
+    expect(applySettingValue(DEFAULTS, 'showStatus', 'off').showStatus).toBe(false);
+    expect(applySettingValue(DEFAULTS, 'showStatus', 'on').showStatus).toBe(true);
   });
   it('parses the resume grace (0 disables; negatives rejected)', () => {
     expect(applySettingValue(DEFAULTS, 'resumeGraceMinutes', '0').resumeGraceMinutes).toBe(0);
@@ -1779,6 +1782,27 @@ describe('extension integration', () => {
         (c) => typeof c[0] === 'string' && c[0].includes('Derived from 1 pi-tps markers')
       )
     ).toBe(true);
+  });
+
+  it('hides the footer status line when showStatus is off (rehydrated)', async () => {
+    fixture.seedSidecar([
+      { kind: 'settings', settings: { ...DEFAULTS, showStatus: false }, timestamp: 0 },
+    ]);
+    fixture.run('session_start', { type: 'session_start', reason: 'resume' });
+    // rehydrate clears the status key rather than writing a totals line
+    expect(fixture.setStatusSpy.mock.calls.at(-1)).toEqual(['ledger', undefined]);
+  });
+
+  it('/ledger-settings toggles the status line off in RPC mode and clears the footer', async () => {
+    (fixture.mockCtx as unknown as { mode: string }).mode = 'rpc';
+    fixture.run('session_start', { type: 'session_start', reason: 'startup' });
+    // first select picks the row, second picks the new value
+    fixture.selectSpy.mockResolvedValueOnce('Status line: on').mockResolvedValueOnce('off');
+    await fixture.commands['ledger-settings'].handler('', fixture.mockCtx);
+    const settingsEvt = fixture.lastSidecarEvent('settings');
+    expect(settingsEvt).toBeDefined();
+    expect(settingsEvt!.settings.showStatus).toBe(false);
+    expect(fixture.setStatusSpy).toHaveBeenCalledWith('ledger', undefined);
   });
 
   it('counts the in-progress open human window in /ledger (entire session up to now)', async () => {

@@ -55,7 +55,7 @@ Didn't run a full pi-ledger session? `/ledger-receipt` also works on a session t
 | Command              | What it does                                                                                                                                                                                    |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/ledger`            | Show running totals: agent/human hours, costs, total.                                                                                                                                           |
-| `/ledger-settings`   | Configure billing (rates, pomodoro, project, author, currency, auto-wizard, auto-extend). TUI: a searchable settings list; GUI: a `select`→`input` flow.                                        |
+| `/ledger-settings`   | Configure billing (rates, pomodoro, project, author, currency, auto-wizard, auto-extend, status line). TUI: a searchable settings list; GUI: a `select`→`input` flow.                           |
 | `/ledger-extend [m]` | Open the human-time wizard to extend the window by `m` minutes (default: pomodoro length); pick with `↑`/`↓` and confirm with `enter` (GUI: `select` dialog). Engages a window if none is open. |
 | `/ledger-receipt`    | Export a self-contained HTML receipt for the session and open it.                                                                                                                               |
 
@@ -127,7 +127,7 @@ The shape is a deliberate hybrid: Toggl's _you-decide-the-budget_ control with t
 
 ## Settings
 
-`/ledger-settings` opens a pi-core-style bordered, searchable list. Rate and text fields open an inline input on `Enter`; currency and the auto-wizard toggle cycle through presets. Settings persist to the per-session sidecar (see [Data model](#data-model)) and rehydrate on resume and `/tree` navigation.
+`/ledger-settings` opens a pi-core-style bordered, searchable list. Rate and text fields open an inline input on `Enter`; currency and the toggle settings (auto-wizard, auto-extend, status line) cycle through presets. Settings persist to the per-session sidecar (see [Data model](#data-model)) and rehydrate on resume and `/tree` navigation.
 
 | Setting          | Default  | Notes                                                                                                                                       |
 | ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -140,6 +140,7 @@ The shape is a deliberate hybrid: Toggl's _you-decide-the-budget_ control with t
 | Currency         | `USD`    | Symbol for amounts                                                                                                                          |
 | Auto-wizard      | `on`     | Idle-gated prompt box at `agent_settled` (no credit) and on `/resume`; mid-typing exhaustion rolls credit silently                          |
 | Resume grace     | `1`      | Billable human-time block (min) provisioned on `/resume` · `/reload` when no rolling credit remains; `0` pops the engagement wizard instead |
+| Status line      | `on`     | Show the pi-ledger totals in the footer; off hides it but billing keeps running                                                             |
 
 ## Receipt / invoice
 

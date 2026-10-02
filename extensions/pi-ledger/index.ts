@@ -195,6 +195,7 @@ const DEFAULT_SETTINGS: LedgerSettings = {
   autoWizard: true,
   autoExtend: false,
   resumeGraceMinutes: 1,
+  showStatus: true,
 };
 
 // ─── Data types ─────────────────────────────────────────────────────────────
@@ -222,6 +223,9 @@ export interface LedgerSettings {
    *  lands at the grace boundary instead of popping at the resume moment.
    *  0 disables (prompt on resume, as before). */
   resumeGraceMinutes: number;
+  /** Whether the pi-ledger status line is shown in the footer. Toggled from
+   *  `/ledger-settings` (Status line); off clears it without disabling billing. */
+  showStatus: boolean;
 }
 
 /** Persisted per agent turn (replayed on rehydrate). */
@@ -696,6 +700,9 @@ export function applySettingValue(
       if (n !== null && n >= 0) next.resumeGraceMinutes = Math.round(n);
       break;
     }
+    case 'showStatus':
+      next.showStatus = value === 'on';
+      break;
   }
   return next;
 }
@@ -1933,6 +1940,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   function updateStatus(ctx: ExtensionContext | null) {
     if (!ctx || !ctx.hasUI) return;
+    // Status line toggled off in /ledger-settings: clear the key and show
+    // nothing. Billing keeps running; only the display is hidden.
+    if (!settings.showStatus) {
+      ctx.ui.setStatus('ledger', undefined);
+      return;
+    }
     const t = computeDisplayTotals(ctx);
     const b = computeBilling(t.agentMs, t.humanMs, settings);
     const text = `ledger · agent ${fmtHours(t.agentMs)} · human ${fmtHours(t.humanMs)} · ${fmtMoney(b.total, settings.currency)}${billingPaused ? ' · paused' : ''}`;
@@ -3234,7 +3247,7 @@ export default function ledgerExtension(pi: ExtensionAPI) {
 
   pi.registerCommand('ledger-settings', {
     description:
-      'Configure billing: agent $/h, human $/h, pomodoro minutes, project, author, currency, auto-wizard, auto-extend.',
+      'Configure billing: agent $/h, human $/h, pomodoro minutes, project, author, currency, auto-wizard, auto-extend, status line.',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       // RPC/GUI (e.g. vscode-pi): a `select` -> `input`/`select` flow, since the
       // custom SettingsList only renders in the terminal. One setting per run.
@@ -3470,6 +3483,12 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         values: ['on', 'off'],
       },
       {
+        id: 'showStatus',
+        label: 'Status line',
+        current: settings.showStatus ? 'on' : 'off',
+        values: ['on', 'off'],
+      },
+      {
         id: 'identityKid',
         label: 'Identity key id',
         current: getIdentity()?.kid ?? '(unavailable)',
@@ -3556,6 +3575,14 @@ export default function ledgerExtension(pi: ExtensionAPI) {
         currentValue: settings.autoExtend ? 'on' : 'off',
         description:
           'Auto-provision a pomodoro block silently (no prompt) when credit runs out — for GUI/headless sessions',
+        values: ['on', 'off'],
+      },
+      {
+        id: 'showStatus',
+        label: 'Status line',
+        currentValue: settings.showStatus ? 'on' : 'off',
+        description:
+          'Show the pi-ledger status line in the footer (billing keeps running when off)',
         values: ['on', 'off'],
       },
       // Notarization identity (read-only rows): register the public key in
